@@ -657,7 +657,7 @@ extension HTTPHandling {
 /// use it, so it lives here once.
 public func sha256HexLower(_ bytes: [UInt8]) -> String {
     var hasher = SHA256()
-    bytes.withUnsafeBytes { hasher.update(bufferPointer: $0) }
+    hasher.update(data: bytes)  // safe DataProtocol overload (no unsafe buffer pointer)
     let hex: [UInt8] = Array("0123456789abcdef".utf8)
     var out: [UInt8] = []
     out.reserveCapacity(64)

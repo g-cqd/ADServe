@@ -25,6 +25,11 @@ let strictSettings: [SwiftSetting] = [
 // Tests: strict + runtime actor data-race checks (unsafe flag → test targets only, never the library).
 let testSettings: [SwiftSetting] = strictSettings + [.unsafeFlags(["-enable-actor-data-race-checks"])]
 
+// Shipped-library settings: strict + StrictMemorySafety. Every use of an unsafe construct (raw pointers,
+// `withUnsafe*`, `unsafeBitCast`, C interop, …) must be explicitly marked `unsafe`, matching the AD-family
+// kernel targets. Tests / the dev codegen stay on `strictSettings` (their unsafe scaffolding is not shipped).
+let kernelSettings: [SwiftSetting] = strictSettings + [.strictMemorySafety()]
+
 // Dev-only tooling is gated behind `ADSERVE_DEV` so consumers never resolve it (mirrors the sibling
 // AD-family `*_DEV` convention). Provides the shared ADBuildTools lint/format plugins + DocC.
 let isDev = Context.environment["ADSERVE_DEV"] != nil
@@ -164,7 +169,7 @@ let package = Package(
                 .product(name: "ADFCore", package: "ADFoundation"),
                 .product(name: "ADMCP", package: "ADMCP")
             ],
-            swiftSettings: strictSettings,
+            swiftSettings: kernelSettings,
             plugins: libraryBuildPlugins),
         .target(
             name: "ADServeDSL",
@@ -175,7 +180,7 @@ let package = Package(
                 .product(name: "HTTPTypes", package: "swift-http-types"),
                 .product(name: "ADJSON", package: "ADJSON")
             ],
-            swiftSettings: strictSettings,
+            swiftSettings: kernelSettings,
             plugins: libraryBuildPlugins),
         .target(
             name: "ADServeObservability",
@@ -188,7 +193,7 @@ let package = Package(
                 .product(name: "Instrumentation", package: "swift-distributed-tracing"),
                 .product(name: "ServiceContextModule", package: "swift-service-context")
             ],
-            swiftSettings: strictSettings,
+            swiftSettings: kernelSettings,
             plugins: libraryBuildPlugins),
         // Dev-only MIME-table generator — run by hand (`swift run ADServeMimeCodegen`); reads the
         // vendored jshttp/mime-db snapshot and emits the committed
