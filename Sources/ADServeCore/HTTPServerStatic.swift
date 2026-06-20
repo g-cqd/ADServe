@@ -16,6 +16,14 @@ import NIOCore
 import NIOHTTPTypes
 import NIOPosix
 
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#elseif canImport(Musl)
+    import Musl
+#endif
+
 /// The validated descriptor the DSL `Static(_:root:)` produces.
 struct StaticFileRequest {
     let root: String
@@ -126,6 +134,17 @@ extension HTTPServer {
                 try await exchange.outbound.write(contentsOf: [.head(responseHead), .end(nil)])
 
             case .serve(let path, let partial, let etag, let lastModified, let encoding, let totalSize, let range):
+                // Open the file ONCE and stream every chunk from this single descriptor: a mid-flight
+                // unlink/replace can no longer swap the bytes served (the open fd pins the original inode),
+                // and the prior re-open-per-chunk (a fresh TOCTOU window each chunk) is gone. A file that
+                // vanished between the plan's stat and this open collapses to 404.
+                guard let fd = Self.openForReading(path) else {
+                    try await write(
+                        .plain(.notFound, "not found\n"), cache: .noStore, requestID: requestID,
+                        keepAlive: keepAlive, suppressBody: suppressBody, exchange: exchange)
+                    return
+                }
+                defer { Self.closeDescriptor(fd) }
                 let start = range?.lowerBound ?? 0
                 let length = range.map { $0.upperBound - $0.lowerBound + 1 } ?? totalSize
                 var headers = staticHeaders(
@@ -149,7 +168,7 @@ extension HTTPServer {
                     try await exchange.outbound.write(contentsOf: [.head(responseHead), .end(nil)])
                 } else {
                     try await streamFileBody(
-                        head: responseHead, path: path, start: start, length: length, exchange: exchange)
+                        head: responseHead, fd: fd, start: start, length: length, exchange: exchange)
                 }
         }
     }
@@ -176,7 +195,7 @@ extension HTTPServer {
     /// `Content-Length` intact (when it does not). A short/failed read ends the body (the connection
     /// drops without a clean end).
     private func streamFileBody(
-        head: HTTPResponse, path: String, start: Int, length: Int, exchange: RequestExchange
+        head: HTTPResponse, fd: Int32, start: Int, length: Int, exchange: RequestExchange
     ) async throws {
         let chunkSize = 256 * 1024
         var sent = 0
@@ -185,7 +204,7 @@ extension HTTPServer {
             let offset = start + sent
             let count = min(chunkSize, length - sent)
             let chunk = try await exchange.threadPool.runIfActive {
-                Self.readChunk(path: path, offset: offset, count: count)
+                Self.readChunk(fd: fd, offset: offset, count: count)
             }
             guard let chunk, !chunk.isEmpty else { break }  // truncated / changed underneath us
             var buffer = exchange.allocator.buffer(capacity: chunk.count)
@@ -316,16 +335,37 @@ extension HTTPServer {
         Int(((attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0).rounded())
     }
 
-    /// One chunk `[offset, offset+count)`; `nil`/empty on any failure (ends the stream).
-    private static func readChunk(path: String, offset: Int, count: Int) -> [UInt8]? {
-        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
-        defer { try? handle.close() }
-        do {
-            try handle.seek(toOffset: UInt64(offset))
-            return try handle.read(upToCount: count).map { [UInt8]($0) }
-        } catch {
-            return nil
+    // MARK: - Held-descriptor file IO (TOCTOU-safe streaming)
+    //
+    // The static streamer opens ONE descriptor for the whole response and reads each chunk positionally
+    // (`pread`) from it. `pread` carries the offset per call, so reads dispatched to different offload-pool
+    // tasks share no seek state; the open fd pins the original inode, so an unlink/replace mid-stream
+    // cannot swap the served bytes. The `unsafe` regions are the libc calls — the read buffer is owned by
+    // the local `Array` for the duration of the call and bounded by `count`, and `fd` is a plain `Int32`
+    // (Sendable) opened/closed by the single owner (`writeFile`'s `.serve` case, via `defer`).
+
+    /// Open `path` read-only; `nil` on failure (e.g. the file vanished since the plan's stat).
+    static func openForReading(_ path: String) -> Int32? {
+        let fd = path.withCString { cString in unsafe open(cString, O_RDONLY) }
+        return fd >= 0 ? fd : nil
+    }
+
+    /// Close a descriptor opened by `openForReading` (best-effort; the result is irrelevant here).
+    static func closeDescriptor(_ fd: Int32) {
+        _ = close(fd)
+    }
+
+    /// One positional read of `[offset, offset+count)` from `fd`. Returns the bytes (short at EOF), `[]` at
+    /// EOF, or `nil` on a read error — each ends the stream.
+    static func readChunk(fd: Int32, offset: Int, count: Int) -> [UInt8]? {
+        guard count > 0 else { return [] }
+        var buffer = [UInt8](repeating: 0, count: count)
+        let read = buffer.withUnsafeMutableBytes { raw in
+            unsafe pread(fd, raw.baseAddress, count, off_t(offset))
         }
+        guard read >= 0 else { return nil }
+        if read < count { buffer.removeLast(count - read) }
+        return read == 0 ? [] : buffer
     }
 
     /// True if `acceptEncoding` permits `token` (present and not explicitly `;q=0`).
