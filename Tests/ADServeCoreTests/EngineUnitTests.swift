@@ -68,3 +68,28 @@ import Testing
                 == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
     }
 }
+
+@Suite struct ResponseFactoryTests {
+    @Test func htmlMediaTypeValue() {
+        #expect(MediaType.html.value == "text/html; charset=utf-8")
+    }
+
+    @Test func htmlFactorySetsContentTypeBodyAndDefaultStatus() {
+        let bytes = Array("<p>hi</p>".utf8)
+        guard case .raw(let body, let contentType, let status) = ResponseContent.html(bytes) else {
+            Issue.record("expected .html to lower to .raw")
+            return
+        }
+        #expect(contentType == "text/html; charset=utf-8")
+        #expect(body == bytes)
+        #expect(status == .ok)
+    }
+
+    @Test func htmlFactoryHonorsExplicitStatus() {
+        guard case .raw(_, _, let status) = ResponseContent.html([], status: .notFound) else {
+            Issue.record("expected .raw")
+            return
+        }
+        #expect(status == .notFound)
+    }
+}

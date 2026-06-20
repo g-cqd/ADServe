@@ -117,16 +117,16 @@ public enum EngineTransport: String, Sendable { case nio, network }
 /// `HandlerInput.connection` and down-casts to its concrete type (the app's invariant: the pool
 /// holds exactly that type).
 public struct AnyConnectionPool: Sendable {
-    private let _withLease:
-        @Sendable (_ body: @Sendable (any PooledResource) -> ResponseContent) -> ResponseContent?
+    private let _withLease: @Sendable (_ body: @Sendable (any PooledResource) -> ResponseContent) -> ResponseContent?
 
     /// `lease` must check a resource out, pass it to `body`, and check it back in when `body`
     /// returns — returning `nil` only when the pool is momentarily drained. A `ResourcePool`
     /// lease does exactly this (`pool.lease()` + the noncopyable `ResourceLease`).
     public init(
-        _ lease: @escaping @Sendable (
-            _ body: @Sendable (any PooledResource) -> ResponseContent
-        ) -> ResponseContent?
+        _ lease:
+            @escaping @Sendable (
+                _ body: @Sendable (any PooledResource) -> ResponseContent
+            ) -> ResponseContent?
     ) {
         self._withLease = lease
     }
@@ -205,6 +205,13 @@ public enum ResponseContent: Sendable {
     public static func text(_ bytes: [UInt8], as type: MediaType) -> ResponseContent {
         .raw(body: bytes, contentType: type.value, status: .ok)
     }
+
+    /// An HTML body (`text/html; charset=utf-8`) — the typed path for server-rendered pages and
+    /// fragments. `status` defaults to `200` but is overridable (a `404` fragment, a `422` form
+    /// re-render). The host transports the bytes; it stays view-agnostic (ADR-0012).
+    public static func html(_ bytes: [UInt8], status: HTTPResponse.Status = .ok) -> ResponseContent {
+        .raw(body: bytes, contentType: MediaType.html.value, status: status)
+    }
 }
 
 /// Type-safe output format — the response content-type as a value, not a raw string.
@@ -239,6 +246,7 @@ public struct MediaType: Sendable {
     public static let jsonSpaced = MediaType(value: "application/json; charset=utf-8")
     public static let text = MediaType(value: "text/plain; charset=utf-8")
     public static let css = MediaType(value: "text/css; charset=utf-8")
+    public static let html = MediaType(value: "text/html; charset=utf-8")
     public static let openSearch = MediaType(value: "application/opensearchdescription+xml")
     public static let linkset = MediaType(value: "application/linkset+json")
 }
@@ -381,7 +389,7 @@ public struct RequestLogging: HTTPMiddleware {
             metadata: [
                 "method": "\(request.method.rawValue)", "path": "\(request.path)",
                 "status": "\(statusCode(of: response))",
-                "duration_ms": .stringConvertible(elapsedMillis), "request_id": "\(context.requestID)",
+                "duration_ms": .stringConvertible(elapsedMillis), "request_id": "\(context.requestID)"
             ])
         return response
     }
