@@ -10,6 +10,10 @@ public import ADServeCore
 public import HTTPTypes
 public import Logging
 
+/// RFC-0019 C1: the header the ADHTML runtime sets on every client-action fetch (`ADH-Request: 1`), so a
+/// handler can detect it and return a fragment. A valid HTTP token, so the force-unwrap is total.
+private let adhRequestFieldName = HTTPField.Name("ADH-Request")!
+
 // MARK: - Handler contexts
 
 /// A handler context, buildable from the engine's per-request input. The `request` + `codec`
@@ -48,6 +52,10 @@ extension HandlerContext {
     /// (`nil` otherwise). Its presence already implies NIOSSL verified the chain; parse it with your X.509
     /// library for the subject/claims.
     public var peerCertificateDER: [UInt8]? { storage[PeerCertificateKey.self] }
+    /// True when the ADHTML runtime issued this request — it carries the `ADH-Request` header (RFC-0019
+    /// C1) — so the handler should return a `.fragment` (partial the client morphs) instead of a full
+    /// page. Serves one route two ways: `ctx.isFragment ? .fragment(rowsHTML) : try .html(page)`.
+    public var isFragment: Bool { request.headers[adhRequestFieldName] != nil }
     /// The raw request body bytes.
     public var body: [UInt8] { request.body }
     /// Decode the request body into `T` via the configured codec (default: JSON over ADJSON). Throws

@@ -278,11 +278,13 @@ enum Loopback {
         try await probe.close().get()
 
         let readiness = ServerReadiness()
+        // Map the harness's two axes to the engine policy: keep-alive carries the given idle deadline;
+        // disabled → Connection: close.
+        let policy: KeepAlivePolicy = keepAlive ? .idleTimeout(idleTimeout) : .close
         let server = HTTPServer(
             listeners: [ListenerConfig(host: "127.0.0.1", port: port, routes: routes)], pool: nil,
             envelope: HTTPFields(), logger: Logger(label: "loopback-keepalive"), threadCount: 1,
-            loopCount: 1, readiness: readiness, responseCompression: compression, idleTimeout: idleTimeout,
-            keepAlive: keepAlive)
+            loopCount: 1, readiness: readiness, responseCompression: compression, keepAlive: policy)
         let serverTask = Task { try? await server.run() }
         defer { serverTask.cancel() }
 

@@ -228,6 +228,11 @@ public protocol ResponseBodyWriter: Sendable {
     func flush() async throws
 }
 
+/// RFC-0019 C4's name for the public, back-pressured `.stream` body seam that `ADHTMLNIO` adapts its
+/// `AsyncHTMLByteSink` onto. ADServe ships the contract as `ResponseBodyWriter` (whose `write(_: [UInt8])`
+/// matches the sink 1:1 — see above); this alias exposes it under the name the RFC + ADHTML reference.
+public typealias ResponseStreamWriter = ResponseBodyWriter
+
 /// A sink for Server-Sent Events (`text/event-stream`). The engine hands a route's `.sse` body closure
 /// a writer over the connection; each `send`/`comment` frames + flushes one event immediately (so a
 /// heartbeat reaches the client at once) and suspends for back-pressure. Reference-semantic +
@@ -315,6 +320,15 @@ public enum ResponseContent: Sendable {
     /// fragments. `status` defaults to `200` but is overridable (a `404` fragment, a `422` form
     /// re-render). The host transports the bytes; it stays view-agnostic (ADR-0012).
     public static func html(_ bytes: [UInt8], status: HTTPResponse.Status = .ok) -> ResponseContent {
+        .raw(body: bytes, contentType: MediaType.html.value, status: status)
+    }
+
+    /// A hypermedia FRAGMENT (RFC-0019 C2): a `text/html; charset=utf-8` PARTIAL (no doctype/`<html>`)
+    /// the ADHTML runtime morphs into a target region. Wire-identical to `.html` — the distinction is
+    /// intent (the caller renders a partial, not a whole document) — so the engine's ETag/304 + envelope
+    /// apply unchanged. Pair with `ctx.isFragment` to serve one route two ways: full page on first load,
+    /// fragment on a client action.
+    public static func fragment(_ bytes: [UInt8], status: HTTPResponse.Status = .ok) -> ResponseContent {
         .raw(body: bytes, contentType: MediaType.html.value, status: status)
     }
 }

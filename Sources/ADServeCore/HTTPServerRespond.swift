@@ -494,7 +494,7 @@ extension HTTPServer {
     /// of scope; fetch + Caddy are 1.1). For h2 this is unused (one request per stream). The server-wide
     /// `keepAlive: false` option overrides everything → always close.
     func isKeepAlive(_ head: HTTPRequest) -> Bool {
-        guard keepAlive else { return false }
+        guard keepAliveEnabled else { return false }
         guard let connection = head.headerFields[.connection]?.lowercased() else { return true }
         return !connection.contains("close")
     }

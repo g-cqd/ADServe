@@ -123,6 +123,21 @@ final class SSELimiter: Sendable {
     func release() { inUse.wrappingSubtract(1, ordering: .relaxed) }
 }
 
+/// HTTP/1 connection-lifetime policy (RFC-0019 §3.4). Controls the `Connection` header + the
+/// per-connection idle deadline, the one knob a `networkidle`-waiting client (a browser preview, a
+/// crawler) cares about. No effect on HTTP/2, which forbids `Connection` and is one request per stream.
+public enum KeepAlivePolicy: Sendable {
+    /// Persistent connections (default) with the default 60s all-idle deadline.
+    case keepAlive
+    /// Answer EVERY request with `Connection: close` and close the socket after the response — so idle
+    /// sockets never linger (a `networkidle` client settles at once) and the client reads to EOF rather
+    /// than trusting `Content-Length`.
+    case close
+    /// Persistent, but with a custom all-idle deadline (e.g. `.seconds(5)` so a preview settles quickly
+    /// without giving up keep-alive). A non-positive duration disables the deadline entirely.
+    case idleTimeout(Duration)
+}
+
 /// The ad-server engine. Binds one NIO listener per `ListenerConfig`, all sharing the
 /// event-loop group + offload pool + connection pool + envelope; serves until cancelled.
 /// The app builds the listeners (DSL) + the response `envelope` and hands them in.
@@ -161,14 +176,10 @@ public struct HTTPServer: Sendable {
     /// connection then lives until the peer or a drain closes it. An SSE source must heartbeat within
     /// this window (its writes reset the timer).
     let idleTimeout: Duration
-    /// HTTP/1 keep-alive. Default `true` (persistent connections). When `false` the server answers EVERY
-    /// request with `Connection: close` and closes the socket after the response, regardless of what the
-    /// client asked. The escape hatch for clients/tools that mishandle persistent connections — e.g. a
-    /// preview harness that waits for network-idle yet sees the browser holding idle keep-alive sockets
-    /// open until the idle timeout — and a hard guarantee the client reads to EOF rather than trusting
-    /// `Content-Length`. No effect on HTTP/2 (it forbids the `Connection` header; each stream is already
-    /// one request).
-    let keepAlive: Bool
+    /// Whether HTTP/1 keep-alive is offered (derived from `KeepAlivePolicy`). When `false` the server
+    /// answers EVERY request with `Connection: close` and closes the socket after the response. No effect
+    /// on HTTP/2 (it forbids the `Connection` header; each stream is already one request).
+    let keepAliveEnabled: Bool
     /// In-flight request count, so a drain waits for real work, not idle keep-alive connections.
     let active = ActiveRequests()
     /// Admission control for concurrent SSE streams (a `.sse` response past the limit gets a 503).
@@ -182,8 +193,8 @@ public struct HTTPServer: Sendable {
         threadCount: Int, loopCount: Int = 2, readiness: ServerReadiness? = nil,
         transport: EngineTransport = .nio, middleware: [any HTTPMiddleware] = [],
         codec: ContentCodec = .json, maxBodyBytes: Int = 1_000_000, maxConcurrentSSE: Int = 1024,
-        maxConnections: Int = 0, responseCompression: Bool = true, idleTimeout: Duration = .seconds(60),
-        keepAlive: Bool = true
+        maxConnections: Int = 0, responseCompression: Bool = true,
+        keepAlive: KeepAlivePolicy = .keepAlive
     ) {
         self.listeners = listeners
         self.pool = pool
@@ -199,8 +210,11 @@ public struct HTTPServer: Sendable {
         self.sseLimiter = SSELimiter(limit: maxConcurrentSSE)
         self.connectionLimiter = ConnectionLimiter(limit: maxConnections)
         self.responseCompression = responseCompression
-        self.idleTimeout = idleTimeout
-        self.keepAlive = keepAlive
+        switch keepAlive {
+            case .keepAlive: (self.keepAliveEnabled, self.idleTimeout) = (true, .seconds(60))
+            case .close: (self.keepAliveEnabled, self.idleTimeout) = (false, .seconds(60))
+            case .idleTimeout(let deadline): (self.keepAliveEnabled, self.idleTimeout) = (true, deadline)
+        }
     }
 
     public func run() async throws {
