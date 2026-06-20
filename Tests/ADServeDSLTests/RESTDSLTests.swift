@@ -33,10 +33,9 @@ private func plain(_ content: ResponseContent?) -> (HTTPResponse.Status, String)
     return (status, message)
 }
 
-@Suite("Path templates")
 struct PathTemplateTests {
-    @Test("binds named segments and parses typed captures")
-    func bindsAndTypes() {
+    @Test
+    func `binds named segments and parses typed captures`() {
         let params = PathTemplate("items/{id}/comments/{cid}").match("/items/42/comments/7")
         #expect(params?.id == "42")
         #expect(params?["cid"] == "7")
@@ -44,8 +43,8 @@ struct PathTemplateTests {
         #expect(params?.int("cid") == 7)
     }
 
-    @Test("rejects literal mismatch, and segment-count mismatch")
-    func rejects() {
+    @Test
+    func `rejects literal mismatch, and segment-count mismatch`() {
         let template = PathTemplate("items/{id}")
         #expect(template.match("/widgets/42") == nil)  // literal mismatch
         #expect(template.match("/items") == nil)  // too few
@@ -53,14 +52,14 @@ struct PathTemplateTests {
         #expect(template.match("/items/42")?.id == "42")
     }
 
-    @Test("trailing catch-all captures the remainder including slashes")
-    func catchAll() {
+    @Test
+    func `trailing catch-all captures the remainder including slashes`() {
         let params = PathTemplate("files/{path*}").match("/files/a/b/c.txt")
         #expect(params?.path == "a/b/c.txt")
     }
 
-    @Test("percent-decodes captures and rejects encoded traversal / separators")
-    func decodingAndTraversal() {
+    @Test
+    func `percent-decodes captures and rejects encoded traversal / separators`() {
         #expect(PathTemplate("items/{id}").match("/items/a%20b")?.id == "a b")  // %20 → space
         #expect(PathTemplate("items/{id}").match("/items/%2e%2e") == nil)  // encoded ".."
         #expect(PathTemplate("items/{id}").match("/items/a%2Fb") == nil)  // encoded "/" in a param
@@ -69,8 +68,8 @@ struct PathTemplateTests {
         #expect(PathTemplate("items/{id}").match("/items/a%ZZb") == nil)  // malformed escape
     }
 
-    @Test("pathHasTraversal flags literal dot-segments")
-    func traversalDetection() {
+    @Test
+    func `pathHasTraversal flags literal dot-segments`() {
         #expect(pathHasTraversal("/a/../b"[...]))
         #expect(pathHasTraversal("/a/./b"[...]))
         #expect(!pathHasTraversal("/a/b/c"[...]))
@@ -78,10 +77,9 @@ struct PathTemplateTests {
     }
 }
 
-@Suite("REST verbs + typed routing")
 struct RESTRoutingTests {
-    @Test("each verb routes; typed path params reach the handler")
-    func verbsAndParams() {
+    @Test
+    func `each verb routes; typed path params reach the handler`() {
         let routes = table {
             GET("items/{id}", pool: .none) { _, params in .plain(.ok, "get-\(params.id ?? "?")") }
             POST("items", pool: .none) { _ in .plain(.created, "made") }
@@ -96,8 +94,8 @@ struct RESTRoutingTests {
         #expect(plain(runMatched(routes, .delete, "/items/3"))?.1 == "del-3")
     }
 
-    @Test("Group prefix composes with typed templates")
-    func groupCompose() {
+    @Test
+    func `Group prefix composes with typed templates`() {
         let routes = table {
             Group("api/v1") {
                 GET("items/{id}", pool: .none) { _, params in .plain(.ok, params.id ?? "?") }
@@ -107,8 +105,8 @@ struct RESTRoutingTests {
         #expect(runMatched(routes, .get, "/items/55") == nil)  // un-prefixed does not match
     }
 
-    @Test("unknown method on a known path → methodNotAllowed with the Allow set; unknown path → notFound")
-    func methodNotAllowedAndNotFound() {
+    @Test
+    func `unknown method on a known path → methodNotAllowed with the Allow set; unknown path → notFound`() {
         let routes = table {
             GET("items/{id}", pool: .none) { _, params in .plain(.ok, params.id ?? "?") }
             DELETE("items/{id}", pool: .none) { _, _ in .plain(.ok, "del") }
@@ -126,7 +124,6 @@ struct RESTRoutingTests {
     }
 }
 
-@Suite("Request helpers + content codec")
 struct RequestHelperTests {
     private func context(target: String, body: [UInt8] = [], codec: ContentCodec = .json) -> RequestContext {
         RequestContext(
@@ -135,8 +132,8 @@ struct RequestHelperTests {
                 connection: nil, logger: Logger(label: "t"), requestID: "r", codec: codec))
     }
 
-    @Test("ctx.query parses + percent-decodes")
-    func query() {
+    @Test
+    func `ctx.query parses + percent-decodes`() {
         let ctx = context(target: "/search?q=hello%20world&limit=10&flag")
         #expect(ctx.query["q"] == "hello world")
         #expect(ctx.query.q == "hello world")  // dynamic member
@@ -145,8 +142,8 @@ struct RequestHelperTests {
         #expect(ctx.query["absent"] == nil)
     }
 
-    @Test("ctx.query typed accessors: int/bool/double/require")
-    func typedQuery() throws {
+    @Test
+    func `ctx.query typed accessors: int/bool/double/require`() throws {
         let ctx = context(target: "/search?limit=10&ratio=1.5&verbose&debug=false")
         #expect(ctx.query.int("limit") == 10)
         #expect(ctx.query.int("ratio") == nil)  // not an integer
@@ -160,8 +157,8 @@ struct RequestHelperTests {
         #expect(throws: HTTPError.self) { _ = try ctx.query.requireInt("ratio") }
     }
 
-    @Test("default JSON codec round-trips decode/encode")
-    func jsonRoundTrip() throws {
+    @Test
+    func `default JSON codec round-trips decode/encode`() throws {
         let item = Item(id: 7, name: "gear")
         let (bytes, contentType) = try ContentCodec.json.encoder.encode(item)
         #expect(contentType == "application/json;charset=utf-8")
@@ -169,15 +166,15 @@ struct RequestHelperTests {
         #expect(back == item)
     }
 
-    @Test("ctx.decode reads a typed JSON body")
-    func decodeBody() throws {
+    @Test
+    func `ctx.decode reads a typed JSON body`() throws {
         let ctx = context(target: "/items", body: Array(#"{"id":3,"name":"bolt"}"#.utf8))
         let item = try ctx.decode(Item.self)
         #expect(item == Item(id: 3, name: "bolt"))
     }
 
-    @Test("ctx.json + ctx.decode route through a CUSTOM codec, not ADJSON")
-    func customCodec() throws {
+    @Test
+    func `ctx.json + ctx.decode route through a CUSTOM codec, not ADJSON`() throws {
         // Encoder emits a fixed marker; decoder ignores the body and returns a fixed value — both
         // prove the pluggable port is what runs.
         struct MarkerEncoder: ResponseBodyEncoder {
@@ -203,7 +200,6 @@ struct RequestHelperTests {
     }
 }
 
-@Suite("Middleware pipeline")
 struct MiddlewareTests {
     private actor OrderLog {
         private(set) var entries: [String] = []
@@ -236,8 +232,8 @@ struct MiddlewareTests {
     private let request = ServerRequest(method: .get, target: "/", headers: HTTPFields())
     private let mwContext = MiddlewareContext(requestID: "r", logger: Logger(label: "t"))
 
-    @Test("onion order: outer-in then inner-out, with the handler in the center")
-    func onionOrder() async {
+    @Test
+    func `onion order: outer-in then inner-out, with the handler in the center`() async {
         let log = OrderLog()
         let terminal: @Sendable (ServerRequest) async -> ResponseContent = { _ in
             await log.append("handler")
@@ -250,8 +246,8 @@ struct MiddlewareTests {
         #expect(await log.entries == ["A-in", "B-in", "handler", "B-out", "A-out"])
     }
 
-    @Test("a middleware can short-circuit — the handler never runs")
-    func shortCircuit() async {
+    @Test
+    func `a middleware can short-circuit — the handler never runs`() async {
         let log = OrderLog()
         let terminal: @Sendable (ServerRequest) async -> ResponseContent = { _ in
             await log.append("handler")
@@ -268,12 +264,11 @@ struct MiddlewareTests {
     }
 }
 
-@Suite("Observability middleware")
 struct ObservabilityTests {
     private let request = ServerRequest(method: .get, target: "/items/9?x=1", headers: HTTPFields())
 
-    @Test("statusCode(of:) extracts the numeric status of every response shape")
-    func statusExtraction() {
+    @Test
+    func `statusCode(of:) extracts the numeric status of every response shape`() {
         #expect(statusCode(of: .plain(.ok, "x")) == 200)
         #expect(statusCode(of: .notFound) == 404)
         #expect(statusCode(of: .raw(body: [], contentType: "x", status: .created)) == 201)
@@ -282,8 +277,8 @@ struct ObservabilityTests {
                 == 204)
     }
 
-    @Test("RequestLogging runs and passes the response through unchanged")
-    func passThrough() async {
+    @Test
+    func `RequestLogging runs and passes the response through unchanged`() async {
         let terminal: @Sendable (ServerRequest) async -> ResponseContent = { _ in .plain(.ok, "ok") }
         let ctx = MiddlewareContext(requestID: "rid-1", logger: Logger(label: "test"))
         // threshold 0 exercises the slow-request `.warning` branch; threshold high exercises `.info`.
@@ -299,10 +294,9 @@ struct ObservabilityTests {
     }
 }
 
-@Suite("Errors + response factories")
 struct ErrorTests {
-    @Test("a throwing handler propagates HTTPError through the route's run")
-    func handlerThrows() {
+    @Test
+    func `a throwing handler propagates HTTPError through the route's run`() {
         let routes = table {
             GET("boom", pool: .none) { _ in throw HTTPError.badRequest("no") }
         }
@@ -318,8 +312,8 @@ struct ErrorTests {
         }
     }
 
-    @Test("response factories produce the right status, headers, and problem body")
-    func factories() {
+    @Test
+    func `response factories produce the right status, headers, and problem body`() {
         if case .full(_, _, let status, let headers) = ResponseContent.created(location: "/items/1") {
             #expect(status == .created)
             #expect(headers[.location] == "/items/1")
@@ -362,12 +356,11 @@ private struct SetUser: HTTPMiddleware {
     }
 }
 
-@Suite("Middleware — CORS, security headers, storage, 415")
 struct MiddlewareBuiltinsTests {
     private let ctx = MiddlewareContext(requestID: "r", logger: Logger(label: "t"))
 
-    @Test("CORS owns the preflight (204 + Allow set) and never calls the handler")
-    func corsPreflight() async {
+    @Test
+    func `CORS owns the preflight (204 + Allow set) and never calls the handler`() async {
         let chain = composeMiddleware(
             [CORS(allowOrigin: "https://x.com", allowMethods: [.get, .post])], context: ctx,
             terminal: { _ in .plain(.ok, "handler ran") })
@@ -383,8 +376,8 @@ struct MiddlewareBuiltinsTests {
         #expect(h[fieldName("access-control-allow-methods")]?.contains("GET") == true)
     }
 
-    @Test("CORS decorates an actual request's response with Allow-Origin")
-    func corsActual() async {
+    @Test
+    func `CORS decorates an actual request's response with Allow-Origin`() async {
         let chain = composeMiddleware(
             [CORS(allowOrigin: "https://x.com")], context: ctx, terminal: { _ in .plain(.ok, "ok") })
         let response = await chain(ServerRequest(method: .get, target: "/x", headers: HTTPFields()))
@@ -396,8 +389,8 @@ struct MiddlewareBuiltinsTests {
         #expect(h[fieldName("access-control-allow-origin")] == "https://x.com")
     }
 
-    @Test("SecurityHeaders decorates the response")
-    func securityHeaders() async {
+    @Test
+    func `SecurityHeaders decorates the response`() async {
         let chain = composeMiddleware([SecurityHeaders()], context: ctx, terminal: { _ in .plain(.ok, "ok") })
         let response = await chain(ServerRequest(method: .get, target: "/", headers: HTTPFields()))
         if case .full(_, _, _, let h) = response {
@@ -408,8 +401,8 @@ struct MiddlewareBuiltinsTests {
         }
     }
 
-    @Test("request storage is shared middleware → handler")
-    func requestStorage() async {
+    @Test
+    func `request storage is shared middleware → handler`() async {
         let storage = RequestStorage()
         let context = MiddlewareContext(requestID: "r", logger: Logger(label: "t"), storage: storage)
         let chain = composeMiddleware([SetUser()], context: context, terminal: { _ in .plain(.ok, "ok") })
@@ -417,8 +410,8 @@ struct MiddlewareBuiltinsTests {
         #expect(storage[CurrentUser.self] == "alice")
     }
 
-    @Test("the JSON codec rejects a non-JSON content type with 415")
-    func unsupportedMediaType() throws {
+    @Test
+    func `the JSON codec rejects a non-JSON content type with 415`() throws {
         let body = Array(#"{"id":1,"name":"x"}"#.utf8)
         #expect(throws: HTTPError.self) {
             _ = try JSONBodyCodec().decode(Item.self, from: body, contentType: "text/xml")
@@ -430,10 +423,9 @@ struct MiddlewareBuiltinsTests {
     }
 }
 
-@Suite("Per-route body limit")
 struct BodyLimitTests {
-    @Test(".maxBody surfaces on the matched route; a group default applies; an inner route wins")
-    func maxBodyThreading() {
+    @Test
+    func `.maxBody surfaces on the matched route; a group default applies; an inner route wins`() {
         let routes = table {
             POST("upload", pool: .none) { _ in .noContent }.maxBody(10)
             Group("admin") {
@@ -456,8 +448,8 @@ struct BodyLimitTests {
         #expect(limit(.post, "/plain") == nil)  // matched (no Issue recorded) but carries no limit
     }
 
-    @Test("RouteTable.bodyLimit surfaces the matched route's ceiling for the engine's head-time peek")
-    func bodyLimitPeek() {
+    @Test
+    func `RouteTable.bodyLimit surfaces the matched route's ceiling for the engine's head-time peek`() {
         let routes = table {
             POST("upload", pool: .none) { _ in .noContent }.maxBody(50_000_000)  // upload, above any default
             POST("plain", pool: .none) { _ in .noContent }
@@ -468,10 +460,9 @@ struct BodyLimitTests {
     }
 }
 
-@Suite("Routing specificity order")
 struct RoutingSpecificityTests {
-    @Test("literal routes are scoped to their segment; param/catch-all reached by structure")
-    func scoping() {
+    @Test
+    func `literal routes are scoped to their segment; param/catch-all reached by structure`() {
         let routes = table {
             GET("items/{id}", pool: .none) { _, p in .plain(.ok, "item-\(p.id ?? "?")") }
             GET("users/{id}", pool: .none) { _, p in .plain(.ok, "user-\(p.id ?? "?")") }
@@ -506,10 +497,9 @@ struct RoutingSpecificityTests {
     }
 }
 
-@Suite("Routing trie — adversarial")
 struct RoutingTrieAdversarialTests {
-    @Test("exact beats param beats catch-all at one position")
-    func specificityLadder() {
+    @Test
+    func `exact beats param beats catch-all at one position`() {
         let routes = table {
             GET("files/readme", pool: .none) { _ in .plain(.ok, "exact") }
             GET("files/{id}", pool: .none) { _, p in .plain(.ok, "param-\(p.id ?? "?")") }
@@ -520,8 +510,8 @@ struct RoutingTrieAdversarialTests {
         #expect(plain(runMatched(routes, .get, "/files/a/b"))?.1 == "catchall-a/b")
     }
 
-    @Test("backtracks when a more-specific branch dead-ends")
-    func backtracking() {
+    @Test
+    func `backtracks when a more-specific branch dead-ends`() {
         let routes = table {
             GET("a/b/c", pool: .none) { _ in .plain(.ok, "exact-abc") }
             GET("a/{x}", pool: .none) { _, p in .plain(.ok, "ax-\(p.x ?? "?")") }
@@ -535,8 +525,8 @@ struct RoutingTrieAdversarialTests {
         #expect(plain(runMatched(routes, .get, "/m/n"))?.1 == "pq-m")  // root-level param branch
     }
 
-    @Test("405 collects every method at a node, de-duplicated")
-    func methodNotAllowedAtNode() {
+    @Test
+    func `405 collects every method at a node, de-duplicated`() {
         let routes = table {
             GET("items/{id}", pool: .none) { _, p in .plain(.ok, p.id ?? "?") }
             DELETE("items/{id}", pool: .none) { _, _ in .plain(.ok, "del") }
@@ -550,8 +540,8 @@ struct RoutingTrieAdversarialTests {
         #expect(allowed.count == 3)  // no duplicates
     }
 
-    @Test("405 unions methods across backtracking branches")
-    func methodNotAllowedUnion() {
+    @Test
+    func `405 unions methods across backtracking branches`() {
         let routes = table {
             GET("{a}/{b}", pool: .none) { _, _ in .plain(.ok, "ab") }
             POST("files/{rest*}", pool: .none) { _, _ in .plain(.ok, "files") }
@@ -565,8 +555,8 @@ struct RoutingTrieAdversarialTests {
         #expect(allowed.contains(.post))
     }
 
-    @Test("exact path and a param overlap: exact serves its method; both fold into the 405 set")
-    func exactParamMethodSplit() {
+    @Test
+    func `exact path and a param overlap: exact serves its method; both fold into the 405 set`() {
         let routes = table {
             GET("users/me", pool: .none) { _ in .plain(.ok, "me") }
             GET("users/{id}", pool: .none) { _, p in .plain(.ok, "id-\(p.id ?? "?")") }
@@ -580,8 +570,8 @@ struct RoutingTrieAdversarialTests {
         #expect(allowed == [.get])  // exact GET + param GET, de-duped to a single entry
     }
 
-    @Test("encoded traversal is rejected under specificity backtracking")
-    func encodedTraversalRejected() {
+    @Test
+    func `encoded traversal is rejected under specificity backtracking`() {
         let routes = table {
             GET("files/{id}", pool: .none) { _, p in .plain(.ok, "id-\(p.id ?? "?")") }
             GET("files/{rest*}", pool: .none) { _, p in .plain(.ok, "rest-\(p.rest ?? "?")") }
@@ -593,8 +583,8 @@ struct RoutingTrieAdversarialTests {
         #expect(plain(runMatched(routes, .get, "/files/a/b/c"))?.1 == "rest-a/b/c")  // normal multi → catch-all
     }
 
-    @Test("root path matches, and 405/404 behave at the root")
-    func rootPath() {
+    @Test
+    func `root path matches, and 405/404 behave at the root`() {
         let routes = table {
             GET("/", pool: .none) { _ in .plain(.ok, "root") }
         }
@@ -607,8 +597,8 @@ struct RoutingTrieAdversarialTests {
         #expect(runMatched(routes, .get, "/anything") == nil)
     }
 
-    @Test("opaque GET(match:) matchers are residual — the trie wins; opaque serves only trie misses")
-    func opaqueCoexistence() {
+    @Test
+    func `opaque GET(match:) matchers are residual — the trie wins; opaque serves only trie misses`() {
         let routes = table {
             GET("items/{id}", pool: .none) { _, p in .plain(.ok, "trie-\(p.id ?? "?")") }
             GET(match: { $0.hasPrefix("/legacy/") ? true : nil }, pool: .none) { _, _ in .plain(.ok, "opaque") }
@@ -625,10 +615,9 @@ struct RoutingTrieAdversarialTests {
     }
 }
 
-@Suite("Static assets")
 struct StaticAssetDSLTests {
-    @Test("content-type allow-list maps known extensions and rejects the rest")
-    func contentTypeAllowList() {
+    @Test
+    func `content-type allow-list maps known extensions and rejects the rest`() {
         #expect(staticContentType(forPath: "app.js") == "text/javascript; charset=utf-8")
         #expect(staticContentType(forPath: "a/b/style.css") == "text/css; charset=utf-8")
         #expect(staticContentType(forPath: "icon.SVG") == "image/svg+xml")  // extension is case-insensitive
@@ -638,8 +627,8 @@ struct StaticAssetDSLTests {
         #expect(staticContentType(forPath: ".env") == nil)  // leading-dot dotfile
     }
 
-    @Test("Static serves allow-listed files; 404s dotfiles + non-allow-listed extensions")
-    func staticRouting() {
+    @Test
+    func `Static serves allow-listed files; 404s dotfiles + non-allow-listed extensions`() {
         let routes = table { Static("/assets", root: "/tmp/whatever") }
         guard case .file(_, let subpath, let contentType, _)? = runMatched(routes, .get, "/assets/app.css")
         else {
