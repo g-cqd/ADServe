@@ -114,7 +114,7 @@ public enum MultipartParser {
     /// traps on malformed input (a bad part is skipped).
     public static func parse(_ body: [UInt8], boundary: String) -> MultipartForm {
         let delimiter = Array("--\(boundary)".utf8)
-        let segments = split(body, on: delimiter)
+        let segments = ByteSearch.split(body, on: delimiter)
         var parts: [MultipartPart] = []
         // segments[0] is the preamble (before the first delimiter, normally empty). A segment beginning
         // with "--" is the closing delimiter (`--boundary--`) — stop.
@@ -132,7 +132,7 @@ public enum MultipartParser {
     /// not valid `form-data` and is dropped).
     private static func parsePart(_ bytes: ArraySlice<UInt8>) -> MultipartPart? {
         let separator: [UInt8] = [13, 10, 13, 10]
-        guard let range = firstRange(of: separator, in: bytes) else { return nil }
+        guard let range = ByteSearch.firstRange(of: separator, in: bytes) else { return nil }
         let headerText = String(decoding: bytes[..<range.lowerBound], as: UTF8.self)
         let partBody = Array(bytes[range.upperBound...])
 
@@ -163,38 +163,5 @@ public enum MultipartParser {
             value = value[..<semicolon]
         }
         return String(value)
-    }
-
-    // MARK: - Byte helpers
-
-    /// The first range of `needle` in `haystack` at or after `from`, or `nil`.
-    private static func firstRange(of needle: [UInt8], in haystack: ArraySlice<UInt8>) -> Range<Int>? {
-        guard !needle.isEmpty, haystack.count >= needle.count else { return nil }
-        let lastStart = haystack.endIndex - needle.count
-        var index = haystack.startIndex
-        while index <= lastStart {
-            if haystack[index] == needle[0] {
-                var matched = true
-                for offset in 1 ..< needle.count where haystack[index + offset] != needle[offset] {
-                    matched = false
-                    break
-                }
-                if matched { return index ..< (index + needle.count) }
-            }
-            index += 1
-        }
-        return nil
-    }
-
-    /// Split `bytes` on every (non-overlapping) occurrence of `separator`.
-    private static func split(_ bytes: [UInt8], on separator: [UInt8]) -> [ArraySlice<UInt8>] {
-        var result: [ArraySlice<UInt8>] = []
-        var start = bytes.startIndex
-        while let range = firstRange(of: separator, in: bytes[start...]) {
-            result.append(bytes[start ..< range.lowerBound])
-            start = range.upperBound
-        }
-        result.append(bytes[start...])
-        return result
     }
 }
