@@ -127,17 +127,19 @@ extension HTTPServer {
         return try NIOSSLContext(configuration: config)
     }
 
-    /// Read-idle deadline per connection/stream. Positioned after HTTP decoding, so
-    /// the timer resets on each decoded request part, not on raw bytes: a peer that
-    /// connects and stalls (or dribbles an incomplete request) is closed instead of
-    /// pinning a slot indefinitely (slowloris, CWE-400). Generous vs. the ms-scale
-    /// handler latency, so it never trips a legitimate in-flight request.
+    /// All-idle deadline per connection/stream. Positioned after HTTP decoding, so it resets on each
+    /// decoded request part AND each response write — not on raw bytes. A peer that connects and stalls
+    /// (or dribbles an incomplete request) is closed instead of pinning a slot indefinitely (slowloris,
+    /// CWE-400), while a long-lived SSE stream stays open because its server-write heartbeats reset the
+    /// timer (a read-only timer would wrongly reap a healthy server→client stream). Generous vs. the
+    /// ms-scale handler latency, so it never trips a legitimate in-flight request; an SSE source must
+    /// heartbeat within this window.
     static var idleTimeout: TimeAmount { .seconds(60) }
 
-    /// Installs the read-idle timeout + the close-on-idle handler at the tail of the
-    /// (already-built) HTTP child pipeline, just before the async-channel sink.
+    /// Installs the all-idle timeout + the close-on-idle handler at the tail of the (already-built)
+    /// HTTP child pipeline, just before the async-channel sink.
     static func addIdleTimeout(_ channel: any Channel) throws {
-        try channel.pipeline.syncOperations.addHandler(IdleStateHandler(readTimeout: idleTimeout))
+        try channel.pipeline.syncOperations.addHandler(IdleStateHandler(allTimeout: idleTimeout))
         try channel.pipeline.syncOperations.addHandler(IdleTimeoutHandler())
     }
 }

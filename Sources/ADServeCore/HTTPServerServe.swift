@@ -89,6 +89,8 @@ extension HTTPServer {
             // account/optimise it against this connection (NIO's documented guidance over a
             // throwaway `ByteBufferAllocator()`). A cheap `Sendable` value, captured once.
             let allocator = channel.channel.allocator
+            // Resolves on client disconnect / server quiesce — an SSE stream cancels its source on it.
+            let onClose = channel.channel.closeFuture
             try await channel.executeThenClose { inbound, outbound in
                 var requestHead: HTTPRequest?
                 var body: [UInt8] = []
@@ -155,7 +157,8 @@ extension HTTPServer {
                             active.enter()
                             defer { active.leave() }
                             let exchange = RequestExchange(
-                                head: head, outbound: outbound, isHTTP2: isHTTP2, allocator: allocator)
+                                head: head, outbound: outbound, isHTTP2: isHTTP2, allocator: allocator,
+                                onClose: onClose)
                             let keepAlive: Bool
                             if overflow {
                                 try await writeBodyTooLarge(exchange)

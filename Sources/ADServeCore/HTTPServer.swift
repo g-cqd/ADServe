@@ -48,14 +48,39 @@ final class ActiveRequests: Sendable {
 struct EngineError: Error { let message: String }
 
 /// The per-request transport context threaded through `respond`/`write`: the decoded request head,
-/// the outbound writer, the wire flavor (HTTP/2 forbids the `Connection` header), and the channel's
-/// pooled allocator (NIO accounts the response buffer against the connection). Bundled so the write
-/// path stays within the engine's parameter-count budget.
+/// the outbound writer, the wire flavor (HTTP/2 forbids the `Connection` header), the channel's pooled
+/// allocator (NIO accounts the response buffer against the connection), and the channel's close future
+/// (resolves on client disconnect or server quiesce — an SSE stream cancels its source on it). Bundled
+/// so the write path stays within the engine's parameter-count budget.
 struct RequestExchange {
     let head: HTTPRequest
     let outbound: NIOAsyncChannelOutboundWriter<HTTPResponsePart>
     let isHTTP2: Bool
     let allocator: ByteBufferAllocator
+    let onClose: EventLoopFuture<Void>
+}
+
+/// A wait-free admission counter for concurrent SSE streams. `tryAcquire` reserves a slot via a CAS
+/// loop (never overshoots `limit`); the `.sse` write path returns a 503 when it fails, and `release`
+/// frees the slot when the stream ends. Boxed in a class so the engine value shares one counter.
+final class SSELimiter: Sendable {
+    private let inUse = Atomic<Int>(0)
+    let limit: Int
+    init(limit: Int) { self.limit = max(0, limit) }
+
+    /// Reserve a slot, or `false` at capacity (the caller answers 503 instead of opening the stream).
+    func tryAcquire() -> Bool {
+        var current = inUse.load(ordering: .relaxed)
+        while current < limit {
+            let (exchanged, original) = inUse.compareExchange(
+                expected: current, desired: current + 1, ordering: .relaxed)
+            if exchanged { return true }
+            current = original
+        }
+        return false
+    }
+
+    func release() { inUse.wrappingSubtract(1, ordering: .relaxed) }
 }
 
 /// The ad-server engine. Binds one NIO listener per `ListenerConfig`, all sharing the
@@ -87,12 +112,14 @@ public struct HTTPServer: Sendable {
     let maxBodyBytes: Int
     /// In-flight request count, so a drain waits for real work, not idle keep-alive connections.
     let active = ActiveRequests()
+    /// Admission control for concurrent SSE streams (a `.sse` response past the limit gets a 503).
+    let sseLimiter: SSELimiter
 
     public init(
         listeners: [ListenerConfig], pool: AnyConnectionPool?, envelope: HTTPFields, logger: Logger,
         threadCount: Int, loopCount: Int = 2, readiness: ServerReadiness? = nil,
         transport: EngineTransport = .nio, middleware: [any HTTPMiddleware] = [],
-        codec: ContentCodec = .json, maxBodyBytes: Int = 1_000_000
+        codec: ContentCodec = .json, maxBodyBytes: Int = 1_000_000, maxConcurrentSSE: Int = 1024
     ) {
         self.listeners = listeners
         self.pool = pool
@@ -105,6 +132,7 @@ public struct HTTPServer: Sendable {
         self.middleware = middleware
         self.codec = codec
         self.maxBodyBytes = max(0, maxBodyBytes)
+        self.sseLimiter = SSELimiter(limit: maxConcurrentSSE)
     }
 
     public func run() async throws {

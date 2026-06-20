@@ -40,6 +40,58 @@ struct ChannelBodyWriter: ResponseBodyWriter {
     func flush() async throws {}
 }
 
+/// Pure WHATWG `text/event-stream` framing — separated from the channel writer so the grammar
+/// (field order, multi-line `data`, single-line sanitization) is unit-testable without a socket.
+enum SSEFraming {
+    /// One event frame: optional `event:`/`id:`/`retry:` fields, then one `data:` line per line of
+    /// `data`, then the terminating blank line that dispatches the event.
+    static func event(event: String?, data: String, id: String?, retry: Int?) -> String {
+        var frame = ""
+        if let event { frame += "event: \(singleLine(event))\n" }
+        if let id { frame += "id: \(singleLine(id))\n" }
+        if let retry { frame += "retry: \(retry)\n" }
+        // One `data:` line per line of `data`. Split at the SCALAR level: Swift clusters "\r\n" into a
+        // single `Character`, so a Character-level split on "\n" would miss CRLF entirely. Stripping a
+        // trailing CR off each piece then makes "\r\n" collapse to one line break.
+        for piece in data.unicodeScalars.split(separator: "\n", omittingEmptySubsequences: false) {
+            var line = String(String.UnicodeScalarView(piece))
+            if line.hasSuffix("\r") { line.removeLast() }
+            frame += "data: \(line)\n"
+        }
+        return frame + "\n"
+    }
+
+    /// A `: comment` line — the SSE keep-alive heartbeat (dispatches no event).
+    static func comment(_ text: String) -> String { ": \(singleLine(text))\n" }
+
+    /// Everything up to the first newline — keeps a single-line field (`event:`/`id:`/`: comment`) from
+    /// being split into multiple lines by an embedded `\n`/`\r` (frame-injection defense).
+    static func singleLine(_ value: String) -> String {
+        String(value.prefix { $0 != "\n" && $0 != "\r" })
+    }
+}
+
+/// The engine's `SSEWriter`: frames each event/comment via `SSEFraming` and writes it as one chunk
+/// (flushed immediately, so a heartbeat reaches the client at once). `Sendable` (both stored values are).
+struct ChannelSSEWriter: SSEWriter {
+    let outbound: NIOAsyncChannelOutboundWriter<HTTPResponsePart>
+    let allocator: ByteBufferAllocator
+
+    func send(event: String?, data: String, id: String?, retry: Int?) async throws {
+        try await writeFrame(SSEFraming.event(event: event, data: data, id: id, retry: retry))
+    }
+
+    func comment(_ text: String) async throws {
+        try await writeFrame(SSEFraming.comment(text))
+    }
+
+    private func writeFrame(_ frame: String) async throws {
+        var buffer = allocator.buffer(capacity: frame.utf8.count)
+        buffer.writeString(frame)
+        try await outbound.write(.body(buffer))
+    }
+}
+
 extension HTTPServer {
     func writeBodyTooLarge(_ exchange: RequestExchange) async throws {
         try await write(
@@ -196,6 +248,33 @@ extension HTTPServer {
             return
         }
 
+        // Server-Sent Events: a long-lived text/event-stream. Admission-controlled (503 at capacity),
+        // `no-store`, status 200, with the source cancelled the instant the peer disconnects or the
+        // server quiesces (so the slot frees promptly — see `driveSSE`).
+        if case .sse(let extra, let body) = content {
+            guard sseLimiter.tryAcquire() else {
+                try await write(
+                    .plain(.serviceUnavailable, "SSE capacity reached\n"), cache: .noStore,
+                    requestID: requestID, keepAlive: keepAlive, suppressBody: suppressBody,
+                    exchange: exchange)
+                return
+            }
+            defer { sseLimiter.release() }
+            var headers = commonHeaders(
+                cache: .noStore, requestID: requestID, keepAlive: keepAlive, isHTTP2: exchange.isHTTP2)
+            headers[.contentType] = "text/event-stream"
+            for field in extra { headers[field.name] = field.value }
+            try await exchange.outbound.write(.head(HTTPResponse(status: .ok, headerFields: headers)))
+            if !suppressBody {
+                try await driveSSE(
+                    body,
+                    writer: ChannelSSEWriter(outbound: exchange.outbound, allocator: exchange.allocator),
+                    onClose: exchange.onClose)
+            }
+            try? await exchange.outbound.write(.end(nil))  // best-effort: the peer may already be gone
+            return
+        }
+
         var materialized = materialize(content)
         var headers = commonHeaders(
             cache: cache, requestID: requestID, keepAlive: keepAlive, isHTTP2: exchange.isHTTP2)
@@ -235,6 +314,27 @@ extension HTTPServer {
         try await exchange.outbound.write(.end(nil))
     }
 
+    /// Drives an SSE `body` to completion, cancelling it the instant the channel closes (peer
+    /// disconnect or server quiesce) or the serving task is cancelled — so the source stops and the
+    /// slot frees without waiting for the next failed write. Normal completion or cancellation is a
+    /// clean end; any other thrown error propagates (dropping the connection).
+    private func driveSSE(
+        _ body: @escaping @Sendable (any SSEWriter) async throws -> Void, writer: ChannelSSEWriter,
+        onClose: EventLoopFuture<Void>
+    ) async throws {
+        let bodyTask = Task { try await body(writer) }
+        onClose.whenComplete { _ in bodyTask.cancel() }
+        try await withTaskCancellationHandler {
+            do {
+                try await bodyTask.value
+            } catch is CancellationError {
+                // Peer disconnected / server quiescing — a normal SSE end, not an error to surface.
+            }
+        } onCancel: {
+            bodyTask.cancel()
+        }
+    }
+
     /// The headers common to every response: cache-control (if any), the constant envelope (security
     /// set + Link + Vary), the echoed/minted request-id, and — h1 only (HTTP/2 forbids it) — the
     /// keep-alive/close connection header. The buffered path layers content-type/length (+ ETag) on
@@ -266,8 +366,8 @@ extension HTTPServer {
             case .full(let body, let contentType, let status, let headers):
                 return MaterializedResponse(
                     status: status, contentType: contentType, body: body, headers: headers)
-            case .stream:
-                // Unreachable: `.stream` is handled in `write` before `materialize` is reached. Return a
+            case .stream, .sse:
+                // Unreachable: `.stream`/`.sse` are handled in `write` before `materialize`. Return a
                 // benign 500 (failure-safe — never traps) should a future buffered caller forget to gate.
                 return MaterializedResponse(
                     status: .internalServerError, contentType: "text/plain; charset=utf-8", body: [],

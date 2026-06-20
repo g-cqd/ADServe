@@ -183,6 +183,27 @@ public protocol ResponseBodyWriter: Sendable {
     func flush() async throws
 }
 
+/// A sink for Server-Sent Events (`text/event-stream`). The engine hands a route's `.sse` body closure
+/// a writer over the connection; each `send`/`comment` frames + flushes one event immediately (so a
+/// heartbeat reaches the client at once) and suspends for back-pressure. Reference-semantic +
+/// `Sendable` (the same rationale as `ResponseBodyWriter`: an `inout` cannot cross an `await`). The
+/// engine frames per the WHATWG spec — multi-line `data` becomes one `data:` line each; `event`/`id`
+/// are forced single-line so a stray newline cannot inject a second event.
+public protocol SSEWriter: Sendable {
+    /// Send one event: optional `event:`/`id:`/`retry:` fields + one or more `data:` lines, then the
+    /// terminating blank line. `data`'s embedded newlines are split into multiple `data:` lines.
+    func send(event: String?, data: String, id: String?, retry: Int?) async throws
+    /// A `: comment` line — the SSE keep-alive heartbeat (no event is dispatched to the client).
+    func comment(_ text: String) async throws
+}
+
+extension SSEWriter {
+    /// Convenience: send `data` with an optional `event`/`id` (no `retry`).
+    public func send(_ data: String, event: String? = nil, id: String? = nil) async throws {
+        try await send(event: event, data: data, id: id, retry: nil)
+    }
+}
+
 /// What a handler returns. The cross-cutting envelope (security set, Link, Vary,
 /// request-id) + cache-control/ETag are applied by the engine, not here.
 public enum ResponseContent: Sendable {
@@ -205,6 +226,11 @@ public enum ResponseContent: Sendable {
     case stream(
         contentType: String, status: HTTPResponse.Status = .ok, headers: HTTPFields = [:],
         body: @Sendable (any ResponseBodyWriter) async throws -> Void)
+    /// A long-lived Server-Sent Events stream (`text/event-stream`, `Cache-Control: no-store`, status
+    /// 200). The engine frames events, caps concurrency (503 past the limit), heartbeat-friendly
+    /// idle handling, and cancels `body` the instant the peer disconnects or the server quiesces — so
+    /// the slot frees promptly. `body` typically loops an app change-feed until cancelled.
+    case sse(headers: HTTPFields = [:], body: @Sendable (any SSEWriter) async throws -> Void)
 
     /// JSON body. Defaults to Bun's `Response.json` content-type; pass `contentType`
     /// to override (e.g. `/search` emits `application/json` with no charset).
@@ -424,6 +450,7 @@ public func statusCode(of content: ResponseContent) -> Int {
         case .raw(_, _, let status), .full(_, _, let status, _): return status.code
         case .plain(let status, _): return status.code
         case .stream(_, let status, _, _): return status.code
+        case .sse: return 200  // SSE is always 200 text/event-stream
         case .notFound: return 404
     }
 }
