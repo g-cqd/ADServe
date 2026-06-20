@@ -231,6 +231,12 @@ public enum ResponseContent: Sendable {
     /// idle handling, and cancels `body` the instant the peer disconnects or the server quiesces — so
     /// the slot frees promptly. `body` typically loops an app change-feed until cancelled.
     case sse(headers: HTTPFields = [:], body: @Sendable (any SSEWriter) async throws -> Void)
+    /// A guarded static file served from `root` + `subpath`. The engine resolves it OFF the event loop
+    /// (NIOFileSystem): 404 if missing / not a regular file / a symlink / outside the canonicalized root
+    /// jail; otherwise a strong size+mtime `ETag` with `If-None-Match` → 304, and the body streamed in
+    /// chunks. The DSL `Static(_:root:)` validates the subpath (no dotfiles; an allow-listed extension →
+    /// `contentType`) and produces this; `headers` carries any response-middleware decoration.
+    case file(root: String, subpath: String, contentType: String, headers: HTTPFields = [:])
 
     /// JSON body. Defaults to Bun's `Response.json` content-type; pass `contentType`
     /// to override (e.g. `/search` emits `application/json` with no charset).
@@ -451,6 +457,8 @@ public func statusCode(of content: ResponseContent) -> Int {
         case .plain(let status, _): return status.code
         case .stream(_, let status, _, _): return status.code
         case .sse: return 200  // SSE is always 200 text/event-stream
+        // The nominal status; the engine resolves the real 200/304/404 off-loop in `writeFile`.
+        case .file: return 200
         case .notFound: return 404
     }
 }

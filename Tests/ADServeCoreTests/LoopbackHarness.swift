@@ -39,13 +39,15 @@ private final class ResponseCollector: ChannelInboundHandler, @unchecked Sendabl
 /// by the streaming/SSE/static integration tests. Best-effort teardown (cancel the serve task; a fresh
 /// port per call keeps tests isolated) and bounded waits, so it can never hang CI.
 enum Loopback {
-    static func run(path: String, routes: any HTTPHandling) async throws -> String {
+    static func run(
+        path: String, routes: any HTTPHandling, headers: [(name: String, value: String)] = []
+    ) async throws -> String {
         // The harness ELG (probe + client). `shutdownGracefully` must be awaited (the strict test
         // settings forbid the blocking `syncShutdownGracefully` in an async context), so bracket the
         // work in do/catch rather than a `defer`.
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         do {
-            let response = try await serve(path: path, routes: routes, group: group)
+            let response = try await serve(path: path, routes: routes, headers: headers, group: group)
             try? await group.shutdownGracefully()
             return response
         } catch {
@@ -55,7 +57,8 @@ enum Loopback {
     }
 
     private static func serve(
-        path: String, routes: any HTTPHandling, group: MultiThreadedEventLoopGroup
+        path: String, routes: any HTTPHandling, headers: [(name: String, value: String)],
+        group: MultiThreadedEventLoopGroup
     ) async throws -> String {
         // Discover a free loopback port (bind :0, read the assignment, release it).
         let probe = try await ServerBootstrap(group: group).bind(host: "127.0.0.1", port: 0).get()
@@ -78,7 +81,9 @@ enum Loopback {
         }
 
         // `Connection: close` makes the server close after `.end`, ending the client's read at EOF.
-        let request = "GET \(path) HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        var requestLines = "GET \(path) HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n"
+        for header in headers { requestLines += "\(header.name): \(header.value)\r\n" }
+        let request = requestLines + "\r\n"
         let promise = group.next().makePromise(of: [UInt8].self)
         let client = try await ClientBootstrap(group: group)
             .channelInitializer { channel in channel.pipeline.addHandler(ResponseCollector(promise)) }

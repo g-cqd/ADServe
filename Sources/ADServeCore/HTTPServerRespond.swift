@@ -275,6 +275,16 @@ extension HTTPServer {
             return
         }
 
+        // A guarded static file: the jail/stat/read run off the event loop (NIOThreadPool); the engine
+        // then writes 200 (streamed body) / 304 / 404. See HTTPServerStatic.swift.
+        if case .file(let root, let subpath, let contentType, let fileHeaders) = content {
+            try await writeFile(
+                StaticFileRequest(
+                    root: root, subpath: subpath, contentType: contentType, headers: fileHeaders),
+                cache: cache, requestID: requestID, exchange: exchange)
+            return
+        }
+
         var materialized = materialize(content)
         var headers = commonHeaders(
             cache: cache, requestID: requestID, keepAlive: keepAlive, isHTTP2: exchange.isHTTP2)
@@ -339,7 +349,7 @@ extension HTTPServer {
     /// set + Link + Vary), the echoed/minted request-id, and — h1 only (HTTP/2 forbids it) — the
     /// keep-alive/close connection header. The buffered path layers content-type/length (+ ETag) on
     /// top; the streamed path layers content-type (no length/ETag, since the body is unbounded).
-    private func commonHeaders(
+    func commonHeaders(
         cache: CachePolicy, requestID: String, keepAlive: Bool, isHTTP2: Bool
     ) -> HTTPFields {
         var headers = HTTPFields()
@@ -366,9 +376,9 @@ extension HTTPServer {
             case .full(let body, let contentType, let status, let headers):
                 return MaterializedResponse(
                     status: status, contentType: contentType, body: body, headers: headers)
-            case .stream, .sse:
-                // Unreachable: `.stream`/`.sse` are handled in `write` before `materialize`. Return a
-                // benign 500 (failure-safe — never traps) should a future buffered caller forget to gate.
+            case .stream, .sse, .file:
+                // Unreachable: these are handled in `write` before `materialize`. Return a benign 500
+                // (failure-safe — never traps) should a future buffered caller forget to gate on them.
                 return MaterializedResponse(
                     status: .internalServerError, contentType: "text/plain; charset=utf-8", body: [],
                     headers: HTTPFields())

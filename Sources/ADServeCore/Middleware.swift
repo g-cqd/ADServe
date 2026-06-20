@@ -52,6 +52,9 @@ extension ResponseContent {
             case .sse(var headers, let body):
                 for field in extra { headers[field.name] = field.value }
                 return .sse(headers: headers, body: body)
+            case .file(let root, let subpath, let contentType, var headers):
+                for field in extra { headers[field.name] = field.value }
+                return .file(root: root, subpath: subpath, contentType: contentType, headers: headers)
         }
     }
 }

@@ -130,6 +130,68 @@ public func Group(_ prefix: String, @RouteGroupBuilder _ children: () -> [RouteN
     }
 }
 
+// MARK: - Static assets
+
+/// Serve guarded static files from `root` under `mountPath` (adserve-requirements #4): e.g.
+/// `Static("/assets", root: "Public")` maps `GET /assets/app.css` → `Public/app.css`. The match is a
+/// catch-all (lowest priority, so explicit routes always win), and the bytes are jailed + served by the
+/// engine off the event loop (the resolved real path must stay inside `root` — `..` and symlink escape
+/// are rejected). The handler here rejects dotfiles and any extension NOT on the content-type
+/// allow-list (so source files, `.env`, etc. are never served), and stamps the `cache` policy
+/// (`.immutable` by default — pair it with content-hashed filenames). SRI hashing stays in
+/// ADHTML/`ADHTMLSRI`; ADServe just serves the bytes.
+public func Static(_ mountPath: String, root: String, cache: CachePolicy = .immutable) -> RouteNode {
+    let template = mountPath.hasSuffix("/") ? mountPath + "{path*}" : mountPath + "/{path*}"
+    return GET(template, pool: .none) { (_: RequestContext, params: PathParameters) -> ResponseContent in
+        guard let subpath = params.path, !subpath.isEmpty else { return .notFound }
+        // Reject dotfiles (any segment starting with "."); PathTemplate already rejected `.`/`..` and
+        // encoded separators, so the subpath cannot climb out of `root`.
+        for segment in subpath.split(separator: "/") where segment.hasPrefix(".") { return .notFound }
+        guard let contentType = staticContentType(forPath: subpath) else { return .notFound }
+        return .file(root: root, subpath: subpath, contentType: contentType)
+    }
+    .cache(cache)
+}
+
+/// The content-type for a static path by its final-segment extension, or `nil` (→ 404) for an
+/// extension-less path or one NOT on the allow-list. The allow-list is the whole point: only known
+/// asset types are ever served — never source, configs, or arbitrary files.
+func staticContentType(forPath path: String) -> String? {
+    let lastSegment = path.split(separator: "/").last.map(String.init) ?? path
+    guard let dotIndex = lastSegment.lastIndex(of: "."), dotIndex != lastSegment.startIndex else {
+        return nil  // no extension, or a leading-dot dotfile
+    }
+    let ext = lastSegment[lastSegment.index(after: dotIndex)...].lowercased()
+    return staticContentTypes[ext]
+}
+
+/// The static-asset extension allow-list — the default covers the ADHTML runtime + CSS/SVG/fonts/
+/// images/wasm. A project needing more types wraps `Static` at the call site.
+let staticContentTypes: [String: String] = [
+    "js": "text/javascript; charset=utf-8",
+    "mjs": "text/javascript; charset=utf-8",
+    "css": "text/css; charset=utf-8",
+    "html": "text/html; charset=utf-8",
+    "json": "application/json; charset=utf-8",
+    "map": "application/json; charset=utf-8",
+    "svg": "image/svg+xml",
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "gif": "image/gif",
+    "webp": "image/webp",
+    "avif": "image/avif",
+    "ico": "image/x-icon",
+    "woff": "font/woff",
+    "woff2": "font/woff2",
+    "ttf": "font/ttf",
+    "otf": "font/otf",
+    "txt": "text/plain; charset=utf-8",
+    "xml": "application/xml; charset=utf-8",
+    "wasm": "application/wasm",
+    "webmanifest": "application/manifest+json"
+]
+
 // MARK: - Routes (typed verbs + typed pool → typed context)
 
 // Each verb has an exact-path form `VERB("path") { ctx in … }` and a typed-template form

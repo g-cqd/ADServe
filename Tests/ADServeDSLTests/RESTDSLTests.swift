@@ -1,8 +1,9 @@
 import ADServeCore
-import ADServeDSL
 import HTTPTypes
 import Logging
 import Testing
+
+@testable import ADServeDSL
 
 // A DTO for the codec round-trip tests.
 private struct Item: Codable, Equatable, Sendable {
@@ -622,4 +623,43 @@ struct RoutingTrieAdversarialTests {
         }
         #expect(allowed.contains(.get))
     }
+}
+
+@Suite("Static assets")
+struct StaticAssetDSLTests {
+    @Test("content-type allow-list maps known extensions and rejects the rest")
+    func contentTypeAllowList() {
+        #expect(staticContentType(forPath: "app.js") == "text/javascript; charset=utf-8")
+        #expect(staticContentType(forPath: "a/b/style.css") == "text/css; charset=utf-8")
+        #expect(staticContentType(forPath: "icon.SVG") == "image/svg+xml")  // extension is case-insensitive
+        #expect(staticContentType(forPath: "runtime.min.js") == "text/javascript; charset=utf-8")
+        #expect(staticContentType(forPath: "noext") == nil)  // no extension
+        #expect(staticContentType(forPath: "app.exe") == nil)  // not allow-listed
+        #expect(staticContentType(forPath: ".env") == nil)  // leading-dot dotfile
+    }
+
+    @Test("Static serves allow-listed files; 404s dotfiles + non-allow-listed extensions")
+    func staticRouting() {
+        let routes = table { Static("/assets", root: "/tmp/whatever") }
+        guard case .file(_, let subpath, let contentType, _)? = runMatched(routes, .get, "/assets/app.css")
+        else {
+            Issue.record("expected .file for an allow-listed asset")
+            return
+        }
+        #expect(subpath == "app.css")
+        #expect(contentType == "text/css; charset=utf-8")
+        #expect(staticSubpath(runMatched(routes, .get, "/assets/sub/app.js")) == "sub/app.js")  // nested
+        #expect(isNotFoundContent(runMatched(routes, .get, "/assets/.env")))  // dotfile
+        #expect(isNotFoundContent(runMatched(routes, .get, "/assets/secret.exe")))  // not allow-listed
+    }
+}
+
+private func isNotFoundContent(_ content: ResponseContent?) -> Bool {
+    if case .notFound? = content { return true }
+    return false
+}
+
+private func staticSubpath(_ content: ResponseContent?) -> String? {
+    if case .file(_, let subpath, _, _)? = content { return subpath }
+    return nil
 }

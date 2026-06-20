@@ -58,6 +58,8 @@ struct RequestExchange {
     let isHTTP2: Bool
     let allocator: ByteBufferAllocator
     let onClose: EventLoopFuture<Void>
+    /// The offload pool — `.file` responses run their blocking jail/stat/read here, off the event loop.
+    let threadPool: NIOThreadPool
 }
 
 /// A wait-free admission counter for concurrent SSE streams. `tryAcquire` reserves a slot via a CAS
