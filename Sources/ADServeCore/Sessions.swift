@@ -133,6 +133,13 @@ public enum SessionKey: StorageKey {
     public typealias Value = Session
 }
 
+/// A misconfiguration of the `Sessions` middleware, surfaced at construction so a weak setup fails fast
+/// (at boot) rather than shipping forgeable sessions.
+public enum SessionConfigError: Error, Equatable, Sendable {
+    /// The signing secret was shorter than the required minimum (a weak key an attacker could brute-force).
+    case secretTooShort(provided: Int, minimum: Int)
+}
+
 // MARK: - Middleware
 
 /// Signed-cookie session middleware. Install it server-wide (or per group). It reads + HMAC-verifies the
@@ -148,15 +155,27 @@ public struct Sessions: HTTPMiddleware {
     private let httpOnly: Bool
     private let sameSite: SameSite
 
-    /// `secret` is the HMAC key bytes — keep it stable across restarts (else every session is invalidated)
-    /// and secret (its disclosure lets an attacker forge session ids). Use 32+ random bytes.
+    /// The minimum signing-secret length (bytes). Below this a key is brute-forceable; construction throws.
+    public static let minimumSecretBytes = 32
+
+    /// `secret` is the signing-key material — keep it stable across restarts (else every session is
+    /// invalidated) and confidential (its disclosure lets an attacker forge session ids). It MUST be at
+    /// least ``minimumSecretBytes`` bytes (`SessionConfigError.secretTooShort` otherwise). The actual HMAC
+    /// key is HKDF-SHA256-**derived** from it, so the signing key is always a uniform 32 bytes regardless
+    /// of how the secret's entropy is distributed (a hardening over keying the HMAC with raw bytes).
     public init(
         secret: [UInt8], store: any SessionStore = InMemorySessionStore(), cookieName: String = "session",
         maxAgeSeconds: Int = 86_400, secure: Bool = true, httpOnly: Bool = true,
         sameSite: SameSite = .lax
-    ) {
+    ) throws {
+        guard secret.count >= Self.minimumSecretBytes else {
+            throw SessionConfigError.secretTooShort(provided: secret.count, minimum: Self.minimumSecretBytes)
+        }
         self.store = store
-        self.key = SymmetricKey(data: secret)
+        self.key = HKDF<SHA256>
+            .deriveKey(
+                inputKeyMaterial: SymmetricKey(data: secret),
+                info: Data("ADServe.Sessions.v1.cookie-signing".utf8), outputByteCount: 32)
         self.cookieName = cookieName
         self.maxAgeSeconds = maxAgeSeconds
         self.secure = secure

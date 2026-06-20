@@ -25,7 +25,7 @@ import Testing
     }
 
     @Test func signedSessionSurvivesARoundTrip() async throws {
-        let sessions = Sessions(secret: secret, store: InMemorySessionStore(), secure: false)
+        let sessions = try Sessions(secret: secret, store: InMemorySessionStore(), secure: false)
         let routes = sessionEchoRoutes()
 
         let first = try await Loopback.runRaw(
@@ -39,7 +39,7 @@ import Testing
     }
 
     @Test func tamperedSessionCookieIsRejected() async throws {
-        let sessions = Sessions(secret: secret, store: InMemorySessionStore(), secure: false)
+        let sessions = try Sessions(secret: secret, store: InMemorySessionStore(), secure: false)
         let routes = sessionEchoRoutes()
 
         let first = try await Loopback.runRaw(
@@ -54,7 +54,7 @@ import Testing
     }
 
     @Test func readOnlyRequestSetsNoCookie() async throws {
-        let sessions = Sessions(secret: secret, store: InMemorySessionStore(), secure: false)
+        let sessions = try Sessions(secret: secret, store: InMemorySessionStore(), secure: false)
         // A GET that only reads the (empty) session must not mint one / set a cookie.
         let routes = InputStubRoutes { input in
             _ = input.storage[SessionKey.self]?["user"]

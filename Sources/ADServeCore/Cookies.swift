@@ -93,16 +93,37 @@ public struct SetCookie: Sendable {
     }
 
     /// The `Set-Cookie` header value: `name=value` plus each present attribute (`Path`/`Domain`/
-    /// `Max-Age`/`Secure`/`HttpOnly`/`SameSite`).
+    /// `Max-Age`/`Secure`/`HttpOnly`/`SameSite`). Caller-controlled components are SANITIZED first
+    /// (`sanitized(_:isName:)`) so a hostile value cannot inject a CRLF (HTTP response splitting) or a `;`
+    /// (a forged attribute) — defense-in-depth over swift-http-types' own header-value validation.
     public var headerValue: String {
-        var out = "\(name)=\(value)"
-        if let path { out += "; Path=\(path)" }
-        if let domain { out += "; Domain=\(domain)" }
-        if let maxAge { out += "; Max-Age=\(maxAge)" }
+        var out = "\(Self.sanitized(name, isName: true))=\(Self.sanitized(value, isName: false))"
+        if let path { out += "; Path=\(Self.sanitized(path, isName: false))" }
+        if let domain { out += "; Domain=\(Self.sanitized(domain, isName: false))" }
+        if let maxAge { out += "; Max-Age=\(maxAge)" }  // Int → structurally safe
         if secure { out += "; Secure" }
         if httpOnly { out += "; HttpOnly" }
-        if let sameSite { out += "; SameSite=\(sameSite.rawValue)" }
+        if let sameSite { out += "; SameSite=\(sameSite.rawValue)" }  // closed enum → safe
         return out
+    }
+
+    /// Strips characters that could break out of a `Set-Cookie` field: control characters (CR/LF/NUL/TAB
+    /// and the rest of %x00–1F + DEL — the response-splitting / header-injection vector) plus `;` (the
+    /// attribute separator). A name is additionally reduced to a bare token (no `=`, `,`, or space). RFC
+    /// 6265 forbids these in cookie name/value anyway; removing them keeps a hostile value from forging a
+    /// second header line or a fake attribute. Filtering on UTF-8 bytes leaves multi-byte scalars intact.
+    static func sanitized(_ component: String, isName: Bool) -> String {
+        String(
+            decoding: component.utf8.filter { byte in
+                if byte < 0x20 || byte == 0x7F { return false }  // C0 controls (incl. CR, LF, NUL, TAB) + DEL
+                if byte == UInt8(ascii: ";") { return false }  // attribute / pair separator
+                if isName {
+                    if byte == UInt8(ascii: "=") || byte == UInt8(ascii: ",") || byte == UInt8(ascii: " ") {
+                        return false  // a cookie-name must be a bare token
+                    }
+                }
+                return true
+            }, as: UTF8.self)
     }
 }
 
