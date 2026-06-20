@@ -136,6 +136,67 @@ public struct SecurityHeaders: HTTPMiddleware {
     }
 }
 
+// MARK: - CSP nonce
+
+/// The request-scoped CSP nonce key. The handler reads `ctx.storage[CSPNonceKey.self]` to stamp the
+/// inline `<script nonce="…">` (and the runtime `<script>`); the `CSPNonce` middleware mints the value
+/// and emits the matching `script-src 'nonce-…'`, so a strict CSP admits exactly those inline scripts.
+public enum CSPNonceKey: StorageKey {
+    public typealias Value = String
+}
+
+/// Per-request CSP nonce middleware (ADHTML hydration under a strict CSP). Mints a fresh 128-bit nonce
+/// from the system CSPRNG, stores it on `RequestStorage` (so the handler can stamp `<script nonce="…">`),
+/// and sets the response `Content-Security-Policy` from `policy(nonce)` — replacing any inherited CSP,
+/// so the nonce is the single source of truth. Install it on the routes that render hydratable HTML.
+///
+/// The nonce is regenerated per request and never reused: a predictable or reused nonce would defeat the
+/// inline-script protection it exists for, so it is NOT derived from the request-id (which can be
+/// client-supplied) — it is CSPRNG bytes, hex-encoded (a valid CSP `base64-value`).
+public struct CSPNonce: HTTPMiddleware {
+    /// Builds the full `Content-Security-Policy` value from the per-request nonce.
+    public var policy: @Sendable (_ nonce: String) -> String
+
+    public init(
+        policy: @escaping @Sendable (_ nonce: String) -> String = CSPNonce.strictHydrationPolicy
+    ) {
+        self.policy = policy
+    }
+
+    /// `script-src 'nonce-…' 'strict-dynamic'; object-src 'none'; base-uri 'none'` — admits the inline
+    /// state script + the runtime (and what the runtime loads, via `strict-dynamic`), nothing else.
+    public static let strictHydrationPolicy: @Sendable (String) -> String = { nonce in
+        "script-src 'nonce-\(nonce)' 'strict-dynamic'; object-src 'none'; base-uri 'none'"
+    }
+
+    public func intercept(
+        _ request: ServerRequest, _ context: MiddlewareContext,
+        next: @Sendable (ServerRequest) async -> ResponseContent
+    ) async -> ResponseContent {
+        let nonce = Self.makeNonce()
+        context.storage[CSPNonceKey.self] = nonce
+        let response = await next(request)
+        var headers = HTTPFields()
+        headers[name("content-security-policy")] = policy(nonce)
+        return response.withHeaders(headers)
+    }
+
+    /// 16 CSPRNG bytes (128 bits) as lowercase hex. `UInt8.random(in:)` draws from
+    /// `SystemRandomNumberGenerator` — the platform CSPRNG (arc4random / getrandom) — and hex is a valid
+    /// CSP `base64-value`, so no Foundation base64 dependency is needed.
+    static func makeNonce() -> String {
+        let hex: [UInt8] = Array("0123456789abcdef".utf8)
+        var out: [UInt8] = []
+        out.reserveCapacity(32)
+        for _ in 0 ..< 16 {
+            let byte = UInt8.random(in: .min ... .max)
+            out.append(hex[Int(byte >> 4)])
+            out.append(hex[Int(byte & 0xF)])
+        }
+        return String(decoding: out, as: UTF8.self)
+    }
+}
+
 /// A lowercase HTTP field name (the swift-http-types canonical form). Traps on an invalid token —
 /// these are compile-time-constant literals.
 private func name(_ token: String) -> HTTPField.Name { HTTPField.Name(token)! }
