@@ -59,6 +59,10 @@ extension HTTPServer {
         HTTPResponseCompressor(responseCompressionPredicate: { responseHead, isSupported in
             guard isSupported else { return .doNotCompress }
             if responseHead.headers.contains(name: "Content-Encoding") { return .doNotCompress }
+            // A 206/range response: compressing it would drop `Content-Length` (→ chunked) while the
+            // `Content-Range` still describes identity bytes — an incoherent range. Serve ranges as
+            // identity (nginx does the same); the full entity (200) still compresses normally.
+            if responseHead.headers.contains(name: "Content-Range") { return .doNotCompress }
             guard let contentType = responseHead.headers.first(name: "Content-Type") else {
                 return .doNotCompress
             }
@@ -80,7 +84,7 @@ extension HTTPServer {
             try channel.pipeline.syncOperations.addHandler(Self.makeResponseCompressor())
         }
         try channel.pipeline.syncOperations.addHandler(HTTP1ToHTTPServerCodec(secure: secure))
-        try Self.addIdleTimeout(channel)
+        try addIdleTimeout(channel)
         return try EngineConnection(wrappingChannelSynchronously: channel)
     }
 
@@ -221,12 +225,12 @@ extension HTTPServer {
     /// timer (a read-only timer would wrongly reap a healthy server→client stream). Generous vs. the
     /// ms-scale handler latency, so it never trips a legitimate in-flight request; an SSE source must
     /// heartbeat within this window.
-    static var idleTimeout: TimeAmount { .seconds(60) }
-
     /// Installs the all-idle timeout + the close-on-idle handler at the tail of the (already-built)
-    /// HTTP child pipeline, just before the async-channel sink.
-    static func addIdleTimeout(_ channel: any Channel) throws {
-        try channel.pipeline.syncOperations.addHandler(IdleStateHandler(allTimeout: idleTimeout))
+    /// HTTP child pipeline, just before the async-channel sink. A non-positive `idleTimeout` disables
+    /// the deadline (no handler installed) — a connection then lives until the peer or a drain closes it.
+    func addIdleTimeout(_ channel: any Channel) throws {
+        guard idleTimeout > .zero else { return }
+        try channel.pipeline.syncOperations.addHandler(IdleStateHandler(allTimeout: TimeAmount(idleTimeout)))
         try channel.pipeline.syncOperations.addHandler(IdleTimeoutHandler())
     }
 }

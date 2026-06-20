@@ -156,6 +156,19 @@ public struct HTTPServer: Sendable {
     /// serve precompressed static for h2, or terminate compression at the proxy. Large dynamic bodies
     /// should still be precompressed (compression runs on the event loop).
     let responseCompression: Bool
+    /// The per-connection all-idle deadline (slowloris/CWE-400 defense): a connection idle this long in
+    /// BOTH directions is closed. Default 60s. Non-positive (`.zero` or less) disables it entirely — a
+    /// connection then lives until the peer or a drain closes it. An SSE source must heartbeat within
+    /// this window (its writes reset the timer).
+    let idleTimeout: Duration
+    /// HTTP/1 keep-alive. Default `true` (persistent connections). When `false` the server answers EVERY
+    /// request with `Connection: close` and closes the socket after the response, regardless of what the
+    /// client asked. The escape hatch for clients/tools that mishandle persistent connections — e.g. a
+    /// preview harness that waits for network-idle yet sees the browser holding idle keep-alive sockets
+    /// open until the idle timeout — and a hard guarantee the client reads to EOF rather than trusting
+    /// `Content-Length`. No effect on HTTP/2 (it forbids the `Connection` header; each stream is already
+    /// one request).
+    let keepAlive: Bool
     /// In-flight request count, so a drain waits for real work, not idle keep-alive connections.
     let active = ActiveRequests()
     /// Admission control for concurrent SSE streams (a `.sse` response past the limit gets a 503).
@@ -169,7 +182,8 @@ public struct HTTPServer: Sendable {
         threadCount: Int, loopCount: Int = 2, readiness: ServerReadiness? = nil,
         transport: EngineTransport = .nio, middleware: [any HTTPMiddleware] = [],
         codec: ContentCodec = .json, maxBodyBytes: Int = 1_000_000, maxConcurrentSSE: Int = 1024,
-        maxConnections: Int = 0, responseCompression: Bool = true
+        maxConnections: Int = 0, responseCompression: Bool = true, idleTimeout: Duration = .seconds(60),
+        keepAlive: Bool = true
     ) {
         self.listeners = listeners
         self.pool = pool
@@ -185,6 +199,8 @@ public struct HTTPServer: Sendable {
         self.sseLimiter = SSELimiter(limit: maxConcurrentSSE)
         self.connectionLimiter = ConnectionLimiter(limit: maxConnections)
         self.responseCompression = responseCompression
+        self.idleTimeout = idleTimeout
+        self.keepAlive = keepAlive
     }
 
     public func run() async throws {

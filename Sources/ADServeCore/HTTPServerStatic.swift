@@ -114,17 +114,16 @@ extension HTTPServer {
                 headers[.eTag] = etag
                 headers[.lastModified] = lastModified
                 mergeResponseHeaders(file.headers, into: &headers)
-                try await exchange.outbound.write(.head(HTTPResponse(status: .notModified, headerFields: headers)))
-                try await exchange.outbound.write(.end(nil))
+                try await exchange.outbound.write(
+                    contentsOf: [.head(HTTPResponse(status: .notModified, headerFields: headers)), .end(nil)])
 
             case .rangeNotSatisfiable(let totalSize):
                 var headers = staticHeaders(
                     cache: cache, requestID: requestID, keepAlive: keepAlive, exchange: exchange)
                 headers[contentRangeName] = "bytes */\(totalSize)"
                 mergeResponseHeaders(file.headers, into: &headers)
-                try await exchange.outbound.write(
-                    .head(HTTPResponse(status: HTTPResponse.Status(code: 416), headerFields: headers)))
-                try await exchange.outbound.write(.end(nil))
+                let responseHead = HTTPResponse(status: HTTPResponse.Status(code: 416), headerFields: headers)
+                try await exchange.outbound.write(contentsOf: [.head(responseHead), .end(nil)])
 
             case .serve(let path, let partial, let etag, let lastModified, let encoding, let totalSize, let range):
                 let start = range?.lowerBound ?? 0
@@ -144,11 +143,14 @@ extension HTTPServer {
                 }
                 mergeResponseHeaders(file.headers, into: &headers)
                 let status = partial ? HTTPResponse.Status(code: 206) : .ok
-                try await exchange.outbound.write(.head(HTTPResponse(status: status, headerFields: headers)))
-                if !suppressBody && length > 0 {
-                    try await streamFileBody(path: path, start: start, length: length, exchange: exchange)
+                let responseHead = HTTPResponse(status: status, headerFields: headers)
+                if suppressBody || length == 0 {
+                    // No body (HEAD / empty file / 0-length range): head + end in ONE flush.
+                    try await exchange.outbound.write(contentsOf: [.head(responseHead), .end(nil)])
+                } else {
+                    try await streamFileBody(
+                        head: responseHead, path: path, start: start, length: length, exchange: exchange)
                 }
-                try await exchange.outbound.write(.end(nil))
         }
     }
 
@@ -165,12 +167,20 @@ extension HTTPServer {
 
     /// Streams `[start, start+length)` of the file in bounded chunks: each chunk is read off the event
     /// loop (NIOThreadPool) and written on it (back-pressure implicit) — so even a large file never
-    /// materializes whole. A short/failed read ends the body (the connection drops without a clean end).
+    /// materializes whole. The response HEAD rides along with the first body chunk in one batched write,
+    /// NEVER flushed on its own: a lone head reaches `HTTPResponseCompressor` before any body, so the
+    /// compressor cannot recompute `Content-Length` for the compressed bytes and emits the original
+    /// (identity) length — a gzip-accepting client (every browser) then blocks waiting for bytes that
+    /// never arrive, and the response hangs until the idle timeout fires. Batching lets the compressor
+    /// switch the response to chunked (when it compresses) or pass the head through with its identity
+    /// `Content-Length` intact (when it does not). A short/failed read ends the body (the connection
+    /// drops without a clean end).
     private func streamFileBody(
-        path: String, start: Int, length: Int, exchange: RequestExchange
+        head: HTTPResponse, path: String, start: Int, length: Int, exchange: RequestExchange
     ) async throws {
         let chunkSize = 256 * 1024
         var sent = 0
+        var headPending = true
         while sent < length {
             let offset = start + sent
             let count = min(chunkSize, length - sent)
@@ -180,8 +190,20 @@ extension HTTPServer {
             guard let chunk, !chunk.isEmpty else { break }  // truncated / changed underneath us
             var buffer = exchange.allocator.buffer(capacity: chunk.count)
             buffer.writeBytes(chunk)
-            try await exchange.outbound.write(.body(buffer))
+            if headPending {
+                try await exchange.outbound.write(contentsOf: [.head(head), .body(buffer)])
+                headPending = false
+            } else {
+                try await exchange.outbound.write(.body(buffer))
+            }
             sent += chunk.count
+        }
+        if headPending {
+            // The first read yielded nothing (file truncated/vanished mid-flight): still emit the head,
+            // batched with the end, so the exchange terminates rather than dangling.
+            try await exchange.outbound.write(contentsOf: [.head(head), .end(nil)])
+        } else {
+            try await exchange.outbound.write(.end(nil))
         }
     }
 

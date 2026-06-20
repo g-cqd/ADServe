@@ -380,8 +380,15 @@ extension HTTPServer {
         // Route-supplied headers override the envelope (CORS / the MCP `/mcp` set); `set-cookie` appends.
         mergeResponseHeaders(materialized.headers, into: &headers)
 
-        try await exchange.outbound.write(
-            .head(HTTPResponse(status: materialized.status, headerFields: headers)))
+        // Write head + body + end as ONE batched write (a single flush after `.end`), NOT three separate
+        // `write`s. `NIOAsyncChannelOutboundWriter.write(_:)` flushes per call; `HTTPResponseCompressor`
+        // buffers the head until it has the whole body so it can recompute `Content-Length` (or switch to
+        // chunked) — a flush *between* the head and the body makes it emit the head early with the original
+        // (uncompressed) `Content-Length`, so a gzip-accepting client (every browser) then waits forever
+        // for bytes that never come and the response hangs. Batching keeps the only flush after `.end`.
+        var parts: [HTTPResponsePart] = [
+            .head(HTTPResponse(status: materialized.status, headerFields: headers))
+        ]
         if !materialized.body.isEmpty && !suppressBody {
             // `HTTPResponsePart.body` is a `ByteBuffer`, so the route's `[UInt8]` must be copied into
             // NIO-owned storage once (a single contiguous memcpy — unavoidable without threading a
@@ -391,9 +398,10 @@ extension HTTPServer {
             // (its documented recommendation). The body is identical bytes either way.
             var buffer = exchange.allocator.buffer(capacity: materialized.body.count)
             buffer.writeBytes(materialized.body)
-            try await exchange.outbound.write(.body(buffer))
+            parts.append(.body(buffer))
         }
-        try await exchange.outbound.write(.end(nil))
+        parts.append(.end(nil))
+        try await exchange.outbound.write(contentsOf: parts)
     }
 
     /// Drives an SSE `body` to completion, cancelling it the instant the channel closes (peer
@@ -483,8 +491,10 @@ extension HTTPServer {
     }
 
     /// HTTP/1.1 default keep-alive unless `Connection: close` (HTTP/1.0 clients are out
-    /// of scope; fetch + Caddy are 1.1). For h2 this is unused (one request per stream).
+    /// of scope; fetch + Caddy are 1.1). For h2 this is unused (one request per stream). The server-wide
+    /// `keepAlive: false` option overrides everything → always close.
     func isKeepAlive(_ head: HTTPRequest) -> Bool {
+        guard keepAlive else { return false }
         guard let connection = head.headerFields[.connection]?.lowercased() else { return true }
         return !connection.contains("close")
     }

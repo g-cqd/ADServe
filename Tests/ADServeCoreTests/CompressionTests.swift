@@ -109,3 +109,93 @@ import Testing
         #expect(response.contains(marker))  // plaintext — compressor not installed
     }
 }
+
+/// On-the-fly compression of STREAMED static files over a KEPT-ALIVE connection — the framing the
+/// `Connection: close` harness structurally cannot see, plus the two new server options (`keepAlive`,
+/// `idleTimeout`). A wrong `Content-Length` only bites a client that honors it (a browser on keep-alive);
+/// `Loopback.run` reads to EOF and would pass regardless, which is exactly how the original bug shipped.
+@Suite struct StaticCompressionFramingTests {
+    /// ~5 KB of very compressible HTML, NO `.gz`/`.br` sibling → the on-the-fly compressor engages (not
+    /// the precompressed-static path).
+    private func staticHTMLRoutes(_ dir: TemporaryDirectory) throws -> StubRoutes {
+        let html =
+            "<!doctype html><html><body>"
+            + String(repeating: "<p>hello compressible world</p>", count: 160) + "</body></html>"
+        try Data(html.utf8).write(to: URL(fileURLWithPath: dir.file("index.html")))
+        return StubRoutes { _ in
+            .file(root: dir.path, subpath: "index.html", contentType: "text/html; charset=utf-8")
+        }
+    }
+
+    /// THE regression. A compressible static file with no precompressed sibling, fetched with
+    /// `Accept-Encoding: gzip` over a kept-alive connection. Before the fix the engine flushed the
+    /// response head (carrying the identity `Content-Length`) on its own, so `HTTPResponseCompressor`
+    /// emitted that stale length beside a gzipped (shorter) body — every browser then blocked waiting for
+    /// bytes that never come (the page/preview hangs until the idle timeout). The fix flushes the head
+    /// WITH the first body chunk, so the compressor switches the response to chunked. Assert it is gzipped
+    /// AND self-framed (chunked, terminated) — a client does NOT hang.
+    @Test func compressedStaticFileOverKeepAliveDoesNotHang() async throws {
+        let dir = TemporaryDirectory(prefix: "adserve-static-gzip")
+        defer { dir.cleanup() }
+        let routes = try staticHTMLRoutes(dir)
+        let response = try await Loopback.runKeepAlive(
+            path: "/index.html", routes: routes, headers: [("Accept-Encoding", "gzip")])
+        let lower = response.lowercased()
+        #expect(lower.contains("content-encoding: gzip"))  // compression engaged
+        #expect(lower.contains("transfer-encoding: chunked"))  // → chunked, no stale Content-Length
+        #expect(!lower.contains("content-length:"))  // the bug header is gone
+        #expect(response.hasSuffix("0\r\n\r\n"))  // last-chunk terminator → self-framed, no hang
+    }
+
+    /// Without `Accept-Encoding` the same file is identity with an EXACT `Content-Length`: the head still
+    /// rides with the first chunk (one batched flush), so the length is correct and the client reads
+    /// exactly that many bytes (length-delimited, not chunked).
+    @Test func uncompressedStaticFileOverKeepAliveHasExactContentLength() async throws {
+        let dir = TemporaryDirectory(prefix: "adserve-static-plain")
+        defer { dir.cleanup() }
+        let routes = try staticHTMLRoutes(dir)
+        let response = try await Loopback.runKeepAlive(path: "/index.html", routes: routes)
+        let lower = response.lowercased()
+        #expect(!lower.contains("content-encoding"))  // not compressed
+        #expect(lower.contains("content-length:"))  // identity length present
+        #expect(!lower.contains("transfer-encoding: chunked"))  // length-delimited
+        #expect(HTTP1ResponseFraming.isComplete(Array(response.utf8)))  // CL satisfied → no hang
+    }
+
+    /// A `Range` request for a compressible file is NOT compressed (gzip + ranges are incoherent — the
+    /// `Content-Range` describes identity bytes). It stays identity: 206 + `Content-Range`, no encoding.
+    @Test func rangeRequestIsServedIdentityNotCompressed() async throws {
+        let dir = TemporaryDirectory(prefix: "adserve-static-range")
+        defer { dir.cleanup() }
+        let routes = try staticHTMLRoutes(dir)
+        let response = try await Loopback.runKeepAlive(
+            path: "/index.html", routes: routes,
+            headers: [("Accept-Encoding", "gzip"), ("Range", "bytes=0-99")])
+        let lower = response.lowercased()
+        #expect(response.hasPrefix("HTTP/1.1 206"))
+        #expect(lower.contains("content-range: bytes 0-99/"))
+        #expect(!lower.contains("content-encoding"))  // a range is served identity
+        #expect(lower.contains("content-length: 100"))
+    }
+
+    /// The server-wide `keepAlive: false` option answers EVERY request with `Connection: close` (and
+    /// closes the socket) even though the client requested keep-alive — so idle sockets never linger and a
+    /// network-idle-waiting preview settles at once.
+    @Test func serverKeepAliveFalseAnswersWithConnectionClose() async throws {
+        let routes = StubRoutes { _ in .raw(body: Array("ok".utf8), contentType: "text/plain", status: .ok) }
+        let response = try await Loopback.runKeepAlive(path: "/", routes: routes, keepAlive: false)
+        #expect(response.hasPrefix("HTTP/1.1 200"))
+        #expect(response.lowercased().contains("connection: close"))
+        #expect(response.hasSuffix("ok"))
+    }
+
+    /// A small configurable `idleTimeout` closes an otherwise-idle kept-alive connection (slowloris
+    /// defense; also lets a network-idle-waiting preview settle without disabling keep-alive). Observed
+    /// within a generous bound.
+    @Test func configurableIdleTimeoutClosesIdleConnection() async throws {
+        let routes = StubRoutes { _ in .raw(body: Array("hi".utf8), contentType: "text/plain", status: .ok) }
+        let closed = try await Loopback.observeServerClose(
+            path: "/", routes: routes, idleTimeout: .milliseconds(200), within: .seconds(3))
+        #expect(closed)
+    }
+}
