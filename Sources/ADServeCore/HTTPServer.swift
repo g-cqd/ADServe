@@ -13,6 +13,7 @@ public import Logging
 import NIOCore
 import NIOExtras
 import NIOHTTP2
+import NIOHTTPCompression
 import NIOHTTPTypes
 import NIOPosix
 import ServiceLifecycle
@@ -138,6 +139,26 @@ public enum KeepAlivePolicy: Sendable {
     case idleTimeout(Duration)
 }
 
+/// Whether the engine transparently inflates a `Content-Encoding: gzip`/`deflate` REQUEST body before the
+/// handler sees it — and, when it does, the HARD ceiling on the inflated output (decompression-bomb
+/// defense, CWE-409). Off by default: an app that never decompresses request bodies pays nothing and its
+/// behavior is unchanged. When enabled, a body that inflates past `maxSize` is rejected (the decompressor
+/// errors → the connection is closed before the oversized output is buffered), so a tiny gzip can never
+/// be expanded into gigabytes in memory. The cap is an ABSOLUTE output-size bound (not a mere ratio): a
+/// ratio alone still lets a large compressed input inflate without limit, whereas a size bound caps the
+/// peak memory regardless of input size. Applies to the HTTP/1 pipeline (plaintext + secure h1); HTTP/2
+/// request bodies are not inflated here (this is an HTTP/1 handler — terminate request compression at a
+/// proxy for h2).
+public enum RequestDecompressionPolicy: Sendable {
+    /// No request-body decompression (default). A `Content-Encoding` request body is passed through to the
+    /// handler verbatim — exactly today's behavior.
+    case disabled
+    /// Inflate gzip/deflate request bodies, rejecting any whose decompressed output would exceed `maxSize`
+    /// bytes. Choose `maxSize` no smaller than the largest legitimately-compressed body you accept; it is
+    /// clamped to at least 1 byte (a non-positive cap would reject every compressed body).
+    case enabled(maxSize: Int)
+}
+
 /// The ad-server engine. Binds one NIO listener per `ListenerConfig`, all sharing the
 /// event-loop group + offload pool + connection pool + envelope; serves until cancelled.
 /// The app builds the listeners (DSL) + the response `envelope` and hands them in.
@@ -171,6 +192,11 @@ public struct HTTPServer: Sendable {
     /// serve precompressed static for h2, or terminate compression at the proxy. Large dynamic bodies
     /// should still be precompressed (compression runs on the event loop).
     let responseCompression: Bool
+    /// Opt-in request-body decompression policy (`.disabled` by default). When `.enabled(maxSize:)`, the
+    /// HTTP/1 pipeline inflates a `Content-Encoding: gzip`/`deflate` body with a HARD output-size cap, so a
+    /// decompression bomb (tiny gzip → gigabytes) is rejected before it can exhaust memory. `nil` once the
+    /// policy is `.disabled`, so the decompressor is never installed and the request path is unchanged.
+    let requestDecompressionLimit: NIOHTTPDecompression.DecompressionLimit?
     /// The per-connection all-idle deadline (slowloris/CWE-400 defense): a connection idle this long in
     /// BOTH directions is closed. Default 60s. Non-positive (`.zero` or less) disables it entirely — a
     /// connection then lives until the peer or a drain closes it. An SSE source must heartbeat within
@@ -201,7 +227,8 @@ public struct HTTPServer: Sendable {
         transport: EngineTransport = .nio, middleware: [any HTTPMiddleware] = [],
         codec: ContentCodec = .json, maxBodyBytes: Int = 1_000_000, maxConcurrentSSE: Int = 1024,
         maxConnections: Int = HTTPServer.defaultMaxConnections, responseCompression: Bool = true,
-        keepAlive: KeepAlivePolicy = .keepAlive
+        keepAlive: KeepAlivePolicy = .keepAlive,
+        requestDecompression: RequestDecompressionPolicy = .disabled
     ) {
         self.listeners = listeners
         self.pool = pool
@@ -217,6 +244,15 @@ public struct HTTPServer: Sendable {
         self.sseLimiter = SSELimiter(limit: maxConcurrentSSE)
         self.connectionLimiter = ConnectionLimiter(limit: maxConnections)
         self.responseCompression = responseCompression
+        switch requestDecompression {
+            case .disabled:
+                self.requestDecompressionLimit = nil
+            case .enabled(let maxSize):
+                // A hard ABSOLUTE output ceiling (clamped ≥ 1 so a non-positive cap can't reject every
+                // body): inflated output over it makes the decompressor error, closing the connection
+                // before the bomb is buffered.
+                self.requestDecompressionLimit = .size(max(1, maxSize))
+        }
         switch keepAlive {
             case .keepAlive: (self.keepAliveEnabled, self.idleTimeout) = (true, .seconds(60))
             case .close: (self.keepAliveEnabled, self.idleTimeout) = (false, .seconds(60))

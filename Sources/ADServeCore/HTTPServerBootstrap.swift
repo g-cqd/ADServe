@@ -75,13 +75,34 @@ extension HTTPServer {
         })
     }
 
+    /// A fresh `NIOHTTPRequestDecompressor` (one per connection — it is stateful) capped to a HARD inflated
+    /// output ceiling (`requestDecompressionLimit`), so a `Content-Encoding: gzip`/`deflate` request body is
+    /// transparently inflated for the handler while a decompression bomb (tiny gzip → gigabytes, CWE-409) is
+    /// rejected. Exceeding the cap makes the handler fire `NIOHTTPDecompression.DecompressionError.limit`
+    /// inbound — the async-channel read throws, `serveConnection` drops the connection, and the oversized
+    /// output is never buffered. NEVER `.none` (a swift-nio-extras advisory: an uncapped limit reintroduces
+    /// the bomb); the limit is always a finite `.size` set by `RequestDecompressionPolicy.enabled(maxSize:)`.
+    static func makeRequestDecompressor(
+        limit: NIOHTTPDecompression.DecompressionLimit
+    ) -> NIOHTTPRequestDecompressor {
+        NIOHTTPRequestDecompressor(limit: limit)
+    }
+
     /// Adds the engine's app-level HTTP/1 handlers (expect-continue, the gated response compressor, the
-    /// swift-http-types bridge, the idle timeout) ON TOP of an already-configured HTTP/1 codec, returning
-    /// the wrapped async connection. Shared by the plaintext not-upgrading path and the secure h1 path.
+    /// opt-in capped request decompressor, the swift-http-types bridge, the idle timeout) ON TOP of an
+    /// already-configured HTTP/1 codec, returning the wrapped async connection. Shared by the plaintext
+    /// not-upgrading path and the secure h1 path.
     func configureHTTP1AppHandlers(_ channel: any Channel, secure: Bool) throws -> EngineConnection {
         try Self.addExpectContinue(channel)
         if responseCompression {
             try channel.pipeline.syncOperations.addHandler(Self.makeResponseCompressor())
+        }
+        // Head-ward of the swift-http-types bridge: the decompressor consumes/emits raw `HTTPServerRequestPart`
+        // (it inflates the body parts in place), so it must run before `HTTP1ToHTTPServerCodec` translates the
+        // parts to the engine's `HTTPRequestPart`. It passes responses through untouched (no interim-head
+        // hazard like the response compressor), so its position relative to the compressor is immaterial.
+        if let limit = requestDecompressionLimit {
+            try channel.pipeline.syncOperations.addHandler(Self.makeRequestDecompressor(limit: limit))
         }
         try channel.pipeline.syncOperations.addHandler(HTTP1ToHTTPServerCodec(secure: secure))
         try addIdleTimeout(channel)
