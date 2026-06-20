@@ -110,6 +110,45 @@ struct WebSocketStubRoutes: HTTPHandling {
         #expect(response.lowercased().contains("upgrade: websocket"))
     }
 
+    @Test func fragmentedTextMessageIsReassembledBeforeTheHandlerSeesIt() async throws {
+        // "Hello WS" sent as three masked fragments — text(fin:false) + continuation(fin:false) +
+        // continuation(fin:true). The engine's NIOWebSocketFrameAggregator must reassemble them into one
+        // message before `connection.messages` yields it, so the echo is the whole string.
+        let echo = try await withEchoServer { wsChannel in
+            try await wsChannel.executeThenClose { inbound, outbound -> String? in
+                var iterator = inbound.makeAsyncIterator()
+                let allocator = ByteBufferAllocator()
+                try await outbound.write(frame(.text, Array("Hel".utf8), fin: false, allocator))
+                try await outbound.write(frame(.continuation, Array("lo ".utf8), fin: false, allocator))
+                try await outbound.write(frame(.continuation, Array("WS".utf8), fin: true, allocator))
+                let reassembled = try await iterator.next().map { String(buffer: $0.unmaskedData) }
+                try await outbound.write(closeFrame(allocator))
+                return reassembled
+            }
+        }
+        #expect(echo == "Hello WS")
+    }
+
+    @Test func aFrameLargerThanTheMaxFrameSizeTearsDownTheConnection() async throws {
+        // A single frame just over the server's 1 MiB `maxFrameSize` is a protocol violation (a DoS bound):
+        // the engine rejects it and closes — it must NOT echo it back.
+        let closed = try await withEchoServer { wsChannel in
+            try await wsChannel.executeThenClose { inbound, outbound -> Bool in
+                var iterator = inbound.makeAsyncIterator()
+                let allocator = ByteBufferAllocator()
+                let oversized = [UInt8](repeating: 0x41, count: (1 << 20) + 1)
+                try? await outbound.write(masked(.text, oversized, allocator))
+                do {
+                    if let next = try await iterator.next() { return next.opcode == .connectionClose }
+                    return true  // channel closed (nil) — torn down, not echoed
+                } catch {
+                    return true  // read errored — connection torn down
+                }
+            }
+        }
+        #expect(closed)
+    }
+
     /// A masked client→server frame (RFC 6455 requires client frames be masked).
     private func masked(_ opcode: WebSocketOpcode, _ bytes: [UInt8], _ allocator: ByteBufferAllocator)
         -> WebSocketFrame
@@ -117,6 +156,56 @@ struct WebSocketStubRoutes: HTTPHandling {
         var buffer = allocator.buffer(capacity: bytes.count)
         buffer.writeBytes(bytes)
         return WebSocketFrame(fin: true, opcode: opcode, maskKey: .random(), data: buffer)
+    }
+
+    /// A masked client→server frame with an explicit `fin` (for sending a fragmented message).
+    private func frame(
+        _ opcode: WebSocketOpcode, _ bytes: [UInt8], fin: Bool, _ allocator: ByteBufferAllocator
+    ) -> WebSocketFrame {
+        var buffer = allocator.buffer(capacity: bytes.count)
+        buffer.writeBytes(bytes)
+        return WebSocketFrame(fin: fin, opcode: opcode, maskKey: .random(), data: buffer)
+    }
+
+    /// A masked close frame with status 1000 (normal).
+    private func closeFrame(_ allocator: ByteBufferAllocator) -> WebSocketFrame {
+        var buffer = allocator.buffer(capacity: 2)
+        buffer.writeInteger(UInt16(1000))
+        return WebSocketFrame(fin: true, opcode: .connectionClose, maskKey: .random(), data: buffer)
+    }
+
+    /// Bind a WebSocket echo server on a loopback port, perform the HTTP/1 upgrade, run `body` with the
+    /// negotiated frame channel, then tear everything down. Bounded readiness wait; best-effort cleanup.
+    private func withEchoServer<R>(_ body: (WSClientChannel) async throws -> R) async throws -> R {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let routes = WebSocketStubRoutes(path: "/ws") { connection in
+            for await message in connection.messages { try? await connection.send(message) }
+        }
+        do {
+            let probe = try await ServerBootstrap(group: group).bind(host: "127.0.0.1", port: 0).get()
+            let port = probe.localAddress?.port ?? 0
+            try await probe.close().get()
+            let readiness = ServerReadiness()
+            let server = HTTPServer(
+                listeners: [ListenerConfig(host: "127.0.0.1", port: port, routes: routes)], pool: nil,
+                envelope: HTTPFields(), logger: .init(label: "ws"), threadCount: 1, loopCount: 1,
+                readiness: readiness)
+            let serverTask = Task { try? await server.run() }
+            defer { serverTask.cancel() }
+            var spins = 0
+            while !readiness.isReady && spins < 300 {
+                try await Task.sleep(for: .milliseconds(10))
+                spins += 1
+            }
+            let wsChannel = try await connect(path: "/ws", port: port, group: group)
+            let result = try await body(wsChannel)
+            serverTask.cancel()
+            try? await group.shutdownGracefully()
+            return result
+        } catch {
+            try? await group.shutdownGracefully()
+            throw error
+        }
     }
 
     /// Connect + perform the HTTP/1 WebSocket upgrade, returning the negotiated frame channel.
