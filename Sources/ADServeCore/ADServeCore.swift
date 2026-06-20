@@ -593,16 +593,20 @@ public struct MatchedRoute: Sendable {
     /// size accumulation) or lower (a tighter bound, enforced post-match as a problem+json 413).
     public let maxBodyBytes: Int?
     public let run: @Sendable (HandlerInput) throws -> ResponseContent
+    /// A WebSocket handler if this route is a `WS` endpoint, else `nil`. The engine reads it (via
+    /// `webSocketRoute(path:)`) to decide an HTTP/1 Upgrade; a normal `GET` to the path still runs `run`.
+    public let webSocketHandler: WebSocketHandler?
 
     public init(
         needsStorage: Bool, cache: CachePolicy, middleware: [any HTTPMiddleware] = [],
-        maxBodyBytes: Int? = nil,
+        maxBodyBytes: Int? = nil, webSocketHandler: WebSocketHandler? = nil,
         run: @escaping @Sendable (HandlerInput) throws -> ResponseContent
     ) {
         self.needsStorage = needsStorage
         self.cache = cache
         self.middleware = middleware
         self.maxBodyBytes = maxBodyBytes
+        self.webSocketHandler = webSocketHandler
         self.run = run
     }
 }

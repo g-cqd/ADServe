@@ -98,7 +98,7 @@ struct ChannelSSEWriter: SSEWriter {
 /// writer tasks never call the NIO async writer concurrently, while per-event back-pressure is
 /// preserved (a blocked write blocks the next acquirer too, which is the desired throttle). Contention
 /// is at most two waiters (body + heartbeat), so the waiter array stays tiny.
-actor SSEWriteGate {
+actor FIFOAsyncGate {
     private var held = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
@@ -119,12 +119,12 @@ actor SSEWriteGate {
     }
 }
 
-/// An `SSEWriter` that routes every frame through an `SSEWriteGate`, so the body and the engine
+/// An `SSEWriter` that routes every frame through an `FIFOAsyncGate`, so the body and the engine
 /// heartbeat can both write to one channel without racing the NIO outbound writer. Releases the gate
 /// on both success and a thrown write (so a failed write never strands the gate held).
 struct GatedSSEWriter: SSEWriter {
     let inner: ChannelSSEWriter
-    let gate: SSEWriteGate
+    let gate: FIFOAsyncGate
 
     func send(event: String?, data: String, id: String?, retry: Int?) async throws {
         await gate.acquire()
@@ -402,7 +402,7 @@ extension HTTPServer {
     /// clean end; any other thrown error propagates (dropping the connection).
     ///
     /// With a `heartbeat` interval the engine also runs a child task emitting a `: ` keep-alive comment
-    /// every interval. Both the body and the heartbeat write through one `SSEWriteGate` (a FIFO async
+    /// every interval. Both the body and the heartbeat write through one `FIFOAsyncGate` (a FIFO async
     /// mutex) so the two tasks never call the NIO outbound writer concurrently — and the gate is held
     /// across each suspending write, so per-event back-pressure is preserved. Without a heartbeat the
     /// body is the sole writer and writes directly (zero added overhead, the prior behavior verbatim).
@@ -410,7 +410,7 @@ extension HTTPServer {
         _ body: @escaping @Sendable (any SSEWriter) async throws -> Void, writer: ChannelSSEWriter,
         heartbeat: Duration?, onClose: EventLoopFuture<Void>
     ) async throws {
-        let gate = heartbeat != nil ? SSEWriteGate() : nil
+        let gate = heartbeat != nil ? FIFOAsyncGate() : nil
         let bodyWriter: any SSEWriter = gate.map { GatedSSEWriter(inner: writer, gate: $0) } ?? writer
         let bodyTask = Task { try await body(bodyWriter) }
         onClose.whenComplete { _ in bodyTask.cancel() }

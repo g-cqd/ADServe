@@ -13,6 +13,7 @@ import NIOHTTPTypesHTTP1
 import NIOHTTPTypesHTTP2
 import NIOPosix
 import NIOSSL
+import NIOWebSocket
 
 #if canImport(Network)
     import NIOTransportServices
@@ -70,52 +71,84 @@ extension HTTPServer {
         })
     }
 
-    /// The plaintext HTTP/1.1 child pipeline — shared by both transports.
-    func plainInitializer() -> @Sendable (any Channel) -> EventLoopFuture<EngineConnection> {
-        let compress = responseCompression
-        return { childChannel in
-            childChannel.eventLoop.makeCompletedFuture {
-                try childChannel.pipeline.syncOperations.configureHTTPServerPipeline()
-                // `Expect: 100-continue` ahead of the compressor (the interim must not pass through it).
-                try Self.addExpectContinue(childChannel)
-                // The compressor operates on the NIO HTTP/1 parts, so it sits between the HTTP codec and
-                // the swift-http-types bridge: outbound it compresses the body before encoding; inbound it
-                // reads the request's `Accept-Encoding`.
-                if compress {
-                    try childChannel.pipeline.syncOperations.addHandler(Self.makeResponseCompressor())
-                }
-                // Bridge NIO's HTTP/1 parts ↔ swift-http-types parts (server, plaintext).
-                try childChannel.pipeline.syncOperations.addHandler(HTTP1ToHTTPServerCodec(secure: false))
-                try Self.addIdleTimeout(childChannel)
-                return try EngineConnection(wrappingChannelSynchronously: childChannel)
-            }
+    /// Adds the engine's app-level HTTP/1 handlers (expect-continue, the gated response compressor, the
+    /// swift-http-types bridge, the idle timeout) ON TOP of an already-configured HTTP/1 codec, returning
+    /// the wrapped async connection. Shared by the plaintext not-upgrading path and the secure h1 path.
+    func configureHTTP1AppHandlers(_ channel: any Channel, secure: Bool) throws -> EngineConnection {
+        try Self.addExpectContinue(channel)
+        if responseCompression {
+            try channel.pipeline.syncOperations.addHandler(Self.makeResponseCompressor())
+        }
+        try channel.pipeline.syncOperations.addHandler(HTTP1ToHTTPServerCodec(secure: secure))
+        try Self.addIdleTimeout(channel)
+        return try EngineConnection(wrappingChannelSynchronously: channel)
+    }
+
+    /// The plaintext HTTP/1.1 child pipeline WITH WebSocket-Upgrade negotiation: a `GET` carrying the
+    /// `Upgrade: websocket` headers whose path matches a `WS` route upgrades to a WebSocket channel;
+    /// everything else becomes a normal HTTP connection. The child's output is the per-connection
+    /// negotiation future (`EngineH1Result`), which `servePlainListener` awaits — mirroring the TLS ALPN
+    /// negotiation. WebSocket-over-TLS (wss direct) is not wired here; terminate TLS at the proxy.
+    func upgradableInitializer(
+        routes: any HTTPHandling
+    ) -> @Sendable (any Channel) -> EventLoopFuture<EventLoopFuture<EngineH1Result>> {
+        { childChannel in
+            let wsUpgrader = NIOTypedWebSocketServerUpgrader<EngineH1Result>(
+                maxFrameSize: 1 << 20,
+                shouldUpgrade: { channel, head in
+                    let matched = routes.webSocketRoute(path: head.uri.prefix { $0 != "?" }) != nil
+                    return channel.eventLoop.makeSucceededFuture(matched ? HTTPHeaders() : nil)
+                },
+                upgradePipelineHandler: { channel, head in
+                    channel.eventLoop.makeCompletedFuture {
+                        try channel.pipeline.syncOperations.addHandler(
+                            NIOWebSocketFrameAggregator(
+                                minNonFinalFragmentSize: 0, maxAccumulatedFrameCount: 1024,
+                                maxAccumulatedFrameSize: 1 << 20))
+                        let wsChannel = try WebSocketChannel(wrappingChannelSynchronously: channel)
+                        let route =
+                            routes.webSocketRoute(path: head.uri.prefix { $0 != "?" })
+                            ?? WebSocketRoute { _ in }
+                        return EngineH1Result.webSocket(wsChannel, route)
+                    }
+                })
+            let configuration = NIOUpgradableHTTPServerPipelineConfiguration<EngineH1Result>(
+                upgradeConfiguration: NIOTypedHTTPServerUpgradeConfiguration(
+                    upgraders: [wsUpgrader],
+                    notUpgradingCompletionHandler: { channel in
+                        channel.eventLoop.makeCompletedFuture {
+                            EngineH1Result.http(try self.configureHTTP1AppHandlers(channel, secure: false))
+                        }
+                    }))
+            return childChannel.pipeline.configureUpgradableHTTPServerPipeline(configuration: configuration)
         }
     }
 
     /// Binds one plaintext HTTP/1.1 listener on the configured transport — or, when the listener carries a
     /// `unixDomainSocketPath`, on that UNIX-domain socket (always via NIOPosix; Network.framework doesn't
-    /// do UDS). The existing socket file is replaced so a restart doesn't fail on a stale node.
+    /// do UDS). The existing socket file is replaced so a restart doesn't fail on a stale node. Each child
+    /// yields a `EngineH1Result` negotiation (HTTP or upgraded WebSocket).
     func bindPlain(
         _ listener: ListenerConfig, group: any EventLoopGroup, quiesce: ServerQuiescingHelper
-    ) async throws -> NIOAsyncChannel<EngineConnection, Never> {
+    ) async throws -> NIOAsyncChannel<EventLoopFuture<EngineH1Result>, Never> {
+        let initializer = upgradableInitializer(routes: listener.routes)
         if let socketPath = listener.unixDomainSocketPath {
             return try await baseBootstrap(group)
                 .serverChannelInitializer(quiesceInitializer(quiesce))
                 .bind(
                     unixDomainSocketPath: socketPath, cleanupExistingSocketFile: true,
-                    childChannelInitializer: plainInitializer())
+                    childChannelInitializer: initializer)
         }
         #if canImport(Network)
             if transport == .network {
                 return try await NIOTSListenerBootstrap(group: group)
                     .serverChannelInitializer(quiesceInitializer(quiesce))
-                    .bind(
-                        host: listener.host, port: listener.port, childChannelInitializer: plainInitializer())
+                    .bind(host: listener.host, port: listener.port, childChannelInitializer: initializer)
             }
         #endif
         return try await baseBootstrap(group)
             .serverChannelInitializer(quiesceInitializer(quiesce))
-            .bind(host: listener.host, port: listener.port, childChannelInitializer: plainInitializer())
+            .bind(host: listener.host, port: listener.port, childChannelInitializer: initializer)
     }
 
     /// Binds one TLS 1.3 listener that negotiates HTTP/1.1 or HTTP/2 by ALPN. Each child's
@@ -132,7 +165,6 @@ extension HTTPServer {
             }
         #endif
         let sslContext = try makeTLSContext(listener.wire.tls!, alpn: listener.wire.alpn)
-        let compress = responseCompression
         return try await baseBootstrap(group)
             .serverChannelInitializer(quiesceInitializer(quiesce))
             .childChannelOption(ChannelOptions.autoRead, value: true)
@@ -149,16 +181,7 @@ extension HTTPServer {
                         childChannel.configureAsyncHTTPServerPipeline(
                             http1ConnectionInitializer: { channel in
                                 channel.eventLoop.makeCompletedFuture {
-                                    // `Expect: 100-continue` ahead of the compressor on the secure h1 path too.
-                                    try Self.addExpectContinue(channel)
-                                    // Compress on the secure h1 path too (before the swift-http-types bridge).
-                                    if compress {
-                                        try channel.pipeline.syncOperations.addHandler(
-                                            Self.makeResponseCompressor())
-                                    }
-                                    try channel.pipeline.syncOperations.addHandler(HTTP1ToHTTPServerCodec(secure: true))
-                                    try Self.addIdleTimeout(channel)
-                                    return try EngineConnection(wrappingChannelSynchronously: channel)
+                                    try self.configureHTTP1AppHandlers(channel, secure: true)
                                 }
                             },
                             http2ConnectionInitializer: { channel in channel.eventLoop.makeSucceededVoidFuture() },

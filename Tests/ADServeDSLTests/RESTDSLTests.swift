@@ -682,6 +682,29 @@ struct StaticAssetDSLTests {
     }
 }
 
+struct WebSocketDSLTests {
+    @Test
+    func `WS registers a websocket route and answers 426 to a plain GET`() {
+        let routes = table { WS("chat") { _ in } }
+        #expect(routes.webSocketRoute(path: "/chat") != nil)
+        #expect(routes.webSocketRoute(path: "/other") == nil)
+        guard case .full(_, _, let status, let headers)? = runMatched(routes, .get, "/chat") else {
+            Issue.record("expected a 426 .full response for a non-upgrade GET")
+            return
+        }
+        #expect(status.code == 426)
+        #expect(headers[HTTPField.Name("upgrade")!] == "websocket")
+        #expect(headers[HTTPField.Name("connection")!] == "Upgrade")
+    }
+
+    @Test
+    func `WS routes nest under a Group prefix`() {
+        let routes = table { Group("api") { WS("socket") { _ in } } }
+        #expect(routes.webSocketRoute(path: "/api/socket") != nil)
+        #expect(routes.webSocketRoute(path: "/socket") == nil)
+    }
+}
+
 private func isNotFoundContent(_ content: ResponseContent?) -> Bool {
     if case .notFound? = content { return true }
     return false

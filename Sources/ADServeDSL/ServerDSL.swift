@@ -264,6 +264,38 @@ public func OPTIONS<P: PoolScope>(
     _ handler: @escaping @Sendable (P.Context, PathParameters) throws -> ResponseContent
 ) -> RouteNode { templateRoute(.options, template, pool: pool, handler) }
 
+/// A WebSocket endpoint: a `GET` at `subpath` that the engine UPGRADES (HTTP/1 `Upgrade: websocket`) and
+/// runs `handler` over the live `WebSocketConnection`. A non-upgrade `GET` to the same path gets `426
+/// Upgrade Required`. WebSocket-over-TLS (wss direct) is not wired; terminate TLS at the proxy.
+///
+///   WS("chat") { conn in for await message in conn.messages { try? await conn.send(message) } }
+public func WS(_ subpath: String, _ handler: @escaping WebSocketHandler) -> RouteNode {
+    precondition(
+        !subpath.contains("{"), "ADServe: a WS route path '\(subpath)' cannot contain a path parameter")
+    return RouteNode(cache: .unset) { prefix, cache, middleware in
+        let full = joinPath(prefix, subpath)
+        let bind: @Sendable (Substring) -> (@Sendable (HandlerInput) throws -> ResponseContent)? = { path in
+            path == full[...] ? { @Sendable _ in webSocketUpgradeRequired() } : nil
+        }
+        return [
+            CompiledRoute(
+                method: .get, needsStorage: false, cache: cache, exactPath: full, middleware: middleware,
+                pathTemplate: full, webSocketHandler: handler, bind: bind)
+        ]
+    }
+}
+
+/// `426 Upgrade Required` + the `Upgrade`/`Connection` headers — the answer to a plain `GET` of a WS
+/// endpoint (RFC 6455 §4.2.1 / RFC 7231 §6.5.15).
+private func webSocketUpgradeRequired() -> ResponseContent {
+    var headers = HTTPFields()
+    headers[HTTPField.Name("upgrade")!] = "websocket"
+    headers[HTTPField.Name("connection")!] = "Upgrade"
+    return .full(
+        body: Array("upgrade required\n".utf8), contentType: "text/plain; charset=utf-8",
+        status: HTTPResponse.Status(code: 426), headers: headers)
+}
+
 /// `GET` with an opaque typed-capture matcher — for irregular path grammars. Matched against the
 /// full request path, so the enclosing `Group` prefix does not apply.
 public func GET<P: PoolScope, Captures: Sendable>(

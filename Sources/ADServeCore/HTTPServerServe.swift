@@ -46,23 +46,35 @@ extension HTTPServer {
         }
     }
 
-    /// The accept loop for a plaintext listener: each connection becomes a child task.
+    /// The accept loop for a plaintext listener: each connection's `EngineH1Result` negotiation becomes a
+    /// child task — a normal HTTP connection, or an upgraded WebSocket driven to completion.
     func servePlainListener(
-        _ serverChannel: NIOAsyncChannel<EngineConnection, Never>, routes: any HTTPHandling,
-        threadPool: NIOThreadPool
+        _ serverChannel: NIOAsyncChannel<EventLoopFuture<EngineH1Result>, Never>,
+        routes: any HTTPHandling, threadPool: NIOThreadPool
     ) async {
         do {
             try await withThrowingDiscardingTaskGroup { taskGroup in
                 try await serverChannel.executeThenClose { inbound in
-                    for try await connection in inbound {
+                    for try await negotiation in inbound {
                         taskGroup.addTask {
-                            guard connectionLimiter.tryAcquire() else {
-                                await rejectOverConnectionLimit(connection)
-                                return
+                            guard let result = try? await negotiation.get() else { return }
+                            switch result {
+                                case .http(let connection):
+                                    guard connectionLimiter.tryAcquire() else {
+                                        await rejectOverConnectionLimit(connection)
+                                        return
+                                    }
+                                    defer { connectionLimiter.release() }
+                                    await serveConnection(
+                                        connection, routes: routes, threadPool: threadPool, isHTTP2: false)
+                                case .webSocket(let wsChannel, let route):
+                                    guard connectionLimiter.tryAcquire() else {
+                                        wsChannel.channel.close(mode: .all, promise: nil)
+                                        return
+                                    }
+                                    defer { connectionLimiter.release() }
+                                    await driveWebSocket(wsChannel, handler: route.handler)
                             }
-                            defer { connectionLimiter.release() }
-                            await serveConnection(
-                                connection, routes: routes, threadPool: threadPool, isHTTP2: false)
                         }
                     }
                 }
