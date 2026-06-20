@@ -39,6 +39,10 @@ struct ServingService: Service {
             }
             // The graceful-shutdown waiter.
             taskGroup.addTask {
+                // `gracefulShutdown()` returns when a shutdown signal arrives, or throws
+                // `CancellationError` if this waiter is cancelled first (e.g. serving already ended).
+                // Both outcomes mean "stop", so the error is deliberately swallowed — `.signalled`
+                // is reported either way to trigger the drain below.
                 do { try await gracefulShutdown() } catch {}
                 return .signalled
             }
