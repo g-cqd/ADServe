@@ -131,12 +131,13 @@ import Testing
     }
 }
 
-/// A shareable boolean signal (a `Mutex` is `~Copyable`, so it cannot be passed by value into the
-/// route closure + the NIO handler — this reference wrapper can). `Sendable` via the inner `Mutex`.
+/// A shareable boolean signal. The lock-free `Atomic` (like a `Mutex`) is `~Copyable`, so it cannot be
+/// passed by value into the route closure + the NIO handler — this reference wrapper can. `Sendable`
+/// via the inner `Atomic`.
 final class Flag: Sendable {
-    private let value = Mutex(false)
-    var isSet: Bool { value.withLock { $0 } }
-    func set() { value.withLock { $0 = true } }
+    private let value = Atomic<Bool>(false)
+    var isSet: Bool { value.load(ordering: .acquiring) }
+    func set() { value.store(true, ordering: .releasing) }
 }
 
 /// Sets `flag` on the first inbound read — signals that the server's SSE stream has started.

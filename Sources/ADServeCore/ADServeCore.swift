@@ -86,14 +86,16 @@ public struct ListenerConfig: Sendable {
     }
 }
 
-/// A thread-safe readiness flag — `true` once the server is serving, `false` while draining.
-/// The app shares one instance between the engine (which flips it across the lifecycle) and
-/// the `/readyz` route (which fails fast while draining, so orchestrators stop new traffic).
+/// A lock-free readiness flag — `true` once the server is serving, `false` while draining. The app
+/// shares one instance between the engine (which flips it across the lifecycle) and the `/readyz`
+/// route (which fails fast while draining, so orchestrators stop new traffic). A lock-free `Atomic`,
+/// not a `Mutex`: the flag is read on the `/readyz` hot path and carries no associated state, so a
+/// release/acquire pair is both correct and cheaper than taking a lock.
 public final class ServerReadiness: Sendable {
-    private let ready = Mutex(false)
+    private let ready = Atomic<Bool>(false)
     public init() {}
-    public var isReady: Bool { ready.withLock { $0 } }
-    public func set(_ value: Bool) { ready.withLock { $0 = value } }
+    public var isReady: Bool { ready.load(ordering: .acquiring) }
+    public func set(_ value: Bool) { ready.store(value, ordering: .releasing) }
 }
 
 /// The network transport the engine binds on. `.nio` = NIOPosix (BSD sockets) + NIOSSL TLS —
