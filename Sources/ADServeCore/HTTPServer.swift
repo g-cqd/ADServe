@@ -63,6 +63,9 @@ struct RequestExchange {
     /// The per-request storage shared with the middleware chain + terminal — the write path reads the
     /// terminal-resolved `StaticPlan` (`ResolvedStaticPlanKey`) from it to avoid a second stat.
     let storage: RequestStorage
+    /// The connection's peer IP (`channel.remoteAddress?.ipAddress`), seeded into `storage` for IP-aware
+    /// middleware. `nil` for a UDS/unknown peer.
+    let remoteAddress: String?
 }
 
 /// A wait-free admission counter for concurrent CONNECTIONS (the max-connection accept gate). Identical

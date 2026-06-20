@@ -430,7 +430,7 @@ public struct MiddlewareContext: Sendable {
 public protocol HTTPMiddleware: Sendable {
     func intercept(
         _ request: ServerRequest, _ context: MiddlewareContext,
-        next: @Sendable (ServerRequest) async -> ResponseContent
+        next: @escaping @Sendable (ServerRequest) async -> ResponseContent
     ) async -> ResponseContent
 }
 

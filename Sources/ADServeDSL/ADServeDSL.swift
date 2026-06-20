@@ -28,6 +28,22 @@ extension HandlerContext {
     /// The cookies parsed from the request's `Cookie:` header: `ctx.cookies["session"]`. Set a response
     /// cookie with `ResponseContent.settingCookie(_:)`.
     public var cookies: RequestCookies { RequestCookies(request.headers[.cookie]) }
+    /// Parse the request body as `application/x-www-form-urlencoded`: `ctx.form()["email"]`.
+    public func form() -> URLEncodedForm { URLEncodedForm(request.body) }
+    /// Parse the request body as `multipart/form-data` (fields + file uploads); `nil` if the request is
+    /// not multipart or the boundary is absent: `ctx.multipart()?["avatar"]`.
+    public func multipart() -> MultipartForm? {
+        guard let contentType = request.headers[.contentType],
+            let boundary = MultipartParser.boundary(fromContentType: contentType)
+        else { return nil }
+        return MultipartParser.parse(request.body, boundary: boundary)
+    }
+    /// The signed-cookie session — present only when the `Sessions` middleware wraps this route (else
+    /// `nil`). Read/mutate it: `ctx.session?["userID"] = id`; rotate/expire via `ctx.session?.rotate()`.
+    public var session: Session? { storage[SessionKey.self] }
+    /// The connection's peer IP (the engine-seeded remote address); `nil` for a UDS/unknown peer. Behind
+    /// a proxy this is the proxy — read `X-Forwarded-For` for the true client there.
+    public var remoteAddress: String? { storage[RemoteAddressKey.self] }
     /// The raw request body bytes.
     public var body: [UInt8] { request.body }
     /// Decode the request body into `T` via the configured codec (default: JSON over ADJSON). Throws

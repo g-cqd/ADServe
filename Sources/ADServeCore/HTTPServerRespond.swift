@@ -172,6 +172,7 @@ extension HTTPServer {
         // read the engine-recorded real status (notably a static file's off-loop-resolved status).
         let storage = exchange.storage
         storage[ResponseStatusKey.self] = ResponseStatusBox()
+        if let remoteAddress = exchange.remoteAddress { storage[RemoteAddressKey.self] = remoteAddress }
 
         // Reject directory traversal (`.`/`..` segments) before routing — a catch-all route would
         // otherwise hand `../../etc/passwd` to a handler.

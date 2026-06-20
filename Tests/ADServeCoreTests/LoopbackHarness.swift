@@ -18,6 +18,17 @@ struct StubRoutes: HTTPHandling {
     }
 }
 
+/// Like `StubRoutes` but matches ANY method and hands the handler the full `HandlerInput` (so a test can
+/// reach `input.storage` — the session, the seeded remote address — not just the request).
+struct InputStubRoutes: HTTPHandling {
+    let respond: @Sendable (HandlerInput) -> ResponseContent
+    func match(method: HTTPRequest.Method, path: Substring) -> RouteMatch {
+        let run = respond
+        return .matched(
+            MatchedRoute(needsStorage: false, cache: .unset, run: { input in run(input) }))
+    }
+}
+
 /// Collects all inbound bytes on a client connection, fulfilling `promise` when the server closes the
 /// socket (the harness sends `Connection: close`, so the server closes after `.end` → the client sees
 /// EOF). `@unchecked Sendable`: `accumulated` is touched ONLY from the channel's event loop

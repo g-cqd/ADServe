@@ -140,6 +140,8 @@ extension HTTPServer {
             let allocator = channel.channel.allocator
             // Resolves on client disconnect / server quiesce — an SSE stream cancels its source on it.
             let onClose = channel.channel.closeFuture
+            // The peer IP (nil for a UDS / unknown peer, or an h2 stream that doesn't carry it).
+            let remoteAddress = channel.channel.remoteAddress?.ipAddress
             try await channel.executeThenClose { inbound, outbound in
                 var requestHead: HTTPRequest?
                 var body: [UInt8] = []
@@ -220,7 +222,8 @@ extension HTTPServer {
                             defer { active.leave() }
                             let exchange = RequestExchange(
                                 head: head, outbound: outbound, isHTTP2: isHTTP2, allocator: allocator,
-                                onClose: onClose, threadPool: threadPool, storage: RequestStorage())
+                                onClose: onClose, threadPool: threadPool, storage: RequestStorage(),
+                                remoteAddress: remoteAddress)
                             let keepAlive: Bool
                             if overflow {
                                 try await writeBodyTooLarge(exchange)

@@ -51,6 +51,14 @@ public enum ResponseStatusKey: StorageKey {
     public typealias Value = ResponseStatusBox
 }
 
+/// The `RequestStorage` key carrying the connection's peer IP (the engine seeds it from the channel's
+/// remote address when available). Behind a proxy this is the proxy's address — prefer an
+/// `X-Forwarded-For` header for the true client there. Read via `ctx.remoteAddress`; used as the default
+/// rate-limit key and available to any IP-aware middleware.
+public enum RemoteAddressKey: StorageKey {
+    public typealias Value = String
+}
+
 // MARK: - Response header decoration
 
 extension ResponseContent {
