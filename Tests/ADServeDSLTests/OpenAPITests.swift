@@ -11,7 +11,6 @@ private struct ItemDTO: Codable {
     let price: Double
 }
 
-@Suite("OpenAPI generation")
 struct OpenAPITests {
     private func spec() -> String {
         let api = Server {
@@ -27,13 +26,13 @@ struct OpenAPITests {
         return openAPIDocument(info: OpenAPIInfo(title: "Items API", version: "1.0.0"), from: api)
     }
 
-    @Test("emits a well-formed JSON document (parses cleanly via ADJSON)")
-    func wellFormed() throws {
+    @Test
+    func `emits a well-formed JSON document (parses cleanly via ADJSON)`() throws {
         _ = try JSONValue(parsing: spec())  // throws on malformed JSON — the core correctness gate
     }
 
-    @Test("carries version, info, and every route's path + verb")
-    func skeleton() {
+    @Test
+    func `carries version, info, and every route's path + verb`() {
         let doc = spec()
         #expect(doc.contains(#""openapi":"3.1.0""#))
         #expect(doc.contains(#""title":"Items API""#))
@@ -45,8 +44,8 @@ struct OpenAPITests {
         #expect(doc.contains(#""post":{"#))
     }
 
-    @Test("derives a path parameter from the {id} segment")
-    func pathParameter() {
+    @Test
+    func `derives a path parameter from the {id} segment`() {
         let doc = spec()
         #expect(doc.contains(#""parameters":["#))
         #expect(doc.contains(#""name":"id""#))
@@ -54,8 +53,8 @@ struct OpenAPITests {
         #expect(doc.contains(#""required":true"#))
     }
 
-    @Test("carries operation metadata: summary, tags, operationId")
-    func operationMetadata() {
+    @Test
+    func `carries operation metadata: summary, tags, operationId`() {
         let doc = spec()
         #expect(doc.contains(#""summary":"Get an item""#))
         #expect(doc.contains(#""summary":"Create an item""#))
@@ -63,8 +62,8 @@ struct OpenAPITests {
         #expect(doc.contains(#""tags":["items"]"#))
     }
 
-    @Test("references @Schemable bodies and emits their schema into components")
-    func schemaComponents() {
+    @Test
+    func `references @Schemable bodies and emits their schema into components`() {
         let doc = spec()
         #expect(doc.contains(#""requestBody":"#))
         #expect(doc.contains(##""$ref":"#/components/schemas/ItemDTO""##))
