@@ -176,7 +176,10 @@ let package = Package(
             dependencies: [
                 "ADServeCore",
                 .product(name: "ADJSON", package: "ADJSON"),
-                .product(name: "HTTPTypes", package: "swift-http-types")
+                .product(name: "HTTPTypes", package: "swift-http-types"),
+                // Loopback integration tests bind a real listener + drive a raw NIO client.
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio")
             ],
             swiftSettings: testSettings),
         .testTarget(

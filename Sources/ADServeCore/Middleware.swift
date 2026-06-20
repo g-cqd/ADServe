@@ -46,6 +46,9 @@ extension ResponseContent {
             case .full(let body, let contentType, let status, var headers):
                 for field in extra { headers[field.name] = field.value }
                 return .full(body: body, contentType: contentType, status: status, headers: headers)
+            case .stream(let contentType, let status, var headers, let body):
+                for field in extra { headers[field.name] = field.value }
+                return .stream(contentType: contentType, status: status, headers: headers, body: body)
         }
     }
 }

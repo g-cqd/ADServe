@@ -20,6 +20,26 @@ struct MaterializedResponse {
     var headers: HTTPFields
 }
 
+/// The engine's `ResponseBodyWriter`, backed by the connection's outbound channel writer. Each `write`
+/// copies the chunk into a pooled NIO `ByteBuffer` (one memcpy — identical to the buffered path) and
+/// awaits `outbound.write`, which suspends while the channel is not writable: that suspension IS the
+/// back-pressure. `NIOAsyncChannelOutboundWriter` flushes per write, so `<head>` reaches the client
+/// immediately and `flush()` has nothing to drain. `Sendable` (both stored values are), so it crosses
+/// into the `@Sendable` `.stream` body closure.
+struct ChannelBodyWriter: ResponseBodyWriter {
+    let outbound: NIOAsyncChannelOutboundWriter<HTTPResponsePart>
+    let allocator: ByteBufferAllocator
+
+    func write(_ bytes: [UInt8]) async throws {
+        guard !bytes.isEmpty else { return }
+        var buffer = allocator.buffer(capacity: bytes.count)
+        buffer.writeBytes(bytes)
+        try await outbound.write(.body(buffer))
+    }
+
+    func flush() async throws {}
+}
+
 extension HTTPServer {
     func writeBodyTooLarge(_ exchange: RequestExchange) async throws {
         try await write(
@@ -158,8 +178,27 @@ extension HTTPServer {
         _ content: ResponseContent, cache: CachePolicy, requestID: String, keepAlive: Bool,
         suppressBody: Bool = false, exchange: RequestExchange
     ) async throws {
+        // Streaming responses take a distinct path: an early head (no Content-Length/ETag — the body
+        // length is unknown, so h1 is chunked and h2 length-less), then writer-driven body chunks
+        // (back-pressure implicit in each `await outbound.write`), then end. A mid-stream throw
+        // propagates out, dropping the connection WITHOUT a clean `.end` (the client sees truncation).
+        if case .stream(let contentType, let status, let extra, let body) = content {
+            var headers = commonHeaders(
+                cache: cache, requestID: requestID, keepAlive: keepAlive, isHTTP2: exchange.isHTTP2)
+            headers[.contentType] = contentType
+            for field in extra { headers[field.name] = field.value }
+            try await exchange.outbound.write(.head(HTTPResponse(status: status, headerFields: headers)))
+            if !suppressBody {
+                try await body(
+                    ChannelBodyWriter(outbound: exchange.outbound, allocator: exchange.allocator))
+            }
+            try await exchange.outbound.write(.end(nil))
+            return
+        }
+
         var materialized = materialize(content)
-        var headers = HTTPFields()
+        var headers = commonHeaders(
+            cache: cache, requestID: requestID, keepAlive: keepAlive, isHTTP2: exchange.isHTTP2)
         var emitEntity = true
 
         // ETag computed once from the original entity; on a match, blank the body → 304
@@ -177,11 +216,6 @@ extension HTTPServer {
             headers[.contentType] = materialized.contentType
             headers[.contentLength] = String(materialized.body.count)
         }
-        if let cacheControl = cache.cacheControl { headers[.cacheControl] = cacheControl }
-        headers.append(contentsOf: envelope)
-        headers[requestIDName] = requestID
-        // HTTP/2 forbids the connection-specific `Connection` header (an HTTP/1.1 concept).
-        if !exchange.isHTTP2 { headers[.connection] = keepAlive ? "keep-alive" : "close" }
         // Route-supplied headers override the envelope (CORS / the MCP `/mcp` set).
         for field in materialized.headers { headers[field.name] = field.value }
 
@@ -201,6 +235,21 @@ extension HTTPServer {
         try await exchange.outbound.write(.end(nil))
     }
 
+    /// The headers common to every response: cache-control (if any), the constant envelope (security
+    /// set + Link + Vary), the echoed/minted request-id, and — h1 only (HTTP/2 forbids it) — the
+    /// keep-alive/close connection header. The buffered path layers content-type/length (+ ETag) on
+    /// top; the streamed path layers content-type (no length/ETag, since the body is unbounded).
+    private func commonHeaders(
+        cache: CachePolicy, requestID: String, keepAlive: Bool, isHTTP2: Bool
+    ) -> HTTPFields {
+        var headers = HTTPFields()
+        if let cacheControl = cache.cacheControl { headers[.cacheControl] = cacheControl }
+        headers.append(contentsOf: envelope)
+        headers[requestIDName] = requestID
+        if !isHTTP2 { headers[.connection] = keepAlive ? "keep-alive" : "close" }
+        return headers
+    }
+
     func materialize(_ content: ResponseContent) -> MaterializedResponse {
         switch content {
             case .raw(let body, let contentType, let status):
@@ -217,6 +266,12 @@ extension HTTPServer {
             case .full(let body, let contentType, let status, let headers):
                 return MaterializedResponse(
                     status: status, contentType: contentType, body: body, headers: headers)
+            case .stream:
+                // Unreachable: `.stream` is handled in `write` before `materialize` is reached. Return a
+                // benign 500 (failure-safe — never traps) should a future buffered caller forget to gate.
+                return MaterializedResponse(
+                    status: .internalServerError, contentType: "text/plain; charset=utf-8", body: [],
+                    headers: HTTPFields())
         }
     }
 

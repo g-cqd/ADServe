@@ -168,6 +168,21 @@ public struct ServerRequest: Sendable {
     public func query(_ key: String) -> String? { query[key] }
 }
 
+/// A back-pressured sink for a streamed response body. The engine hands a route's `.stream` body
+/// closure a writer backed by the connection's outbound channel; `write` suspends while the channel
+/// is not writable (the back-pressure point), so a slow client throttles the producer and peak memory
+/// stays bounded. Reference-semantic + `Sendable`, NOT an `inout`/`mutating` sink — exclusive access
+/// to an `inout` cannot be held across an `await`; the writer owns its channel handle by value and its
+/// methods are non-mutating. This matches ADHTML's `AsyncHTMLByteSink.write(_:)` (`[UInt8]`, not a
+/// slice) 1:1, so the gated `ADHTMLNIO` bridge is a direct forwarder.
+public protocol ResponseBodyWriter: Sendable {
+    /// Append a chunk of already-rendered bytes, suspending for channel back-pressure as needed.
+    func write(_ bytes: [UInt8]) async throws
+    /// Drain anything buffered. A no-op on the channel writer (each `write` flushes), present so a
+    /// buffering sink has a flush point.
+    func flush() async throws
+}
+
 /// What a handler returns. The cross-cutting envelope (security set, Link, Vary,
 /// request-id) + cache-control/ETag are applied by the engine, not here.
 public enum ResponseContent: Sendable {
@@ -182,6 +197,14 @@ public enum ResponseContent: Sendable {
     /// can override an envelope header). For routes that need their own header set — the
     /// CORS + MCP header set on `POST /mcp` / `OPTIONS /mcp`.
     case full(body: [UInt8], contentType: String, status: HTTPResponse.Status, headers: HTTPFields)
+    /// A streamed response: an early head (NO `Content-Length`/ETag — the length is unknown, so h1 is
+    /// chunked and h2 is length-less) followed by writer-driven body chunks. The engine drives `body`
+    /// AFTER the head is on the wire, so `<head>` flushes before the body completes (TTFB); back-pressure
+    /// is implicit in each `writer.write`. A mid-stream throw tears the connection — the client sees a
+    /// truncated, unterminated body, never a clean `end` implying success.
+    case stream(
+        contentType: String, status: HTTPResponse.Status = .ok, headers: HTTPFields = [:],
+        body: @Sendable (any ResponseBodyWriter) async throws -> Void)
 
     /// JSON body. Defaults to Bun's `Response.json` content-type; pass `contentType`
     /// to override (e.g. `/search` emits `application/json` with no charset).
@@ -400,6 +423,7 @@ public func statusCode(of content: ResponseContent) -> Int {
     switch content {
         case .raw(_, _, let status), .full(_, _, let status, _): return status.code
         case .plain(let status, _): return status.code
+        case .stream(_, let status, _, _): return status.code
         case .notFound: return 404
     }
 }
