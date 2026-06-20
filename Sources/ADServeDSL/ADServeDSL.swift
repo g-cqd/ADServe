@@ -170,6 +170,16 @@ private final class TrieNode: @unchecked Sendable {
     var routes: [HTTPRequest.Method: RoutePayload] = [:]
 }
 
+/// One frame of the iterative trie descent in `RouteTable.match`: the node under exploration, the
+/// path-segment `index` at that node, and a `stage` cursor (0 literal → 1 param → 2 catch-all → 3
+/// exhausted) so a popped child returns the parent to its next alternative. Replaces the former
+/// recursive `search` closure with an explicit stack (no recursion).
+private struct SearchFrame {
+    let node: TrieNode
+    let index: Int
+    var stage: UInt8
+}
+
 /// The slim per-route projection the trie indexes: exactly what `MatchedRoute` needs, plus the route's
 /// own `bind`. `bind` is the AUTHORITATIVE acceptance oracle — it performs the same percent-decode +
 /// traversal rejection + capture binding as the legacy matcher and returns `nil` on reject. The trie
@@ -278,19 +288,41 @@ public struct RouteTable: HTTPHandling {
             return nil
         }
 
-        // Depth-first descent in specificity order (literal → param → catch-all) with backtracking.
-        // Recursion depth is bounded by the path's segment count (the engine caps URI length, and the
-        // literal-traversal pre-check has already run), so it cannot be driven unboundedly deep.
-        func search(_ node: TrieNode, _ index: Int) -> MatchedRoute? {
-            if index == parts.count { return accept(node.routes) }
-            let segment = String(parts[index])
-            if let child = node.literals[segment], let hit = search(child, index + 1) { return hit }
-            if let param = node.param, let hit = search(param.node, index + 1) { return hit }
-            if let catchAll = node.catchAll, let hit = accept(catchAll.routes) { return hit }
-            return nil
+        // Depth-first descent in specificity order (literal → param → catch-all) with backtracking,
+        // driven by an EXPLICIT stack (no recursion). A frame's `stage` cursor advances literal → param
+        // → catch-all; pushing a child explores its subtree first (LIFO), and when that subtree is
+        // exhausted the child is popped and the parent resumes at its next stage — exactly the order the
+        // former recursive `search` produced. The first `accept` hit wins (returns immediately). Depth
+        // is bounded by the path's segment count (URI length is capped; the literal-traversal pre-check
+        // has already run), so the stack cannot grow unboundedly.
+        var stack: [SearchFrame] = [SearchFrame(node: root, index: 0, stage: 0)]
+        while let top = stack.last {
+            if top.index == parts.count {
+                // Terminal position: accept here (or backtrack); a deeper node is never descended.
+                stack.removeLast()
+                if let hit = accept(top.node.routes) { return .matched(hit) }
+                continue
+            }
+            switch top.stage {
+                case 0:  // the literal child for this segment
+                    stack[stack.count - 1].stage = 1
+                    if let child = top.node.literals[String(parts[top.index])] {
+                        stack.append(SearchFrame(node: child, index: top.index + 1, stage: 0))
+                    }
+                case 1:  // then the single `{param}` child
+                    stack[stack.count - 1].stage = 2
+                    if let param = top.node.param {
+                        stack.append(SearchFrame(node: param.node, index: top.index + 1, stage: 0))
+                    }
+                case 2:  // then the terminal `{catchAll*}` (consumes the remainder)
+                    stack[stack.count - 1].stage = 3
+                    if let catchAll = top.node.catchAll, let hit = accept(catchAll.routes) {
+                        return .matched(hit)
+                    }
+                default:  // exhausted → backtrack to the parent's next alternative
+                    stack.removeLast()
+            }
         }
-
-        if let matched = search(root, 0) { return .matched(matched) }
 
         // Trie miss: try opaque matchers in declaration order (structured routes always win over these).
         for route in opaque {
