@@ -153,43 +153,24 @@ public func Static(_ mountPath: String, root: String, cache: CachePolicy = .immu
     .cache(cache)
 }
 
-/// The content-type for a static path by its final-segment extension, or `nil` (→ 404) for an
-/// extension-less path or one NOT on the allow-list. The allow-list is the whole point: only known
-/// asset types are ever served — never source, configs, or arbitrary files.
+/// The content-type for a static path, or `nil` (→ 404) for an extension-less path, a dotfile, or an
+/// extension NOT on the servable allow-set. Two separated concerns: the allow-set is the SECURITY
+/// boundary (WHICH extensions are servable — never source/configs/scripts), while the content-type
+/// STRING comes from the authoritative generated mime-db table via `MediaType(fileExtension:)` — so the
+/// types are correct + cross-platform without hand-maintenance.
 func staticContentType(forPath path: String) -> String? {
-    let lastSegment = path.split(separator: "/").last.map(String.init) ?? path
-    guard let dotIndex = lastSegment.lastIndex(of: "."), dotIndex != lastSegment.startIndex else {
-        return nil  // no extension, or a leading-dot dotfile
-    }
-    let ext = lastSegment[lastSegment.index(after: dotIndex)...].lowercased()
-    return staticContentTypes[ext]
+    guard let ext = MediaType.fileExtension(of: path), staticServableExtensions.contains(ext),
+        let mediaType = MediaType(fileExtension: ext)
+    else { return nil }
+    return mediaType.value
 }
 
-/// The static-asset extension allow-list — the default covers the ADHTML runtime + CSS/SVG/fonts/
-/// images/wasm. A project needing more types wraps `Static` at the call site.
-let staticContentTypes: [String: String] = [
-    "js": "text/javascript; charset=utf-8",
-    "mjs": "text/javascript; charset=utf-8",
-    "css": "text/css; charset=utf-8",
-    "html": "text/html; charset=utf-8",
-    "json": "application/json; charset=utf-8",
-    "map": "application/json; charset=utf-8",
-    "svg": "image/svg+xml",
-    "png": "image/png",
-    "jpg": "image/jpeg",
-    "jpeg": "image/jpeg",
-    "gif": "image/gif",
-    "webp": "image/webp",
-    "avif": "image/avif",
-    "ico": "image/x-icon",
-    "woff": "font/woff",
-    "woff2": "font/woff2",
-    "ttf": "font/ttf",
-    "otf": "font/otf",
-    "txt": "text/plain; charset=utf-8",
-    "xml": "application/xml; charset=utf-8",
-    "wasm": "application/wasm",
-    "webmanifest": "application/manifest+json"
+/// The web-asset extensions `Static` will serve — the curated security allow-set (the default covers
+/// the ADHTML runtime + CSS/SVG/fonts/images/wasm). A project needing more types wraps `Static`. The
+/// content-TYPE for each is resolved from the generated `MIMEDatabase`, not hand-typed here.
+let staticServableExtensions: Set<String> = [
+    "js", "mjs", "css", "html", "htm", "json", "map", "svg", "png", "jpg", "jpeg", "gif", "webp",
+    "avif", "ico", "woff", "woff2", "ttf", "otf", "txt", "xml", "wasm", "webmanifest"
 ]
 
 // MARK: - Routes (typed verbs + typed pool → typed context)

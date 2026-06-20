@@ -1,0 +1,32 @@
+ADServe vendors a snapshot of jshttp/mime-db to code-generate its MIME-type table.
+
+  Source:  https://github.com/jshttp/mime-db  (file: db.json)
+  Version: 1.54.0
+  Commit:  c03ddfcab556
+  License: MIT
+
+mime-db is the aggregate of the IANA media-type registry, Apache, and nginx. The vendored db.json
+drives `ADServeMimeCodegen`, which emits the committed, reviewable
+`Sources/ADServeCore/Generated/MIMEDatabase.swift`. To re-vendor: replace db.json with a newer
+snapshot, update the version/commit above, and run `swift run ADServeMimeCodegen` (then `swift format`).
+
+------------------------------------------------------------------------------------------------------
+jshttp/mime-db — The MIT License (MIT)
+
+Copyright (c) 2014 Jonathan Ong <me@jongleberry.com>
+Copyright (c) 2015-2022 Douglas Christopher Wilson <doug@somethingdoug.com>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the 'Software'), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
+following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial
+portions of the Software.
+
+THE SOFTWARE IS PROVIDED 'AS IS', WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

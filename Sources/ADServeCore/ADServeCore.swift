@@ -287,13 +287,41 @@ public struct MediaType: Sendable {
     }
 
     #if canImport(UniformTypeIdentifiers)
-        /// From an Apple `UTType` (+ optional charset) — the type-safe, Apple-native constructor.
+        /// From an Apple `UTType` (+ optional charset) — the type-safe, Apple-native constructor. Only a
+        /// convenience: `UTType` is Apple-only (absent on Linux, ADServe's primary target), carries no
+        /// charset, and can't express `text/event-stream`/`application/problem+json`/`…+json`, so the
+        /// authoritative source is the generated mime-db table below — not `UTType`.
         @available(macOS 11.0, *)
         public init(_ type: UTType, charset: Charset? = nil) {
             let mime = type.preferredMIMEType ?? "application/octet-stream"
             value = charset.map { mime + $0.suffix } ?? mime
         }
     #endif
+
+    /// The media type for a file extension (lowercased, dot-free) from the generated jshttp/mime-db
+    /// table, or `nil` if unknown. Appends `; charset=…` when the table records one (`text/*` defaults
+    /// to utf-8). The authoritative, cross-platform path — works identically on Linux.
+    public init?(fileExtension ext: String) {
+        guard let entry = MIMEDatabase.entry(forExtension: ext.lowercased()) else { return nil }
+        self.init(value: entry.charset.map { "\(entry.type); charset=\($0)" } ?? entry.type)
+    }
+
+    /// The media type for a path by its final-segment extension, or `nil` (no extension / dotfile /
+    /// unknown type). Drives `Static`'s content-type and any handler mapping a filename to a type.
+    public init?(path: String) {
+        guard let ext = MediaType.fileExtension(of: path) else { return nil }
+        self.init(fileExtension: ext)
+    }
+
+    /// The lowercase extension of a path's final segment (no dot), or `nil` for none / a leading-dot
+    /// dotfile. The single ext-extraction the `path` init and the static-asset lookup share.
+    public static func fileExtension(of path: String) -> String? {
+        let lastSegment = path.split(separator: "/").last.map(String.init) ?? path
+        guard let dotIndex = lastSegment.lastIndex(of: "."), dotIndex != lastSegment.startIndex else {
+            return nil
+        }
+        return lastSegment[lastSegment.index(after: dotIndex)...].lowercased()
+    }
 
     /// An explicit content-type (the non-`UTType`-expressible cases + the parity strings).
     public static func custom(_ value: String) -> MediaType { MediaType(value: value) }

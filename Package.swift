@@ -171,6 +171,15 @@ let package = Package(
             ],
             swiftSettings: strictSettings,
             plugins: libraryBuildPlugins),
+        // Dev-only MIME-table generator — run by hand (`swift run ADServeMimeCodegen`); reads the
+        // vendored jshttp/mime-db snapshot and emits the committed
+        // `Sources/ADServeCore/Generated/MIMEDatabase.swift`. NOT a product, so consumers of the
+        // libraries never build it. Foundation-only (no package dependency); mirrors ADHTML's
+        // ADHTMLCodegen (ADR-0009): committed, reviewable output, never a build plugin.
+        .executableTarget(
+            name: "ADServeMimeCodegen",
+            resources: [.copy("mime-db.json")],
+            swiftSettings: strictSettings),
         .testTarget(
             name: "ADServeCoreTests",
             dependencies: [
