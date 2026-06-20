@@ -142,6 +142,8 @@ let package = Package(
                 .product(name: "NIOHTTPTypes", package: "swift-nio-extras"),
                 .product(name: "NIOHTTPTypesHTTP1", package: "swift-nio-extras"),
                 .product(name: "NIOHTTPTypesHTTP2", package: "swift-nio-extras"),
+                // On-the-fly response compression (gzip/deflate) — already a package dep; add the product.
+                .product(name: "NIOHTTPCompression", package: "swift-nio-extras"),
                 .product(name: "NIOSSL", package: "swift-nio-ssl"),
                 .product(name: "NIOHTTP2", package: "swift-nio-http2"),
                 .product(name: "NIOTransportServices", package: "swift-nio-transport-services"),

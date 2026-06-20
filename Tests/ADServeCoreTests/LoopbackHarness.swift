@@ -41,19 +41,21 @@ private final class ResponseCollector: ChannelInboundHandler, @unchecked Sendabl
 enum Loopback {
     static func run(
         path: String, routes: any HTTPHandling, headers: [(name: String, value: String)] = [],
-        middleware: [any HTTPMiddleware] = []
+        middleware: [any HTTPMiddleware] = [], compression: Bool = true
     ) async throws -> String {
         // `Connection: close` makes the server close after `.end`, ending the client's read at EOF.
         var request = "GET \(path) HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n"
         for header in headers { request += "\(header.name): \(header.value)\r\n" }
-        return try await runRaw(request + "\r\n", routes: routes, middleware: middleware)
+        return try await runRaw(
+            request + "\r\n", routes: routes, middleware: middleware, compression: compression)
     }
 
     /// Send a fully-formed raw HTTP/1.1 request (caller supplies request line + headers + body) and read
     /// the whole response to EOF — for exercising the wire directly (e.g. `Expect: 100-continue`, where
     /// the engine writes a `100` interim before the final response). Include `Connection: close`.
     static func runRaw(
-        _ rawRequest: String, routes: any HTTPHandling, middleware: [any HTTPMiddleware] = []
+        _ rawRequest: String, routes: any HTTPHandling, middleware: [any HTTPMiddleware] = [],
+        compression: Bool = true
     ) async throws -> String {
         // The harness ELG (probe + client). `shutdownGracefully` must be awaited (the strict test
         // settings forbid the blocking `syncShutdownGracefully` in an async context), so bracket the
@@ -61,7 +63,8 @@ enum Loopback {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         do {
             let response = try await serve(
-                request: rawRequest, routes: routes, middleware: middleware, group: group)
+                request: rawRequest, routes: routes, middleware: middleware, compression: compression,
+                group: group)
             try? await group.shutdownGracefully()
             return response
         } catch {
@@ -71,7 +74,7 @@ enum Loopback {
     }
 
     private static func serve(
-        request: String, routes: any HTTPHandling, middleware: [any HTTPMiddleware],
+        request: String, routes: any HTTPHandling, middleware: [any HTTPMiddleware], compression: Bool,
         group: MultiThreadedEventLoopGroup
     ) async throws -> String {
         // Discover a free loopback port (bind :0, read the assignment, release it).
@@ -83,7 +86,7 @@ enum Loopback {
         let server = HTTPServer(
             listeners: [ListenerConfig(host: "127.0.0.1", port: port, routes: routes)], pool: nil,
             envelope: HTTPFields(), logger: Logger(label: "loopback-test"), threadCount: 1, loopCount: 1,
-            readiness: readiness, middleware: middleware)
+            readiness: readiness, middleware: middleware, responseCompression: compression)
         let serverTask = Task { try? await server.run() }
         defer { serverTask.cancel() }
 

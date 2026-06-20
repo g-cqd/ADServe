@@ -192,12 +192,14 @@ extension HTTPServer {
                             if !overflow, let declaredLength, declaredLength > 0 {
                                 body.reserveCapacity(min(declaredLength, effectiveLimit))
                             }
-                            // `Expect: 100-continue`: the client announced it is WAITING for our go-ahead
-                            // before sending the body. Send the `100 Continue` interim now (head only, no
-                            // end) so it proceeds — UNLESS we already know the declared body is oversized
-                            // or malformed (`overflow`), in which case the `.end` 413-and-close path answers
-                            // and we never invite a body we would only reject (RFC 9110 §10.1.1).
-                            if !overflow,
+                            // `Expect: 100-continue` (HTTP/2 only here): the client announced it is WAITING
+                            // for our go-ahead before sending the body. Send the `100 Continue` interim now
+                            // (head only) so it proceeds — UNLESS we already know the declared body is
+                            // oversized/malformed (`overflow`), in which case the `.end` 413-and-close path
+                            // answers and we never invite a body we would only reject (RFC 9110 §10.1.1).
+                            // The HTTP/1 path is handled by `HTTP1ExpectContinueHandler` in the pipeline,
+                            // ahead of the response compressor (which cannot tolerate an interim head).
+                            if isHTTP2, !overflow,
                                 let expect = head.headerFields[.expect],
                                 expect.lowercased().contains("100-continue")
                             {

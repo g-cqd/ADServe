@@ -144,6 +144,12 @@ public struct HTTPServer: Sendable {
     /// endpoint; the engine peeks the route at the request head to size accumulation) or *lower* (a
     /// tighter bound, enforced post-match as a problem+json 413).
     let maxBodyBytes: Int
+    /// On-the-fly response compression (gzip/deflate) on the HTTP/1 pipeline (plaintext + secure h1),
+    /// gated by a predicate (compressible MIME types, no existing `Content-Encoding`, not SSE). Default
+    /// on. HTTP/2 streams are not compressed on the fly — `HTTPResponseCompressor` is an HTTP/1 handler;
+    /// serve precompressed static for h2, or terminate compression at the proxy. Large dynamic bodies
+    /// should still be precompressed (compression runs on the event loop).
+    let responseCompression: Bool
     /// In-flight request count, so a drain waits for real work, not idle keep-alive connections.
     let active = ActiveRequests()
     /// Admission control for concurrent SSE streams (a `.sse` response past the limit gets a 503).
@@ -157,7 +163,7 @@ public struct HTTPServer: Sendable {
         threadCount: Int, loopCount: Int = 2, readiness: ServerReadiness? = nil,
         transport: EngineTransport = .nio, middleware: [any HTTPMiddleware] = [],
         codec: ContentCodec = .json, maxBodyBytes: Int = 1_000_000, maxConcurrentSSE: Int = 1024,
-        maxConnections: Int = 0
+        maxConnections: Int = 0, responseCompression: Bool = true
     ) {
         self.listeners = listeners
         self.pool = pool
@@ -172,6 +178,7 @@ public struct HTTPServer: Sendable {
         self.maxBodyBytes = max(0, maxBodyBytes)
         self.sseLimiter = SSELimiter(limit: maxConcurrentSSE)
         self.connectionLimiter = ConnectionLimiter(limit: maxConnections)
+        self.responseCompression = responseCompression
     }
 
     public func run() async throws {

@@ -77,6 +77,12 @@ let cases = byExtension.keys.sorted()
             + "compressible: \(resolved.compressible))"
     }
 
+// The bare media types mime-db marks `compressible: true` — the type-keyed compressibility the on-the-fly
+// response compressor consults (the extension table above is keyed by extension, but a response carries a
+// Content-Type, not a filename). One `case` per compressible type, sorted for a stable diff.
+let compressibleTypes = db.keys.filter { db[$0]?.compressible == true }.sorted()
+let compressibleCases = compressibleTypes.map { "        case \"\($0)\": return true" }
+
 // Build the file from a joined array of lines (not a `"""` literal) so the emitted columns are exact +
 // deterministic, and `main.swift` itself stays free of multiline-string indentation churn. The format +
 // lint gates are disabled in-file: the generated switch is intentionally long (a fast hashed jump).
@@ -107,12 +113,31 @@ let preamble = [
     "        switch ext {"
 ]
 .joined(separator: "\n")
-let footer = "        default:\n            return nil\n        }\n    }\n}\n"
+
+// Close `entry(forExtension:)`, then the type-keyed `isCompressible(type:)` switch (default false — an
+// unknown type is never compressed), then the enum.
+let middle = [
+    "        default:",
+    "            return nil",
+    "        }",
+    "    }",
+    "",
+    "    /// Whether the on-the-fly response compressor should compress this BARE media type (mime-db's",
+    "    /// `compressible` flag; \(compressibleTypes.count) types). Pass the type with no parameters —",
+    "    /// strip `; charset=…` first. An unknown type returns `false` (never compressed, the safe default).",
+    "    static func isCompressible(type: String) -> Bool {",
+    "        switch type {"
+]
+.joined(separator: "\n")
+let footer = "        default:\n            return false\n        }\n    }\n}\n"
 
 let outPath =
     CommandLine.arguments.count > 1
     ? CommandLine.arguments[1] : "Sources/ADServeCore/Generated/MIMEDatabase.swift"
-try (preamble + "\n" + cases.joined(separator: "\n") + "\n" + footer)
-    .write(
-        toFile: outPath, atomically: true, encoding: .utf8)
-print("ADServeMimeCodegen: wrote \(cases.count) extensions → \(outPath)")
+let body =
+    preamble + "\n" + cases.joined(separator: "\n") + "\n" + middle + "\n"
+    + compressibleCases.joined(separator: "\n") + "\n" + footer
+try body.write(toFile: outPath, atomically: true, encoding: .utf8)
+print(
+    "ADServeMimeCodegen: wrote \(cases.count) extensions + \(compressibleTypes.count) compressible types "
+        + "→ \(outPath)")

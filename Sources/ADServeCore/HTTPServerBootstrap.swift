@@ -2,10 +2,12 @@
 // the TLS context, and the per-connection read-idle timeout. Extracted from HTTPServer.swift; the
 // behavior is unchanged. One listener per `ListenerConfig`; each speaks its `Wire`.
 
+import Foundation
 import NIOCore
 import NIOExtras
 import NIOHTTP1
 import NIOHTTP2
+import NIOHTTPCompression
 import NIOHTTPTypes
 import NIOHTTPTypesHTTP1
 import NIOHTTPTypesHTTP2
@@ -39,11 +41,49 @@ extension HTTPServer {
         }
     }
 
+    /// Adds the HTTP/1 `Expect: 100-continue` handler ahead of (head-ward of) the response compressor, so
+    /// the `100 Continue` interim it writes never flows through `HTTPResponseCompressor` — which pops its
+    /// accept-encoding queue on EVERY response head, interim included, and would underflow on the final
+    /// response. Must be installed before the compressor in the pipeline.
+    static func addExpectContinue(_ channel: any Channel) throws {
+        try channel.pipeline.syncOperations.addHandler(HTTP1ExpectContinueHandler())
+    }
+
+    /// A fresh `HTTPResponseCompressor` (one per connection — it is stateful) gated to compress only what
+    /// is worth it and safe: a body whose bare `Content-Type` is mime-db-compressible, with NO existing
+    /// `Content-Encoding` (so a precompressed `.br`/`.gz` static variant is passed through untouched), and
+    /// NEVER `text/event-stream` (compressing buffers, which would stall a long-lived SSE stream).
+    /// `isSupported` already encodes the client's `Accept-Encoding` (with q-values) ∩ what HTTP allows.
+    static func makeResponseCompressor() -> HTTPResponseCompressor {
+        HTTPResponseCompressor(responseCompressionPredicate: { responseHead, isSupported in
+            guard isSupported else { return .doNotCompress }
+            if responseHead.headers.contains(name: "Content-Encoding") { return .doNotCompress }
+            guard let contentType = responseHead.headers.first(name: "Content-Type") else {
+                return .doNotCompress
+            }
+            let lower = contentType.lowercased()
+            if lower.hasPrefix("text/event-stream") { return .doNotCompress }
+            let bareType =
+                lower.split(separator: ";", maxSplits: 1).first
+                .map { $0.trimmingCharacters(in: .whitespaces) } ?? lower
+            return MIMEDatabase.isCompressible(type: bareType) ? .compressIfPossible : .doNotCompress
+        })
+    }
+
     /// The plaintext HTTP/1.1 child pipeline — shared by both transports.
     func plainInitializer() -> @Sendable (any Channel) -> EventLoopFuture<EngineConnection> {
-        { childChannel in
+        let compress = responseCompression
+        return { childChannel in
             childChannel.eventLoop.makeCompletedFuture {
                 try childChannel.pipeline.syncOperations.configureHTTPServerPipeline()
+                // `Expect: 100-continue` ahead of the compressor (the interim must not pass through it).
+                try Self.addExpectContinue(childChannel)
+                // The compressor operates on the NIO HTTP/1 parts, so it sits between the HTTP codec and
+                // the swift-http-types bridge: outbound it compresses the body before encoding; inbound it
+                // reads the request's `Accept-Encoding`.
+                if compress {
+                    try childChannel.pipeline.syncOperations.addHandler(Self.makeResponseCompressor())
+                }
                 // Bridge NIO's HTTP/1 parts ↔ swift-http-types parts (server, plaintext).
                 try childChannel.pipeline.syncOperations.addHandler(HTTP1ToHTTPServerCodec(secure: false))
                 try Self.addIdleTimeout(childChannel)
@@ -83,6 +123,7 @@ extension HTTPServer {
             }
         #endif
         let sslContext = try makeTLSContext(listener.wire.tls!, alpn: listener.wire.alpn)
+        let compress = responseCompression
         return try await baseBootstrap(group)
             .serverChannelInitializer(quiesceInitializer(quiesce))
             .childChannelOption(ChannelOptions.autoRead, value: true)
@@ -99,6 +140,13 @@ extension HTTPServer {
                         childChannel.configureAsyncHTTPServerPipeline(
                             http1ConnectionInitializer: { channel in
                                 channel.eventLoop.makeCompletedFuture {
+                                    // `Expect: 100-continue` ahead of the compressor on the secure h1 path too.
+                                    try Self.addExpectContinue(channel)
+                                    // Compress on the secure h1 path too (before the swift-http-types bridge).
+                                    if compress {
+                                        try channel.pipeline.syncOperations.addHandler(
+                                            Self.makeResponseCompressor())
+                                    }
                                     try channel.pipeline.syncOperations.addHandler(HTTP1ToHTTPServerCodec(secure: true))
                                     try Self.addIdleTimeout(channel)
                                     return try EngineConnection(wrappingChannelSynchronously: channel)
@@ -141,5 +189,27 @@ extension HTTPServer {
     static func addIdleTimeout(_ channel: any Channel) throws {
         try channel.pipeline.syncOperations.addHandler(IdleStateHandler(allTimeout: idleTimeout))
         try channel.pipeline.syncOperations.addHandler(IdleTimeoutHandler())
+    }
+}
+
+/// Answers `Expect: 100-continue` on the HTTP/1 pipeline: on a request head announcing it, the handler
+/// writes the `100 Continue` interim toward the encoder so the client proceeds with the body. It sits
+/// head-ward of `HTTPResponseCompressor`, so the interim never reaches the compressor (which pops its
+/// accept-encoding queue on every response head and would underflow on the final response). The request
+/// head is forwarded unchanged. h2 `Expect` is handled separately in the serve loop (no h1 compressor
+/// there to conflict). The interim is unconditional for h1: an oversized body still earns its 413 next.
+final class HTTP1ExpectContinueHandler: ChannelInboundHandler, RemovableChannelHandler {
+    typealias InboundIn = HTTPServerRequestPart
+    typealias InboundOut = HTTPServerRequestPart
+    typealias OutboundOut = HTTPServerResponsePart
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        if case .head(let head) = unwrapInboundIn(data),
+            head.headers[canonicalForm: "expect"].contains(where: { $0.lowercased() == "100-continue" })
+        {
+            let interim = HTTPResponseHead(version: head.version, status: .continue)
+            context.writeAndFlush(wrapOutboundOut(.head(interim)), promise: nil)
+        }
+        context.fireChannelRead(data)
     }
 }
