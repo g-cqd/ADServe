@@ -6,7 +6,6 @@
 // (OpenAPI 3.1 schemas ARE JSON Schema, so no translation is needed).
 
 public import ADJSON
-
 import HTTPTypes
 
 // MARK: - Document metadata
@@ -196,7 +195,7 @@ public func openAPIDocument(info: OpenAPIInfo, from apps: [Application]) -> Stri
     var root: [(String, DocJSON)] = [
         ("openapi", .string("3.1.0")),
         ("info", openAPIInfoObject(info)),
-        ("paths", .object(pathOrder.map { path in (path, pathItemObject(byPath[path] ?? [], path: path)) })),
+        ("paths", .object(pathOrder.map { path in (path, pathItemObject(byPath[path] ?? [], path: path)) }))
     ]
     if !schemaOrder.isEmpty {
         let entries = schemaOrder.map { name in (name, DocJSON.raw(schemas[name] ?? "{}")) }
@@ -240,28 +239,33 @@ private func operationObject(_ doc: RouteDoc?, parameters: [DocJSON]) -> DocJSON
 }
 
 private func pathParameterObjects(of path: String) -> [DocJSON] {
-    path.split(separator: "/").compactMap { segment -> DocJSON? in
-        guard segment.first == "{", segment.last == "}" else { return nil }
-        var name = segment.dropFirst().dropLast()
-        if name.last == "*" { name = name.dropLast() }  // catch-all `{rest*}` → `rest`
-        return .object([
-            ("name", .string(String(name))),
-            ("in", .string("path")),
-            ("required", .bool(true)),
-            ("schema", .object([("type", .string("string"))])),
-        ])
-    }
+    path.split(separator: "/")
+        .compactMap { segment -> DocJSON? in
+            guard segment.first == "{", segment.last == "}" else { return nil }
+            var name = segment.dropFirst().dropLast()
+            if name.last == "*" { name = name.dropLast() }  // catch-all `{rest*}` → `rest`
+            return .object([
+                ("name", .string(String(name))),
+                ("in", .string("path")),
+                ("required", .bool(true)),
+                ("schema", .object([("type", .string("string"))]))
+            ])
+        }
 }
 
 private func mediaObject(_ ref: SchemaRef) -> DocJSON {
     .object([
-        ("content",
+        (
+            "content",
             .object([
-                ("application/json",
+                (
+                    "application/json",
                     .object([
                         ("schema", .object([("$ref", .string("#/components/schemas/\(ref.name)"))]))
-                    ]))
-            ]))
+                    ])
+                )
+            ])
+        )
     ])
 }
 
@@ -275,14 +279,15 @@ private func responsesObject(_ responses: [Int: SchemaRef]) -> DocJSON {
     guard !responses.isEmpty else {
         return .object([("200", .object([("description", .string("OK"))]))])
     }
-    let entries = responses.keys.sorted().map { status -> (String, DocJSON) in
-        let ref = responses[status]
-        var fields: [(String, DocJSON)] = [
-            ("description", .string(HTTPResponse.Status(code: status).reasonPhrase))
-        ]
-        if let ref { fields.append(contentsOf: objectFields(mediaObject(ref))) }
-        return (String(status), .object(fields))
-    }
+    let entries = responses.keys.sorted()
+        .map { status -> (String, DocJSON) in
+            let ref = responses[status]
+            var fields: [(String, DocJSON)] = [
+                ("description", .string(HTTPResponse.Status(code: status).reasonPhrase))
+            ]
+            if let ref { fields.append(contentsOf: objectFields(mediaObject(ref))) }
+            return (String(status), .object(fields))
+        }
     return .object(entries)
 }
 

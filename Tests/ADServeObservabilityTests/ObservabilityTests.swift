@@ -30,9 +30,10 @@ struct ObservabilityTests {
     @Test("MetricsMiddleware records a counter + timer dimensioned by method and status")
     func metrics() async throws {
         _ = bootstrapOnce
-        let response = await MetricsMiddleware().intercept(
-            ServerRequest(method: .get, target: "/x", headers: HTTPFields()), makeContext()
-        ) { _ in .plain(.ok, "ok") }
+        let response = await MetricsMiddleware()
+            .intercept(
+                ServerRequest(method: .get, target: "/x", headers: HTTPFields()), makeContext()
+            ) { _ in .plain(.ok, "ok") }
         #expect(statusCode(of: response) == 200)
 
         let counter = try testMetrics.expectCounter(
@@ -46,9 +47,10 @@ struct ObservabilityTests {
 
     @Test("MetricsMiddleware returns the downstream response unchanged")
     func metricsTransparent() async {
-        let response = await MetricsMiddleware().intercept(
-            ServerRequest(method: .post, target: "/y", headers: HTTPFields()), makeContext()
-        ) { _ in .plain(.created, "made") }
+        let response = await MetricsMiddleware()
+            .intercept(
+                ServerRequest(method: .post, target: "/y", headers: HTTPFields()), makeContext()
+            ) { _ in .plain(.created, "made") }
         #expect(statusCode(of: response) == 201)
     }
 
@@ -56,9 +58,10 @@ struct ObservabilityTests {
     func tracingError() async throws {
         _ = bootstrapOnce
         testTracer.clearAll(includingActive: true)
-        _ = await TracingMiddleware().intercept(
-            ServerRequest(method: .post, target: "/boom", headers: HTTPFields()), makeContext()
-        ) { _ in .plain(.internalServerError, "boom") }
+        _ = await TracingMiddleware()
+            .intercept(
+                ServerRequest(method: .post, target: "/boom", headers: HTTPFields()), makeContext()
+            ) { _ in .plain(.internalServerError, "boom") }
 
         let spans = testTracer.popFinishedSpans()
         #expect(spans.count == 1)
@@ -73,9 +76,10 @@ struct ObservabilityTests {
     func tracingOK() async throws {
         _ = bootstrapOnce
         testTracer.clearAll(includingActive: true)
-        _ = await TracingMiddleware().intercept(
-            ServerRequest(method: .get, target: "/ok", headers: HTTPFields()), makeContext()
-        ) { _ in .plain(.ok, "ok") }
+        _ = await TracingMiddleware()
+            .intercept(
+                ServerRequest(method: .get, target: "/ok", headers: HTTPFields()), makeContext()
+            ) { _ in .plain(.ok, "ok") }
 
         let span = try #require(testTracer.popFinishedSpans().first)
         #expect(span.operationName == "GET")

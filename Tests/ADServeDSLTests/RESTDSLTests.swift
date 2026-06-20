@@ -1,9 +1,8 @@
+import ADServeCore
+import ADServeDSL
 import HTTPTypes
 import Logging
 import Testing
-
-import ADServeCore
-import ADServeDSL
 
 // A DTO for the codec round-trip tests.
 private struct Item: Codable, Equatable, Sendable {
@@ -423,7 +422,9 @@ struct MiddlewareBuiltinsTests {
         #expect(throws: HTTPError.self) {
             _ = try JSONBodyCodec().decode(Item.self, from: body, contentType: "text/xml")
         }
-        #expect(try JSONBodyCodec().decode(Item.self, from: body, contentType: "application/json") == Item(id: 1, name: "x"))
+        #expect(
+            try JSONBodyCodec().decode(Item.self, from: body, contentType: "application/json") == Item(id: 1, name: "x")
+        )
         #expect(try JSONBodyCodec().decode(Item.self, from: body, contentType: nil) == Item(id: 1, name: "x"))
     }
 }
@@ -437,7 +438,8 @@ struct BodyLimitTests {
             Group("admin") {
                 POST("small", pool: .none) { _ in .noContent }  // inherits the group's 100
                 POST("tiny", pool: .none) { _ in .noContent }.maxBody(5)  // own 5 wins over the group
-            }.maxBody(100)
+            }
+            .maxBody(100)
             POST("plain", pool: .none) { _ in .noContent }  // no limit → nil
         }
         func limit(_ method: HTTPRequest.Method, _ path: String) -> Int? {

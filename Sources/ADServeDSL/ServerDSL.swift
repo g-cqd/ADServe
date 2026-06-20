@@ -137,26 +137,61 @@ public func Group(_ prefix: String, @RouteGroupBuilder _ children: () -> [RouteN
 // additionally keeps the opaque-matcher form for irregular grammars (e.g. RegexBuilder). Storage
 // verbs default to the shared pool (`ctx.db`); `OPTIONS` defaults to no pool.
 
-public func GET<P: PoolScope>(_ subpath: String, pool: P = SharedPool(), _ handler: @escaping @Sendable (P.Context) throws -> ResponseContent) -> RouteNode { exactRoute(.get, subpath, pool: pool, handler) }
-public func GET<P: PoolScope>(_ template: String, pool: P = SharedPool(), _ handler: @escaping @Sendable (P.Context, PathParameters) throws -> ResponseContent) -> RouteNode { templateRoute(.get, template, pool: pool, handler) }
+public func GET<P: PoolScope>(
+    _ subpath: String, pool: P = SharedPool(), _ handler: @escaping @Sendable (P.Context) throws -> ResponseContent
+) -> RouteNode { exactRoute(.get, subpath, pool: pool, handler) }
+public func GET<P: PoolScope>(
+    _ template: String, pool: P = SharedPool(),
+    _ handler: @escaping @Sendable (P.Context, PathParameters) throws -> ResponseContent
+) -> RouteNode { templateRoute(.get, template, pool: pool, handler) }
 
-public func POST<P: PoolScope>(_ subpath: String, pool: P = SharedPool(), _ handler: @escaping @Sendable (P.Context) throws -> ResponseContent) -> RouteNode { exactRoute(.post, subpath, pool: pool, handler) }
-public func POST<P: PoolScope>(_ template: String, pool: P = SharedPool(), _ handler: @escaping @Sendable (P.Context, PathParameters) throws -> ResponseContent) -> RouteNode { templateRoute(.post, template, pool: pool, handler) }
+public func POST<P: PoolScope>(
+    _ subpath: String, pool: P = SharedPool(), _ handler: @escaping @Sendable (P.Context) throws -> ResponseContent
+) -> RouteNode { exactRoute(.post, subpath, pool: pool, handler) }
+public func POST<P: PoolScope>(
+    _ template: String, pool: P = SharedPool(),
+    _ handler: @escaping @Sendable (P.Context, PathParameters) throws -> ResponseContent
+) -> RouteNode { templateRoute(.post, template, pool: pool, handler) }
 
-public func PUT<P: PoolScope>(_ subpath: String, pool: P = SharedPool(), _ handler: @escaping @Sendable (P.Context) throws -> ResponseContent) -> RouteNode { exactRoute(.put, subpath, pool: pool, handler) }
-public func PUT<P: PoolScope>(_ template: String, pool: P = SharedPool(), _ handler: @escaping @Sendable (P.Context, PathParameters) throws -> ResponseContent) -> RouteNode { templateRoute(.put, template, pool: pool, handler) }
+public func PUT<P: PoolScope>(
+    _ subpath: String, pool: P = SharedPool(), _ handler: @escaping @Sendable (P.Context) throws -> ResponseContent
+) -> RouteNode { exactRoute(.put, subpath, pool: pool, handler) }
+public func PUT<P: PoolScope>(
+    _ template: String, pool: P = SharedPool(),
+    _ handler: @escaping @Sendable (P.Context, PathParameters) throws -> ResponseContent
+) -> RouteNode { templateRoute(.put, template, pool: pool, handler) }
 
-public func PATCH<P: PoolScope>(_ subpath: String, pool: P = SharedPool(), _ handler: @escaping @Sendable (P.Context) throws -> ResponseContent) -> RouteNode { exactRoute(.patch, subpath, pool: pool, handler) }
-public func PATCH<P: PoolScope>(_ template: String, pool: P = SharedPool(), _ handler: @escaping @Sendable (P.Context, PathParameters) throws -> ResponseContent) -> RouteNode { templateRoute(.patch, template, pool: pool, handler) }
+public func PATCH<P: PoolScope>(
+    _ subpath: String, pool: P = SharedPool(), _ handler: @escaping @Sendable (P.Context) throws -> ResponseContent
+) -> RouteNode { exactRoute(.patch, subpath, pool: pool, handler) }
+public func PATCH<P: PoolScope>(
+    _ template: String, pool: P = SharedPool(),
+    _ handler: @escaping @Sendable (P.Context, PathParameters) throws -> ResponseContent
+) -> RouteNode { templateRoute(.patch, template, pool: pool, handler) }
 
-public func DELETE<P: PoolScope>(_ subpath: String, pool: P = SharedPool(), _ handler: @escaping @Sendable (P.Context) throws -> ResponseContent) -> RouteNode { exactRoute(.delete, subpath, pool: pool, handler) }
-public func DELETE<P: PoolScope>(_ template: String, pool: P = SharedPool(), _ handler: @escaping @Sendable (P.Context, PathParameters) throws -> ResponseContent) -> RouteNode { templateRoute(.delete, template, pool: pool, handler) }
+public func DELETE<P: PoolScope>(
+    _ subpath: String, pool: P = SharedPool(), _ handler: @escaping @Sendable (P.Context) throws -> ResponseContent
+) -> RouteNode { exactRoute(.delete, subpath, pool: pool, handler) }
+public func DELETE<P: PoolScope>(
+    _ template: String, pool: P = SharedPool(),
+    _ handler: @escaping @Sendable (P.Context, PathParameters) throws -> ResponseContent
+) -> RouteNode { templateRoute(.delete, template, pool: pool, handler) }
 
-public func HEAD<P: PoolScope>(_ subpath: String, pool: P = SharedPool(), _ handler: @escaping @Sendable (P.Context) throws -> ResponseContent) -> RouteNode { exactRoute(.head, subpath, pool: pool, handler) }
-public func HEAD<P: PoolScope>(_ template: String, pool: P = SharedPool(), _ handler: @escaping @Sendable (P.Context, PathParameters) throws -> ResponseContent) -> RouteNode { templateRoute(.head, template, pool: pool, handler) }
+public func HEAD<P: PoolScope>(
+    _ subpath: String, pool: P = SharedPool(), _ handler: @escaping @Sendable (P.Context) throws -> ResponseContent
+) -> RouteNode { exactRoute(.head, subpath, pool: pool, handler) }
+public func HEAD<P: PoolScope>(
+    _ template: String, pool: P = SharedPool(),
+    _ handler: @escaping @Sendable (P.Context, PathParameters) throws -> ResponseContent
+) -> RouteNode { templateRoute(.head, template, pool: pool, handler) }
 
-public func OPTIONS<P: PoolScope>(_ subpath: String, pool: P = NoPool(), _ handler: @escaping @Sendable (P.Context) throws -> ResponseContent) -> RouteNode { exactRoute(.options, subpath, pool: pool, handler) }
-public func OPTIONS<P: PoolScope>(_ template: String, pool: P = NoPool(), _ handler: @escaping @Sendable (P.Context, PathParameters) throws -> ResponseContent) -> RouteNode { templateRoute(.options, template, pool: pool, handler) }
+public func OPTIONS<P: PoolScope>(
+    _ subpath: String, pool: P = NoPool(), _ handler: @escaping @Sendable (P.Context) throws -> ResponseContent
+) -> RouteNode { exactRoute(.options, subpath, pool: pool, handler) }
+public func OPTIONS<P: PoolScope>(
+    _ template: String, pool: P = NoPool(),
+    _ handler: @escaping @Sendable (P.Context, PathParameters) throws -> ResponseContent
+) -> RouteNode { templateRoute(.options, template, pool: pool, handler) }
 
 /// `GET` with an opaque typed-capture matcher — for irregular path grammars. Matched against the
 /// full request path, so the enclosing `Group` prefix does not apply.

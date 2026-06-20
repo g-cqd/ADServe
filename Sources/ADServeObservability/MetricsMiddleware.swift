@@ -9,7 +9,6 @@
 // .bootstrap`). With nothing bootstrapped, both middleware are no-ops.
 
 public import ADServeCore
-
 import Dispatch
 import HTTPTypes
 import Metrics
@@ -47,7 +46,7 @@ public struct MetricsMiddleware: HTTPMiddleware {
         let response = await next(request)
         let dimensions = [
             ("method", request.method.rawValue),
-            ("status", String(statusCode(of: response))),
+            ("status", String(statusCode(of: response)))
         ]
         // swift-metrics dedups handlers by label+dimensions inside the backend, so creating the
         // metric per request is the documented usage (not a per-request allocation of state).
