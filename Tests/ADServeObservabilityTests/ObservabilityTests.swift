@@ -25,10 +25,10 @@ private func makeContext() -> MiddlewareContext {
     MiddlewareContext(requestID: "rid-123", logger: Logger(label: "test"))
 }
 
-@Suite("Observability middleware", .serialized)
+@Suite(.serialized)
 struct ObservabilityTests {
-    @Test("MetricsMiddleware records a counter + timer dimensioned by method and status")
-    func metrics() async throws {
+    @Test
+    func `MetricsMiddleware records a counter + timer dimensioned by method and status`() async throws {
         _ = bootstrapOnce
         let response = await MetricsMiddleware()
             .intercept(
@@ -45,8 +45,8 @@ struct ObservabilityTests {
         #expect(timer.values.allSatisfy { $0 >= 0 })
     }
 
-    @Test("MetricsMiddleware returns the downstream response unchanged")
-    func metricsTransparent() async {
+    @Test
+    func `MetricsMiddleware returns the downstream response unchanged`() async {
         let response = await MetricsMiddleware()
             .intercept(
                 ServerRequest(method: .post, target: "/y", headers: HTTPFields()), makeContext()
@@ -54,8 +54,8 @@ struct ObservabilityTests {
         #expect(statusCode(of: response) == 201)
     }
 
-    @Test("TracingMiddleware opens a .server span and marks 5xx as errored")
-    func tracingError() async throws {
+    @Test
+    func `TracingMiddleware opens a .server span and marks 5xx as errored`() async throws {
         _ = bootstrapOnce
         testTracer.clearAll(includingActive: true)
         _ = await TracingMiddleware()
@@ -72,8 +72,8 @@ struct ObservabilityTests {
         #expect(span.attributes.count >= 3)  // method, path, status_code (+ request id when present)
     }
 
-    @Test("TracingMiddleware leaves a 2xx span unerrored")
-    func tracingOK() async throws {
+    @Test
+    func `TracingMiddleware leaves a 2xx span unerrored`() async throws {
         _ = bootstrapOnce
         testTracer.clearAll(includingActive: true)
         _ = await TracingMiddleware()
@@ -86,8 +86,8 @@ struct ObservabilityTests {
         if case .error = span.status?.code { Issue.record("a 2xx must not be errored") }
     }
 
-    @Test("HTTPFieldsExtractor reads propagation headers off the carrier")
-    func extractor() {
+    @Test
+    func `HTTPFieldsExtractor reads propagation headers off the carrier`() {
         var headers = HTTPFields()
         headers[HTTPField.Name("traceparent")!] = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
         let extractor = HTTPFieldsExtractor()
