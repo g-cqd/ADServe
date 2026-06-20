@@ -34,6 +34,12 @@ public struct URLEncodedForm: Sendable {
     /// `+` → space, then RFC 3986 percent-decode (`%2B` stays `+`). Malformed escapes fall back to the
     /// raw text rather than dropping the value.
     static func formDecode(_ token: Substring) -> String {
+        // Fast path: a token with neither `+` nor `%` is already its decoded form — skip the byte-array
+        // copy, the percent-decode pass, and the re-`String` (most form values are unencoded). One scan,
+        // no allocation, then a single `String(token)`.
+        if !token.utf8.contains(where: { $0 == UInt8(ascii: "+") || $0 == UInt8(ascii: "%") }) {
+            return String(token)
+        }
         var bytes = Array(token.utf8)
         for index in bytes.indices where bytes[index] == UInt8(ascii: "+") {
             bytes[index] = UInt8(ascii: " ")
