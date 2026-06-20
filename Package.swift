@@ -63,6 +63,15 @@ let admcpDependency: Package.Dependency = {
     }
     return .package(url: "https://github.com/g-cqd/ADMCP.git", branch: "main")
 }()
+// ADTESTKIT_PATH -> ADTestKit, the family's deterministic-testing toolkit (AsyncEventProbe, managed
+// TemporaryDirectory, seeded RNG, tags). TEST-ONLY: linked solely by the test targets, so a consumer of
+// the shipped libraries never resolves it.
+let adtestkitDependency: Package.Dependency = {
+    if let path = Context.environment["ADTESTKIT_PATH"], !path.isEmpty {
+        return .package(path: path)
+    }
+    return .package(url: "https://github.com/g-cqd/ADTestKit.git", branch: "main")
+}()
 
 var packageDependencies: [Package.Dependency] = [
     .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
@@ -82,7 +91,8 @@ var packageDependencies: [Package.Dependency] = [
     adjsonDependency,
     adconcurrencyDependency,
     adfoundationDependency,
-    admcpDependency
+    admcpDependency,
+    adtestkitDependency
 ]
 if isDev {
     if let path = Context.environment["ADBUILDTOOLS_PATH"], !path.isEmpty {
@@ -188,7 +198,19 @@ let package = Package(
                 .product(name: "HTTPTypes", package: "swift-http-types"),
                 // Loopback integration tests bind a real listener + drive a raw NIO client.
                 .product(name: "NIOCore", package: "swift-nio"),
-                .product(name: "NIOPosix", package: "swift-nio")
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "NIOEmbedded", package: "swift-nio"),
+                .product(name: "NIOExtras", package: "swift-nio-extras"),
+                // The TLS + HTTP/2 loopback client (`.stream`/`.sse`/`.file` over h2+TLS): NIOSSL for
+                // the insecure test client context, NIOHTTP2 + NIOHTTPTypesHTTP2 for the h2 stream
+                // multiplexer speaking the same swift-http-types parts the engine serves.
+                .product(name: "NIOSSL", package: "swift-nio-ssl"),
+                .product(name: "NIOHTTP2", package: "swift-nio-http2"),
+                .product(name: "NIOHTTPTypes", package: "swift-nio-extras"),
+                .product(name: "NIOHTTPTypesHTTP2", package: "swift-nio-extras"),
+                // Deterministic-testing toolkit: AsyncEventProbe (wait-or-throw, no polling), managed
+                // temp dirs — replacing ad-hoc `Flag`+poll loops in the timing-sensitive integration tests.
+                .product(name: "ADTestKit", package: "ADTestKit")
             ],
             swiftSettings: testSettings),
         .testTarget(

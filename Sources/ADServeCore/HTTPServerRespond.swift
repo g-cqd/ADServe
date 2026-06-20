@@ -92,6 +92,63 @@ struct ChannelSSEWriter: SSEWriter {
     }
 }
 
+/// A minimal FIFO async mutex serializing the SSE body's writes against the engine heartbeat's writes
+/// (only built when a heartbeat interval is set). Non-reentrant: `acquire` suspends until the holder
+/// `release`s, and the holder keeps the gate across its suspending `outbound.write` — so the two
+/// writer tasks never call the NIO async writer concurrently, while per-event back-pressure is
+/// preserved (a blocked write blocks the next acquirer too, which is the desired throttle). Contention
+/// is at most two waiters (body + heartbeat), so the waiter array stays tiny.
+actor SSEWriteGate {
+    private var held = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func acquire() async {
+        if !held {
+            held = true
+            return
+        }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func release() {
+        if waiters.isEmpty {
+            held = false
+        } else {
+            waiters.removeFirst().resume()
+        }
+    }
+}
+
+/// An `SSEWriter` that routes every frame through an `SSEWriteGate`, so the body and the engine
+/// heartbeat can both write to one channel without racing the NIO outbound writer. Releases the gate
+/// on both success and a thrown write (so a failed write never strands the gate held).
+struct GatedSSEWriter: SSEWriter {
+    let inner: ChannelSSEWriter
+    let gate: SSEWriteGate
+
+    func send(event: String?, data: String, id: String?, retry: Int?) async throws {
+        await gate.acquire()
+        do {
+            try await inner.send(event: event, data: data, id: id, retry: retry)
+        } catch {
+            await gate.release()
+            throw error
+        }
+        await gate.release()
+    }
+
+    func comment(_ text: String) async throws {
+        await gate.acquire()
+        do {
+            try await inner.comment(text)
+        } catch {
+            await gate.release()
+            throw error
+        }
+        await gate.release()
+    }
+}
+
 extension HTTPServer {
     func writeBodyTooLarge(_ exchange: RequestExchange) async throws {
         try await write(
@@ -110,7 +167,11 @@ extension HTTPServer {
             method: head.method, target: head.path ?? "/", headers: head.headerFields, body: body)
         let requestID = resolveRequestID(head.headerFields)
         let isHead = head.method == .head
-        let storage = RequestStorage()
+        // One storage instance per request, shared by the middleware context, the terminal, and the
+        // write path (`exchange.storage`). Seed the resolved-status box so an observing middleware can
+        // read the engine-recorded real status (notably a static file's off-loop-resolved status).
+        let storage = exchange.storage
+        storage[ResponseStatusKey.self] = ResponseStatusBox()
 
         // Reject directory traversal (`.`/`..` segments) before routing — a catch-all route would
         // otherwise hand `../../etc/passwd` to a handler.
@@ -184,6 +245,7 @@ extension HTTPServer {
                             .contentTooLarge("request body exceeds this route's \(routeBodyLimit)-byte limit"),
                             instance: requestID)
                     }
+                    let content: ResponseContent
                     if needsStorage {
                         guard let pool else { return .plain(.serviceUnavailable, "") }
                         let result = try? await threadPool.runIfActive {
@@ -194,12 +256,18 @@ extension HTTPServer {
                                         requestID: requestID, codec: codec, storage: storage))
                             } ?? .plain(.serviceUnavailable, "")
                         }
-                        return result ?? .plain(.serviceUnavailable, "")
+                        content = result ?? .plain(.serviceUnavailable, "")
+                    } else {
+                        content = mapErrors(
+                            HandlerInput(
+                                request: req, connection: nil, logger: logger, requestID: requestID,
+                                codec: codec, storage: storage))
                     }
-                    return mapErrors(
-                        HandlerInput(
-                            request: req, connection: nil, logger: logger, requestID: requestID,
-                            codec: codec, storage: storage))
+                    // Resolve a `.file` off-loop now (before the chain unwinds): record the real static
+                    // status for observing middleware and stash the plan for `writeFile` to reuse.
+                    await self.recordStaticStatus(
+                        content, request: req, storage: storage, threadPool: threadPool)
+                    return content
                 }
                 return ResolvedRoute(cache: route.cache, middleware: route.middleware, terminal: terminal)
             case .methodNotAllowed(let allowed):
@@ -251,7 +319,7 @@ extension HTTPServer {
         // Server-Sent Events: a long-lived text/event-stream. Admission-controlled (503 at capacity),
         // `no-store`, status 200, with the source cancelled the instant the peer disconnects or the
         // server quiesces (so the slot frees promptly — see `driveSSE`).
-        if case .sse(let extra, let body) = content {
+        if case .sse(let extra, let heartbeat, let body) = content {
             guard sseLimiter.tryAcquire() else {
                 try await write(
                     .plain(.serviceUnavailable, "SSE capacity reached\n"), cache: .noStore,
@@ -269,7 +337,7 @@ extension HTTPServer {
                 try await driveSSE(
                     body,
                     writer: ChannelSSEWriter(outbound: exchange.outbound, allocator: exchange.allocator),
-                    onClose: exchange.onClose)
+                    heartbeat: heartbeat, onClose: exchange.onClose)
             }
             try? await exchange.outbound.write(.end(nil))  // best-effort: the peer may already be gone
             return
@@ -328,13 +396,37 @@ extension HTTPServer {
     /// disconnect or server quiesce) or the serving task is cancelled — so the source stops and the
     /// slot frees without waiting for the next failed write. Normal completion or cancellation is a
     /// clean end; any other thrown error propagates (dropping the connection).
+    ///
+    /// With a `heartbeat` interval the engine also runs a child task emitting a `: ` keep-alive comment
+    /// every interval. Both the body and the heartbeat write through one `SSEWriteGate` (a FIFO async
+    /// mutex) so the two tasks never call the NIO outbound writer concurrently — and the gate is held
+    /// across each suspending write, so per-event back-pressure is preserved. Without a heartbeat the
+    /// body is the sole writer and writes directly (zero added overhead, the prior behavior verbatim).
     private func driveSSE(
         _ body: @escaping @Sendable (any SSEWriter) async throws -> Void, writer: ChannelSSEWriter,
-        onClose: EventLoopFuture<Void>
+        heartbeat: Duration?, onClose: EventLoopFuture<Void>
     ) async throws {
-        let bodyTask = Task { try await body(writer) }
+        let gate = heartbeat != nil ? SSEWriteGate() : nil
+        let bodyWriter: any SSEWriter = gate.map { GatedSSEWriter(inner: writer, gate: $0) } ?? writer
+        let bodyTask = Task { try await body(bodyWriter) }
         onClose.whenComplete { _ in bodyTask.cancel() }
+
+        let heartbeatTask: Task<Void, Never>?
+        if let heartbeat, let gate {
+            let pinger = GatedSSEWriter(inner: writer, gate: gate)
+            heartbeatTask = Task {
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: heartbeat)
+                    if Task.isCancelled { break }
+                    do { try await pinger.comment("") } catch { break }  // peer gone → stop pinging
+                }
+            }
+        } else {
+            heartbeatTask = nil
+        }
+
         try await withTaskCancellationHandler {
+            defer { heartbeatTask?.cancel() }
             do {
                 try await bodyTask.value
             } catch is CancellationError {
@@ -342,6 +434,7 @@ extension HTTPServer {
             }
         } onCancel: {
             bodyTask.cancel()
+            heartbeatTask?.cancel()
         }
     }
 

@@ -158,7 +158,7 @@ extension HTTPServer {
                             defer { active.leave() }
                             let exchange = RequestExchange(
                                 head: head, outbound: outbound, isHTTP2: isHTTP2, allocator: allocator,
-                                onClose: onClose, threadPool: threadPool)
+                                onClose: onClose, threadPool: threadPool, storage: RequestStorage())
                             let keepAlive: Bool
                             if overflow {
                                 try await writeBodyTooLarge(exchange)

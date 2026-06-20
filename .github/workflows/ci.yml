@@ -24,3 +24,23 @@ jobs:
     with:
       dev-env-var: ADSERVE_DEV
       requires-published-siblings: true
+
+  mime-codegen-drift:
+    # Drift guard: the MIME table is GENERATED (vendored jshttp/mime-db -> the committed
+    # `Sources/ADServeCore/Generated/MIMEDatabase.swift`) and the generator is deterministic, so
+    # re-running it must produce zero diff. Catches a hand-edit of the generated file or a stale table
+    # after a mime-db snapshot bump. `swift run` resolves the full package (the first-party siblings from
+    # branch: main), so this gates on the same AD_SWIFT_SIBLINGS_PUBLISHED signal as `quality`.
+    name: MIME table in sync
+    if: ${{ vars.AD_SWIFT_SIBLINGS_PUBLISHED == 'true' }}
+    runs-on: ubuntu-latest
+    # The canonical 6.4 nightly (matches the reusable workflow's container + `.swift-version`).
+    container: swiftlang/swift:nightly-6.4-jammy
+    steps:
+      - uses: actions/checkout@v4
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Regenerate the MIME table
+        run: swift run ADServeMimeCodegen
+      - name: Assert the committed table matches the generator output
+        run: git diff --exit-code -- Sources/ADServeCore/Generated/MIMEDatabase.swift

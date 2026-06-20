@@ -25,6 +25,32 @@ public final class RequestStorage: Sendable {
     }
 }
 
+// MARK: - Resolved-status reporting (the real status for logging/metrics)
+
+/// A request-scoped, lock-free holder for the response's REAL status code — the status an observer
+/// (`RequestLogging`, `MetricsMiddleware`) should report. It exists because a `.file` response's true
+/// status (200 / 206 / 304 / 404 / 416) is only known after the engine resolves the file OFF the event
+/// loop, by which point a middleware computing `statusCode(of:)` on the still-nominal `.file` content
+/// would record a misleading 200. The engine resolves the file in the route terminal (innermost, before
+/// the chain unwinds) and records the real status here, so an outer observing middleware reads the
+/// resolved value. `0` means "not recorded" → fall back to the content's nominal status.
+public final class ResponseStatusBox: Sendable {
+    private let value = Atomic<Int>(0)
+    public init() {}
+    /// The recorded real status, or `nil` if the engine recorded none (use the nominal status then).
+    public var code: Int? {
+        let raw = value.load(ordering: .relaxed)
+        return raw == 0 ? nil : raw
+    }
+    /// Record the resolved status (engine-internal: called once the real status is known).
+    public func record(_ code: Int) { value.store(code, ordering: .relaxed) }
+}
+
+/// The `RequestStorage` key under which the engine seeds a `ResponseStatusBox` for every request.
+public enum ResponseStatusKey: StorageKey {
+    public typealias Value = ResponseStatusBox
+}
+
 // MARK: - Response header decoration
 
 extension ResponseContent {
@@ -49,9 +75,9 @@ extension ResponseContent {
             case .stream(let contentType, let status, var headers, let body):
                 for field in extra { headers[field.name] = field.value }
                 return .stream(contentType: contentType, status: status, headers: headers, body: body)
-            case .sse(var headers, let body):
+            case .sse(var headers, let heartbeat, let body):
                 for field in extra { headers[field.name] = field.value }
-                return .sse(headers: headers, body: body)
+                return .sse(headers: headers, heartbeat: heartbeat, body: body)
             case .file(let root, let subpath, let contentType, var headers):
                 for field in extra { headers[field.name] = field.value }
                 return .file(root: root, subpath: subpath, contentType: contentType, headers: headers)

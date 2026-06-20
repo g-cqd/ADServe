@@ -40,14 +40,16 @@ private final class ResponseCollector: ChannelInboundHandler, @unchecked Sendabl
 /// port per call keeps tests isolated) and bounded waits, so it can never hang CI.
 enum Loopback {
     static func run(
-        path: String, routes: any HTTPHandling, headers: [(name: String, value: String)] = []
+        path: String, routes: any HTTPHandling, headers: [(name: String, value: String)] = [],
+        middleware: [any HTTPMiddleware] = []
     ) async throws -> String {
         // The harness ELG (probe + client). `shutdownGracefully` must be awaited (the strict test
         // settings forbid the blocking `syncShutdownGracefully` in an async context), so bracket the
         // work in do/catch rather than a `defer`.
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         do {
-            let response = try await serve(path: path, routes: routes, headers: headers, group: group)
+            let response = try await serve(
+                path: path, routes: routes, headers: headers, middleware: middleware, group: group)
             try? await group.shutdownGracefully()
             return response
         } catch {
@@ -58,7 +60,7 @@ enum Loopback {
 
     private static func serve(
         path: String, routes: any HTTPHandling, headers: [(name: String, value: String)],
-        group: MultiThreadedEventLoopGroup
+        middleware: [any HTTPMiddleware], group: MultiThreadedEventLoopGroup
     ) async throws -> String {
         // Discover a free loopback port (bind :0, read the assignment, release it).
         let probe = try await ServerBootstrap(group: group).bind(host: "127.0.0.1", port: 0).get()
@@ -69,7 +71,7 @@ enum Loopback {
         let server = HTTPServer(
             listeners: [ListenerConfig(host: "127.0.0.1", port: port, routes: routes)], pool: nil,
             envelope: HTTPFields(), logger: Logger(label: "loopback-test"), threadCount: 1, loopCount: 1,
-            readiness: readiness)
+            readiness: readiness, middleware: middleware)
         let serverTask = Task { try? await server.run() }
         defer { serverTask.cancel() }
 

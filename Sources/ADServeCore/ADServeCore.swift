@@ -231,8 +231,13 @@ public enum ResponseContent: Sendable {
     /// A long-lived Server-Sent Events stream (`text/event-stream`, `Cache-Control: no-store`, status
     /// 200). The engine frames events, caps concurrency (503 past the limit), heartbeat-friendly
     /// idle handling, and cancels `body` the instant the peer disconnects or the server quiesces — so
-    /// the slot frees promptly. `body` typically loops an app change-feed until cancelled.
-    case sse(headers: HTTPFields = [:], body: @Sendable (any SSEWriter) async throws -> Void)
+    /// the slot frees promptly. `body` typically loops an app change-feed until cancelled. When
+    /// `heartbeat` is non-nil the engine emits a `: ` keep-alive comment every interval (serialized
+    /// against the body's writes), so an idle stream stays alive without the app heartbeating itself;
+    /// the default (`nil`) keeps the app-driven heartbeat valid and adds zero overhead.
+    case sse(
+        headers: HTTPFields = [:], heartbeat: Duration? = nil,
+        body: @Sendable (any SSEWriter) async throws -> Void)
     /// A guarded static file served from `root` + `subpath`. The engine resolves it OFF the event loop
     /// (NIOFileSystem): 404 if missing / not a regular file / a symlink / outside the canonicalized root
     /// jail; otherwise a strong size+mtime `ETag` with `If-None-Match` → 304, and the body streamed in
@@ -473,7 +478,7 @@ public struct RequestLogging: HTTPMiddleware {
             level: isSlow ? .warning : level, "request",
             metadata: [
                 "method": "\(request.method.rawValue)", "path": "\(request.path)",
-                "status": "\(statusCode(of: response))",
+                "status": "\(resolvedStatusCode(of: response, storage: context.storage))",
                 "duration_ms": .stringConvertible(elapsedMillis), "request_id": "\(context.requestID)"
             ])
         return response
@@ -491,6 +496,16 @@ public func statusCode(of content: ResponseContent) -> Int {
         case .file: return 200
         case .notFound: return 404
     }
+}
+
+/// The status to REPORT for `content`: the engine-recorded real status when present (e.g. a `.file`'s
+/// resolved 200/206/304/404/416, known only after off-loop resolution), else the nominal
+/// `statusCode(of:)`. A response-observing middleware (`RequestLogging`, `MetricsMiddleware`) calls this
+/// with `context.storage` so its access log / metric carries the status actually written, not the
+/// pre-resolution placeholder. The engine seeds the `ResponseStatusBox` and records into it from the
+/// route terminal, before the middleware chain unwinds.
+public func resolvedStatusCode(of content: ResponseContent, storage: RequestStorage) -> Int {
+    storage[ResponseStatusKey.self]?.code ?? statusCode(of: content)
 }
 
 // MARK: - Routing contract (the engine ⇄ DSL seam)

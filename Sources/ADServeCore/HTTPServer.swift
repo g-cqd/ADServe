@@ -60,6 +60,9 @@ struct RequestExchange {
     let onClose: EventLoopFuture<Void>
     /// The offload pool — `.file` responses run their blocking jail/stat/read here, off the event loop.
     let threadPool: NIOThreadPool
+    /// The per-request storage shared with the middleware chain + terminal — the write path reads the
+    /// terminal-resolved `StaticPlan` (`ResolvedStaticPlanKey`) from it to avoid a second stat.
+    let storage: RequestStorage
 }
 
 /// A wait-free admission counter for concurrent SSE streams. `tryAcquire` reserves a slot via a CAS

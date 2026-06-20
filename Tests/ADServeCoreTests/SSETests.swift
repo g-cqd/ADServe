@@ -1,8 +1,8 @@
+import ADTestKit
 import HTTPTypes
 import Logging
 import NIOCore
 import NIOPosix
-import Synchronization
 import Testing
 
 @testable import ADServeCore
@@ -85,11 +85,13 @@ import Testing
     /// write. Drives an INFINITE SSE body, disconnects mid-stream, and asserts the body exits.
     @Test func clientDisconnectCancelsTheSseSource() async throws {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-        let gotBytes = Flag()
-        let bodyExited = Flag()
+        // Deterministic boundaries (ADTestKit): `wait(forAtLeast:)` throws on a missed signal instead of
+        // a silent poll-loop timeout, so a regression fails fast and points at the probe's creation site.
+        let firstByte = AsyncEventProbe<Void>()
+        let bodyExited = AsyncEventProbe<Void>()
         let routes = StubRoutes { _ in
             .sse { writer in
-                defer { bodyExited.set() }  // runs when the body unwinds (cancelled)
+                defer { bodyExited.record(()) }  // runs when the body unwinds (cancelled)
                 while true {
                     try await writer.comment("ping")
                     try await Task.sleep(for: .milliseconds(20))
@@ -107,21 +109,20 @@ import Testing
                 loopCount: 1, readiness: readiness)
             let serverTask = Task { try? await server.run() }
             defer { serverTask.cancel() }
-            try await waitUntil(readiness.isReady)
+            try await waitForReadiness(readiness)
 
             // Connect WITHOUT `Connection: close` so the stream stays open until WE disconnect.
             let client = try await ClientBootstrap(group: group)
-                .channelInitializer { channel in channel.pipeline.addHandler(FirstByteSignal(gotBytes)) }
+                .channelInitializer { channel in channel.pipeline.addHandler(FirstByteSignal(firstByte)) }
                 .connect(host: "127.0.0.1", port: port).get()
             var request = client.allocator.buffer(capacity: 64)
             request.writeString("GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
             try await client.writeAndFlush(request).get()
-            try await waitUntil(gotBytes.isSet)  // the SSE has started sending
-            #expect(!bodyExited.isSet)  // …and the body is still looping while connected
+            _ = try await firstByte.wait(forAtLeast: 1, timeout: .seconds(3))  // the SSE is sending
+            #expect(bodyExited.count == 0)  // …and the body is still looping while connected
 
             try await client.close().get()  // the client disconnects mid-stream
-            try await waitUntil(bodyExited.isSet)  // → source cancelled, body unwound
-            #expect(bodyExited.isSet)
+            _ = try await bodyExited.wait(forAtLeast: 1, timeout: .seconds(3))  // source cancelled, unwound
             serverTask.cancel()
             try? await group.shutdownGracefully()
         } catch {
@@ -131,34 +132,27 @@ import Testing
     }
 }
 
-/// A shareable boolean signal. The lock-free `Atomic` (like a `Mutex`) is `~Copyable`, so it cannot be
-/// passed by value into the route closure + the NIO handler — this reference wrapper can. `Sendable`
-/// via the inner `Atomic`.
-final class Flag: Sendable {
-    private let value = Atomic<Bool>(false)
-    var isSet: Bool { value.load(ordering: .acquiring) }
-    func set() { value.store(true, ordering: .releasing) }
-}
-
-/// Sets `flag` on the first inbound read — signals that the server's SSE stream has started.
-/// `@unchecked Sendable`: `flag` is `Sendable`; `fired` is touched only on the event loop.
+/// Records into `probe` on the first inbound read — signals that the server's SSE stream has started.
+/// `@unchecked Sendable`: `probe` is `Sendable`; `fired` is touched only on the event loop.
 private final class FirstByteSignal: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = ByteBuffer
-    private let flag: Flag
+    private let probe: AsyncEventProbe<Void>
     private var fired = false
-    init(_ flag: Flag) { self.flag = flag }
+    init(_ probe: AsyncEventProbe<Void>) { self.probe = probe }
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         if !fired {
             fired = true
-            flag.set()
+            probe.record(())
         }
     }
 }
 
-/// Polls `condition` (≤3s) so a missed signal fails the test instead of hanging CI.
-private func waitUntil(_ condition: @autoclosure () -> Bool) async throws {
+/// Awaits server readiness (a synchronous flag, not a probe), throwing after ~3s so a bind failure
+/// fails the test fast instead of hanging CI.
+private func waitForReadiness(_ readiness: ServerReadiness) async throws {
     var spins = 0
-    while !condition() && spins < 300 {
+    while !readiness.isReady {
+        if spins >= 300 { throw TLSHarnessError("server did not become ready within 3s") }
         try await Task.sleep(for: .milliseconds(10))
         spins += 1
     }

@@ -25,8 +25,9 @@ struct StaticFileRequest {
 }
 
 /// The off-loop resolution: which file to read, with what status/range/encoding, or a terminal status.
-/// `Sendable` so it can cross back from the offload-pool thread.
-private enum StaticPlan: Sendable {
+/// `Sendable` so it can cross back from the offload-pool thread — and so the route terminal can stash it
+/// on `RequestStorage` (`ResolvedStaticPlanKey`) for `writeFile` to reuse without a second stat.
+enum StaticPlan: Sendable {
     case notFound
     case notModified(etag: String)
     case rangeNotSatisfiable(totalSize: Int)
@@ -34,6 +35,24 @@ private enum StaticPlan: Sendable {
     case serve(
         absolutePath: String, partial: Bool, etag: String, contentEncoding: String?, totalSize: Int,
         range: ClosedRange<Int>?)
+
+    /// The HTTP status this plan resolves to — recorded into the `ResponseStatusBox` so observing
+    /// middleware (`RequestLogging`/metrics) log the real static status, not the nominal 200.
+    var statusCode: Int {
+        switch self {
+            case .notFound: return 404
+            case .notModified: return 304
+            case .rangeNotSatisfiable: return 416
+            case .serve(_, let partial, _, _, _, _): return partial ? 206 : 200
+        }
+    }
+}
+
+/// The `RequestStorage` key under which the route terminal stashes the resolved `StaticPlan`, so
+/// `writeFile` reuses it (single stat per static request) and the `ResponseStatusBox` carries the real
+/// status before the middleware chain unwinds.
+enum ResolvedStaticPlanKey: StorageKey {
+    typealias Value = StaticPlan
 }
 
 // Header names not provided as `HTTPField.Name` statics by swift-http-types.
@@ -44,6 +63,25 @@ private let contentEncodingName = HTTPField.Name("content-encoding")!
 private let varyName = HTTPField.Name("vary")!
 
 extension HTTPServer {
+    /// Resolve a `.file` response off the event loop into a `StaticPlan`, BEFORE the middleware chain
+    /// unwinds: stash it on `storage` (`ResolvedStaticPlanKey`) so `writeFile` reuses it (one stat per
+    /// request, not two) and record its real status in the `ResponseStatusBox` so observing middleware
+    /// (`RequestLogging`/metrics) log the true 200/206/304/404/416. A no-op for non-`.file` content.
+    func recordStaticStatus(
+        _ content: ResponseContent, request: ServerRequest, storage: RequestStorage,
+        threadPool: NIOThreadPool
+    ) async {
+        guard case .file(let root, let subpath, let contentType, let headers) = content else { return }
+        let file = StaticFileRequest(
+            root: root, subpath: subpath, contentType: contentType, headers: headers)
+        let plan =
+            (try? await threadPool.runIfActive {
+                Self.planStaticFile(file: file, headers: request.headers)
+            }) ?? .notFound
+        storage[ResolvedStaticPlanKey.self] = plan
+        storage[ResponseStatusKey.self]?.record(plan.statusCode)
+    }
+
     func writeFile(
         _ file: StaticFileRequest, cache: CachePolicy, requestID: String, exchange: RequestExchange
     ) async throws {
@@ -51,9 +89,17 @@ extension HTTPServer {
         let keepAlive = isKeepAlive(head)
         let suppressBody = head.method == .head
 
-        let plan =
-            (try? await exchange.threadPool.runIfActive { Self.planStaticFile(file: file, head: head) })
-            ?? .notFound
+        // Reuse the plan the route terminal already resolved (single stat); fall back to a fresh
+        // resolution for direct `write` callers that bypass the terminal (e.g. unit tests).
+        let plan: StaticPlan
+        if let cached = exchange.storage[ResolvedStaticPlanKey.self] {
+            plan = cached
+        } else {
+            plan =
+                (try? await exchange.threadPool.runIfActive {
+                    Self.planStaticFile(file: file, headers: head.headerFields)
+                }) ?? .notFound
+        }
 
         switch plan {
             case .notFound:
@@ -140,7 +186,7 @@ extension HTTPServer {
     /// negotiates a precompressed `.br`/`.gz` sibling (compressible types, no `Range`), derives a strong
     /// size+mtime ETag, and decides 200 / 206 / 304 / 416 / 404 — WITHOUT reading the body (that streams
     /// later). Any failure collapses to 404 (no information leak about why).
-    private static func planStaticFile(file: StaticFileRequest, head: HTTPRequest) -> StaticPlan {
+    static func planStaticFile(file: StaticFileRequest, headers: HTTPFields) -> StaticPlan {
         let fileManager = FileManager.default
         let rootReal = URL(fileURLWithPath: file.root).standardizedFileURL.resolvingSymlinksInPath().path
         let identityReal =
@@ -150,7 +196,7 @@ extension HTTPServer {
             let identityAttrs = regularFileAttributes(fileManager, identityReal)
         else { return .notFound }
 
-        let rangeHeader = head.headerFields[rangeName]
+        let rangeHeader = headers[rangeName]
 
         // Precompressed negotiation: only for compressible types and only without a Range (a range
         // request serves the identity bytes — ranges over the compressed stream are not offered).
@@ -160,7 +206,7 @@ extension HTTPServer {
         let ext = MediaType.fileExtension(of: file.subpath)
         let compressible = ext.flatMap { MIMEDatabase.entry(forExtension: $0)?.compressible } ?? false
         if compressible, rangeHeader == nil {
-            let accept = head.headerFields[.acceptEncoding] ?? ""
+            let accept = headers[.acceptEncoding] ?? ""
             for (token, suffix) in [("br", ".br"), ("gzip", ".gz")] where contentEncoding == nil {
                 if acceptsEncoding(accept, token),
                     let (path, attrs) = precompressedSibling(fileManager, identityReal, suffix, root: rootReal)
@@ -176,7 +222,7 @@ extension HTTPServer {
         let mtime = modificationTime(serveAttrs)
         let etag = contentEncoding.map { "\"\(size)-\(mtime)-\($0)\"" } ?? "\"\(size)-\(mtime)\""
 
-        if let ifNoneMatch = head.headerFields[.ifNoneMatch], matchesIfNoneMatch(ifNoneMatch, etag) {
+        if let ifNoneMatch = headers[.ifNoneMatch], matchesIfNoneMatch(ifNoneMatch, etag) {
             return .notModified(etag: etag)
         }
 
