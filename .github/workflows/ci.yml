@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    # Full-adopt of the reusable workflow (replaces the bespoke test-only CI, and adds the missing
+    # gate: format/discipline + SwiftLint metrics + config/manifest drift). ADServe depends on the
+    # first-party siblings ADJSON / ADConcurrency (resolved from branch: main), so the
+    # resolution-dependent jobs stay gated on AD_SWIFT_SIBLINGS_PUBLISHED — the same gate the bespoke
+    # workflow used. The Linux container moves from the stale swift:6.3 to the canonical 6.4 nightly.
+    uses: g-cqd/ADBuildTools/.github/workflows/swift-quality.yml@v1
+    with:
+      dev-env-var: ADSERVE_DEV
+      requires-published-siblings: true

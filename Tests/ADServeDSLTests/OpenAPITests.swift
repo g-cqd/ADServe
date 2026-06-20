@@ -1,0 +1,77 @@
+import ADJSON
+import ADServeCore
+import ADServeDSL
+import HTTPTypes
+import Testing
+
+@Schemable
+private struct ItemDTO: Codable {
+    let id: Int
+    let title: String
+    let price: Double
+}
+
+@Suite("OpenAPI generation")
+struct OpenAPITests {
+    private func spec() -> String {
+        let api = Server {
+            App(pool: .none) {
+                GET("items/{id}", pool: .none) { _, params in .plain(.ok, params.id ?? "") }
+                    .summary("Get an item").tags("items").responds(ItemDTO.self)
+                POST("items", pool: .none) { _ in .noContent }
+                    .summary("Create an item").operationId("createItem").tags("items")
+                    .body(ItemDTO.self).responds(ItemDTO.self, status: 201)
+                GET("health", pool: .none) { _ in .plain(.ok, "ok") }  // undocumented, still in the doc
+            }
+        }
+        return openAPIDocument(info: OpenAPIInfo(title: "Items API", version: "1.0.0"), from: api)
+    }
+
+    @Test("emits a well-formed JSON document (parses cleanly via ADJSON)")
+    func wellFormed() throws {
+        _ = try JSONValue(parsing: spec())  // throws on malformed JSON — the core correctness gate
+    }
+
+    @Test("carries version, info, and every route's path + verb")
+    func skeleton() {
+        let doc = spec()
+        #expect(doc.contains(#""openapi":"3.1.0""#))
+        #expect(doc.contains(#""title":"Items API""#))
+        #expect(doc.contains(#""version":"1.0.0""#))
+        #expect(doc.contains("/items/{id}"))
+        #expect(doc.contains("/items"))
+        #expect(doc.contains("/health"))  // undocumented route still contributes its path+verb
+        #expect(doc.contains(#""get":{"#))
+        #expect(doc.contains(#""post":{"#))
+    }
+
+    @Test("derives a path parameter from the {id} segment")
+    func pathParameter() {
+        let doc = spec()
+        #expect(doc.contains(#""parameters":["#))
+        #expect(doc.contains(#""name":"id""#))
+        #expect(doc.contains(#""in":"path""#))
+        #expect(doc.contains(#""required":true"#))
+    }
+
+    @Test("carries operation metadata: summary, tags, operationId")
+    func operationMetadata() {
+        let doc = spec()
+        #expect(doc.contains(#""summary":"Get an item""#))
+        #expect(doc.contains(#""summary":"Create an item""#))
+        #expect(doc.contains(#""operationId":"createItem""#))
+        #expect(doc.contains(#""tags":["items"]"#))
+    }
+
+    @Test("references @Schemable bodies and emits their schema into components")
+    func schemaComponents() {
+        let doc = spec()
+        #expect(doc.contains(#""requestBody":"#))
+        #expect(doc.contains(##""$ref":"#/components/schemas/ItemDTO""##))
+        #expect(doc.contains(#""components":{"schemas":{"ItemDTO":"#))
+        // The embedded @Schemable schema carries the DTO's properties.
+        #expect(doc.contains("price"))
+        #expect(doc.contains("title"))
+        #expect(doc.contains(#""201":"#))  // the documented 201 response
+    }
+}

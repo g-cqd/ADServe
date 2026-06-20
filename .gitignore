@@ -1,0 +1,35 @@
+# Swift Package Manager / Xcode
+.build/
+.swiftpm/
+*.xcodeproj
+*.xcworkspace
+Package.resolved
+DerivedData/
+.derivedData/
+xcuserdata/
+*.xcuserstate
+
+# DocC / Pages build output
+_site/
+_docs_check/
+*.doccarchive
+
+# Code coverage / profiling
+*.profraw
+*.profdata
+
+# Benchmark baselines (ordo-one/benchmark) are machine-specific scratch. Only a runner-generated
+# `main` baseline is ever committed — and it is force-added (`git add -f`) from CI — so the
+# directory is ignored wholesale to keep local-machine numbers out of the repo.
+/.benchmarkBaselines/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+._*
