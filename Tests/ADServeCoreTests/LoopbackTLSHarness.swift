@@ -169,6 +169,89 @@ enum LoopbackTLS {
         }
     }
 
+    /// One concurrent-stream result: which stream id, its status, and its body text.
+    struct H2StreamResult: Sendable {
+        let stream: Int
+        let status: Int
+        let body: String
+    }
+
+    /// Opens `count` HTTP/2 streams CONCURRENTLY on ONE connection (each carrying a distinct `x-stream`
+    /// header the route echoes back), returning every result. With `count` above the server's advertised
+    /// `SETTINGS_MAX_CONCURRENT_STREAMS` (NIO's default 100) the client throttles the excess — they queue
+    /// and complete as slots free — so this proves multiplexing concurrency, per-stream isolation (no
+    /// crossed wires), AND that the stream cap throttles gracefully rather than dropping work.
+    static func runH2Concurrent(count: Int, path: String = "/", routes: any HTTPHandling) async throws
+        -> [H2StreamResult]
+    {
+        let tls = try EphemeralTLS.source()
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        do {
+            let probe = try await ServerBootstrap(group: group).bind(host: "127.0.0.1", port: 0).get()
+            let port = probe.localAddress?.port ?? 0
+            try await probe.close().get()
+            let readiness = ServerReadiness()
+            let server = HTTPServer(
+                listeners: [
+                    ListenerConfig(
+                        host: "127.0.0.1", port: port, wire: .https(tls, alpn: [.http2, .http1]),
+                        routes: routes)
+                ], pool: nil, envelope: HTTPFields(), logger: Logger(label: "loopback-tls-mux"),
+                threadCount: 1, loopCount: 1, readiness: readiness)
+            let serverTask = Task { try? await server.run() }
+            defer { serverTask.cancel() }
+            var spins = 0
+            while !readiness.isReady && spins < 200 {
+                try await Task.sleep(for: .milliseconds(10))
+                spins += 1
+            }
+
+            let mux = try await connect(port: port, group: group)
+            let results = try await withThrowingTaskGroup(of: H2StreamResult.self) { taskGroup in
+                for index in 0 ..< count {
+                    taskGroup.addTask {
+                        let stream = try await mux.openStream { streamChannel in
+                            streamChannel.eventLoop.makeCompletedFuture {
+                                try streamChannel.pipeline.syncOperations.addHandler(
+                                    HTTP2FramePayloadToHTTPClientCodec())
+                                return try H2Stream(wrappingChannelSynchronously: streamChannel)
+                            }
+                        }
+                        var fields = HTTPFields()
+                        fields[HTTPField.Name("x-stream")!] = String(index)
+                        let request = HTTPRequest(
+                            method: .get, scheme: "https", authority: "127.0.0.1:\(port)", path: path,
+                            headerFields: fields)
+                        return try await stream.executeThenClose { inbound, outbound in
+                            try await outbound.write(.head(request))
+                            try await outbound.write(.end(nil))
+                            var status = 0
+                            var body: [UInt8] = []
+                            for try await part in inbound {
+                                switch part {
+                                    case .head(let response): status = response.status.code
+                                    case .body(let buffer): body.append(contentsOf: buffer.readableBytesView)
+                                    case .end: break
+                                }
+                            }
+                            return H2StreamResult(
+                                stream: index, status: status, body: String(decoding: body, as: UTF8.self))
+                        }
+                    }
+                }
+                var collected: [H2StreamResult] = []
+                for try await result in taskGroup { collected.append(result) }
+                return collected
+            }
+            serverTask.cancel()
+            try? await group.shutdownGracefully()
+            return results
+        } catch {
+            try? await group.shutdownGracefully()
+            throw error
+        }
+    }
+
     /// Connects over TLS (insecure verification — a test self-signed cert), negotiating `h2` by ALPN,
     /// and returns the HTTP/2 stream multiplexer once the pipeline is configured.
     private static func connect(port: Int, group: MultiThreadedEventLoopGroup) async throws -> H2Mux {
