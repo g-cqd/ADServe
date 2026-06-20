@@ -8,6 +8,7 @@ import NIOCore
 import NIOHTTP2
 import NIOHTTPTypes
 import NIOPosix
+import NIOSSL
 
 /// `Retry-After` — not provided as an `HTTPField.Name` static by swift-http-types.
 private let retryAfterName = HTTPField.Name("retry-after")!
@@ -90,8 +91,10 @@ extension HTTPServer {
                                         return
                                     }
                                     defer { connectionLimiter.release() }
+                                    let peerCert = await peerCertificateDER(connection.channel)
                                     await serveConnection(
-                                        connection, routes: routes, threadPool: threadPool, isHTTP2: false)
+                                        connection, routes: routes, threadPool: threadPool, isHTTP2: false,
+                                        peerCertificateDER: peerCert)
                                 case .http2(let (_, multiplexer)):
                                     // An h2 connection (not its streams) takes one slot. Past the limit we
                                     // decline to serve; the unread connection idle-times out and closes.
@@ -127,11 +130,24 @@ extension HTTPServer {
         }
     }
 
+    /// Reads the verified mTLS client certificate (DER) off a TLS h1 channel, or `nil` (plaintext / no
+    /// client cert). Called once per connection by the secure accept loop, so plaintext never pays for it.
+    /// The cert is extracted INSIDE the event-loop-bound `map` (the SSL handler is not `Sendable`, so it
+    /// never crosses the `await`); only the DER `[UInt8]` — which is `Sendable` — is returned out.
+    func peerCertificateDER(_ channel: any Channel) async -> [UInt8]? {
+        let future = channel.pipeline.handler(type: NIOSSLServerHandler.self)
+            .map { handler -> [UInt8]? in
+                guard let certificate = handler.peerCertificate else { return nil }
+                return try? certificate.toDERBytes()
+            }
+        return (try? await future.get()) ?? nil
+    }
+
     /// Serves successive requests on one connection (h1) or one stream (h2) until close /
     /// `Connection: close` (h1) or stream end (h2).
     func serveConnection(
         _ channel: EngineConnection, routes: any HTTPHandling, threadPool: NIOThreadPool,
-        isHTTP2: Bool
+        isHTTP2: Bool, peerCertificateDER: [UInt8]? = nil
     ) async {
         do {
             // The channel's pooled allocator — used for the response body buffer so NIO can
@@ -223,7 +239,7 @@ extension HTTPServer {
                             let exchange = RequestExchange(
                                 head: head, outbound: outbound, isHTTP2: isHTTP2, allocator: allocator,
                                 onClose: onClose, threadPool: threadPool, storage: RequestStorage(),
-                                remoteAddress: remoteAddress)
+                                remoteAddress: remoteAddress, peerCertificateDER: peerCertificateDER)
                             let keepAlive: Bool
                             if overflow {
                                 try await writeBodyTooLarge(exchange)

@@ -641,6 +641,45 @@ struct StaticAssetDSLTests {
         #expect(isNotFoundContent(runMatched(routes, .get, "/assets/.env")))  // dotfile
         #expect(isNotFoundContent(runMatched(routes, .get, "/assets/secret.exe")))  // not allow-listed
     }
+
+    @Test
+    func `Static appends the index file for an extension-less directory request`() {
+        let routes = table { Static("/site", root: "/tmp/x") }
+        #expect(staticSubpath(runMatched(routes, .get, "/site/docs")) == "docs/index.html")
+        #expect(staticSubpath(runMatched(routes, .get, "/site/a/b")) == "a/b/index.html")
+        #expect(staticSubpath(runMatched(routes, .get, "/site/app.css")) == "app.css")  // a real file, unchanged
+    }
+
+    @Test
+    func `Static index can be disabled`() {
+        let routes = table { Static("/site", root: "/tmp/x", index: nil) }
+        #expect(isNotFoundContent(runMatched(routes, .get, "/site/docs")))  // extension-less + no index → 404
+    }
+
+    @Test
+    func `File serves one specific file jailed in its own directory`() {
+        let routes = table { File("/favicon.ico", path: "Public/favicon.ico") }
+        guard case .file(let root, let subpath, let contentType, _)? = runMatched(routes, .get, "/favicon.ico")
+        else {
+            Issue.record("expected .file for the single-file route")
+            return
+        }
+        #expect(root == "Public")
+        #expect(subpath == "favicon.ico")
+        #expect(contentType.hasPrefix("image/"))
+    }
+
+    @Test
+    func `File at the site root serves its target`() {
+        let routes = table { File("/", path: "Public/index.html") }
+        guard case .file(let root, let subpath, let contentType, _)? = runMatched(routes, .get, "/") else {
+            Issue.record("expected .file at the root")
+            return
+        }
+        #expect(root == "Public")
+        #expect(subpath == "index.html")
+        #expect(contentType == "text/html; charset=utf-8")
+    }
 }
 
 private func isNotFoundContent(_ content: ResponseContent?) -> Bool {

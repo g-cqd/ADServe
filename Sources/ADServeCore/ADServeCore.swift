@@ -29,19 +29,43 @@ public enum ALPN: String, Sendable {
     case http3 = "h3"
 }
 
-/// TLS material: a PEM certificate chain + private key on disk (NIOSSL-native).
+/// Whether the server requires (and verifies) a client certificate — the mTLS toggle. `.none` is the
+/// default one-way TLS; `.required` makes NIOSSL reject the handshake unless the client presents a
+/// certificate that chains to `trustRoots` (mutual TLS).
+public enum ClientCertificateVerification: Sendable {
+    case none
+    case required
+}
+
+/// TLS material: a PEM certificate chain + private key on disk (NIOSSL-native), plus optional mutual-TLS
+/// settings (require + verify a client certificate against a trust root).
 public struct TLSSource: Sendable {
     public let certificatePath: String
     public let privateKeyPath: String
+    /// Client-certificate policy (mTLS). `.none` = one-way TLS.
+    public let clientVerification: ClientCertificateVerification
+    /// A PEM trust-root (CA) file the client certificate must chain to when `clientVerification` is
+    /// `.required`; `nil` falls back to the system trust store.
+    public let trustRootsPath: String?
 
-    public init(certificatePath: String, privateKeyPath: String) {
+    public init(
+        certificatePath: String, privateKeyPath: String,
+        clientVerification: ClientCertificateVerification = .none, trustRootsPath: String? = nil
+    ) {
         self.certificatePath = certificatePath
         self.privateKeyPath = privateKeyPath
+        self.clientVerification = clientVerification
+        self.trustRootsPath = trustRootsPath
     }
 
-    /// A PEM certificate-chain file + PEM private-key file.
-    public static func pem(certificate: String, privateKey: String) -> TLSSource {
-        TLSSource(certificatePath: certificate, privateKeyPath: privateKey)
+    /// A PEM certificate-chain file + PEM private-key file (one-way TLS unless `clientVerification` is set).
+    public static func pem(
+        certificate: String, privateKey: String,
+        clientVerification: ClientCertificateVerification = .none, trustRoots: String? = nil
+    ) -> TLSSource {
+        TLSSource(
+            certificatePath: certificate, privateKeyPath: privateKey,
+            clientVerification: clientVerification, trustRootsPath: trustRoots)
     }
 }
 
@@ -73,6 +97,10 @@ public struct Wire: Sendable {
 public struct ListenerConfig: Sendable {
     public let host: String
     public let port: Int
+    /// When non-nil, the listener binds a UNIX-domain socket at this path instead of `host:port` — for
+    /// a behind-proxy deploy where the proxy (Caddy/nginx) talks to the app over a local socket (no TCP
+    /// port, filesystem-permission access control). The existing socket file is replaced on bind.
+    public let unixDomainSocketPath: String?
     public let wire: Wire
     public let routes: any HTTPHandling
 
@@ -81,8 +109,23 @@ public struct ListenerConfig: Sendable {
     ) {
         self.host = host
         self.port = port
+        self.unixDomainSocketPath = nil
         self.wire = wire
         self.routes = routes
+    }
+
+    /// Bind a UNIX-domain socket at `path` (plaintext by default; pass a `wire` for TLS over the socket).
+    public init(unixDomainSocketPath path: String, wire: Wire = .http1, routes: any HTTPHandling) {
+        self.host = ""
+        self.port = 0
+        self.unixDomainSocketPath = path
+        self.wire = wire
+        self.routes = routes
+    }
+
+    /// A human label for logs: the socket path, or `host:port`.
+    public var addressDescription: String {
+        unixDomainSocketPath ?? "\(host):\(port)"
     }
 }
 

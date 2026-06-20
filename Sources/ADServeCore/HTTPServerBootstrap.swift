@@ -92,10 +92,19 @@ extension HTTPServer {
         }
     }
 
-    /// Binds one plaintext HTTP/1.1 listener on the configured transport.
+    /// Binds one plaintext HTTP/1.1 listener on the configured transport — or, when the listener carries a
+    /// `unixDomainSocketPath`, on that UNIX-domain socket (always via NIOPosix; Network.framework doesn't
+    /// do UDS). The existing socket file is replaced so a restart doesn't fail on a stale node.
     func bindPlain(
         _ listener: ListenerConfig, group: any EventLoopGroup, quiesce: ServerQuiescingHelper
     ) async throws -> NIOAsyncChannel<EngineConnection, Never> {
+        if let socketPath = listener.unixDomainSocketPath {
+            return try await baseBootstrap(group)
+                .serverChannelInitializer(quiesceInitializer(quiesce))
+                .bind(
+                    unixDomainSocketPath: socketPath, cleanupExistingSocketFile: true,
+                    childChannelInitializer: plainInitializer())
+        }
         #if canImport(Network)
             if transport == .network {
                 return try await NIOTSListenerBootstrap(group: group)
@@ -164,7 +173,10 @@ extension HTTPServer {
             }
     }
 
-    /// Builds a TLS 1.3 server context from PEM material, advertising the listener's ALPN ids.
+    /// Builds a TLS 1.3 server context from PEM material, advertising the listener's ALPN ids. When the
+    /// source requires mutual TLS, NIOSSL is told to demand + verify a client certificate against the
+    /// trust roots (`.noHostnameVerification` — a CLIENT cert has no server hostname to check, but its
+    /// chain must validate), so an unauthenticated client's handshake is rejected.
     func makeTLSContext(_ tls: TLSSource, alpn: [ALPN]) throws -> NIOSSLContext {
         let chain = try NIOSSLCertificate.fromPEMFile(tls.certificatePath)
         let key = try NIOSSLPrivateKey(file: tls.privateKeyPath, format: .pem)
@@ -172,6 +184,10 @@ extension HTTPServer {
             certificateChain: chain.map { .certificate($0) }, privateKey: .privateKey(key))
         config.minimumTLSVersion = .tlsv13
         config.applicationProtocols = alpn.map(\.rawValue)
+        if tls.clientVerification == .required {
+            config.certificateVerification = .noHostnameVerification
+            if let trustRootsPath = tls.trustRootsPath { config.trustRoots = .file(trustRootsPath) }
+        }
         return try NIOSSLContext(configuration: config)
     }
 

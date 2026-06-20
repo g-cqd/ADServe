@@ -140,15 +140,43 @@ public func Group(_ prefix: String, @RouteGroupBuilder _ children: () -> [RouteN
 /// allow-list (so source files, `.env`, etc. are never served), and stamps the `cache` policy
 /// (`.immutable` by default — pair it with content-hashed filenames). SRI hashing stays in
 /// ADHTML/`ADHTMLSRI`; ADServe just serves the bytes.
-public func Static(_ mountPath: String, root: String, cache: CachePolicy = .immutable) -> RouteNode {
+public func Static(
+    _ mountPath: String, root: String, index: String? = "index.html", cache: CachePolicy = .immutable
+) -> RouteNode {
     let template = mountPath.hasSuffix("/") ? mountPath + "{path*}" : mountPath + "/{path*}"
     return GET(template, pool: .none) { (_: RequestContext, params: PathParameters) -> ResponseContent in
-        guard let subpath = params.path, !subpath.isEmpty else { return .notFound }
+        guard var subpath = params.path, !subpath.isEmpty else { return .notFound }
         // Reject dotfiles (any segment starting with "."); PathTemplate already rejected `.`/`..` and
         // encoded separators, so the subpath cannot climb out of `root`.
         for segment in subpath.split(separator: "/") where segment.hasPrefix(".") { return .notFound }
+        // Directory index: an extension-less final segment is treated as a directory → serve its `index`
+        // (e.g. `/docs/guide` → `docs/guide/index.html`). The engine still 404s if the index is missing
+        // (no directory listing). A real extension-less asset would need an explicit `File(_:path:)` route.
+        if let index, MediaType.fileExtension(of: subpath) == nil {
+            subpath += "/" + index
+        }
         guard let contentType = staticContentType(forPath: subpath) else { return .notFound }
         return .file(root: root, subpath: subpath, contentType: contentType)
+    }
+    .cache(cache)
+}
+
+/// Serve ONE specific file at an exact route: `File("/favicon.ico", path: "Public/favicon.ico")` or
+/// `File("/", path: "Public/index.html")` for a site root. The file is jailed inside its own directory
+/// (the engine rejects `..`/symlink escape), and the content-type is derived from its extension unless
+/// `contentType` overrides. Pairs with `Static` for the catch-all + an explicit root index.
+public func File(
+    _ routePath: String, path filePath: String, contentType: String? = nil, cache: CachePolicy = .unset
+) -> RouteNode {
+    // Jail the file inside its OWN directory: root = the file's directory, subpath = its basename.
+    let lastSlash = filePath.lastIndex(of: "/")
+    let directory = lastSlash.map { String(filePath[..<$0]) } ?? "."
+    let name = lastSlash.map { String(filePath[filePath.index(after: $0)...]) } ?? filePath
+    let root = directory.isEmpty ? "/" : directory
+    let resolvedType =
+        contentType ?? MediaType(path: filePath)?.value ?? "application/octet-stream"
+    return GET(routePath, pool: .none) { (_: RequestContext) -> ResponseContent in
+        .file(root: root, subpath: name, contentType: resolvedType)
     }
     .cache(cache)
 }

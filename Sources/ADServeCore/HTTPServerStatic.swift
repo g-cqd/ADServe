@@ -29,12 +29,13 @@ struct StaticFileRequest {
 /// on `RequestStorage` (`ResolvedStaticPlanKey`) for `writeFile` to reuse without a second stat.
 enum StaticPlan: Sendable {
     case notFound
-    case notModified(etag: String)
+    case notModified(etag: String, lastModified: String)
     case rangeNotSatisfiable(totalSize: Int)
     /// Serve `absolutePath` (identity or a `.br`/`.gz` sibling). `range` non-nil ⇒ 206 partial content.
+    /// `lastModified` is the IMF-fixdate of the served file's mtime (emitted as `Last-Modified`).
     case serve(
-        absolutePath: String, partial: Bool, etag: String, contentEncoding: String?, totalSize: Int,
-        range: ClosedRange<Int>?)
+        absolutePath: String, partial: Bool, etag: String, lastModified: String, contentEncoding: String?,
+        totalSize: Int, range: ClosedRange<Int>?)
 
     /// The HTTP status this plan resolves to — recorded into the `ResponseStatusBox` so observing
     /// middleware (`RequestLogging`/metrics) log the real static status, not the nominal 200.
@@ -43,7 +44,7 @@ enum StaticPlan: Sendable {
             case .notFound: return 404
             case .notModified: return 304
             case .rangeNotSatisfiable: return 416
-            case .serve(_, let partial, _, _, _, _): return partial ? 206 : 200
+            case .serve(_, let partial, _, _, _, _, _): return partial ? 206 : 200
         }
     }
 }
@@ -107,10 +108,11 @@ extension HTTPServer {
                     .plain(.notFound, "not found\n"), cache: .noStore, requestID: requestID,
                     keepAlive: keepAlive, suppressBody: suppressBody, exchange: exchange)
 
-            case .notModified(let etag):
+            case .notModified(let etag, let lastModified):
                 var headers = staticHeaders(
                     cache: cache, requestID: requestID, keepAlive: keepAlive, exchange: exchange)
                 headers[.eTag] = etag
+                headers[.lastModified] = lastModified
                 mergeResponseHeaders(file.headers, into: &headers)
                 try await exchange.outbound.write(.head(HTTPResponse(status: .notModified, headerFields: headers)))
                 try await exchange.outbound.write(.end(nil))
@@ -124,7 +126,7 @@ extension HTTPServer {
                     .head(HTTPResponse(status: HTTPResponse.Status(code: 416), headerFields: headers)))
                 try await exchange.outbound.write(.end(nil))
 
-            case .serve(let path, let partial, let etag, let encoding, let totalSize, let range):
+            case .serve(let path, let partial, let etag, let lastModified, let encoding, let totalSize, let range):
                 let start = range?.lowerBound ?? 0
                 let length = range.map { $0.upperBound - $0.lowerBound + 1 } ?? totalSize
                 var headers = staticHeaders(
@@ -132,6 +134,7 @@ extension HTTPServer {
                 headers[.contentType] = file.contentType
                 headers[.contentLength] = String(length)
                 headers[.eTag] = etag
+                headers[.lastModified] = lastModified
                 if let encoding {
                     headers[contentEncodingName] = encoding
                     headers[varyName] = "Accept-Encoding"
@@ -221,17 +224,24 @@ extension HTTPServer {
         let size = fileSize(serveAttrs)
         let mtime = modificationTime(serveAttrs)
         let etag = contentEncoding.map { "\"\(size)-\(mtime)-\($0)\"" } ?? "\"\(size)-\(mtime)\""
+        let lastModified = HTTPDate.format(mtime)
 
-        if let ifNoneMatch = headers[.ifNoneMatch], matchesIfNoneMatch(ifNoneMatch, etag) {
-            return .notModified(etag: etag)
+        // Conditional GET: `If-None-Match` (the strong validator) takes precedence; only when it is absent
+        // do we consult `If-Modified-Since` (whole-second mtime comparison). Either hit → 304.
+        if let ifNoneMatch = headers[.ifNoneMatch] {
+            if matchesIfNoneMatch(ifNoneMatch, etag) {
+                return .notModified(etag: etag, lastModified: lastModified)
+            }
+        } else if let ifModifiedSince = headers[.ifModifiedSince].flatMap(HTTPDate.parse), mtime <= ifModifiedSince {
+            return .notModified(etag: etag, lastModified: lastModified)
         }
 
         if let rangeHeader {
             switch parseByteRange(rangeHeader, totalSize: size) {
                 case .satisfiable(let range):
                     return .serve(
-                        absolutePath: servePath, partial: true, etag: etag, contentEncoding: nil,
-                        totalSize: size, range: range)
+                        absolutePath: servePath, partial: true, etag: etag, lastModified: lastModified,
+                        contentEncoding: nil, totalSize: size, range: range)
                 case .unsatisfiable:
                     return .rangeNotSatisfiable(totalSize: size)
                 case .ignore:
@@ -240,8 +250,8 @@ extension HTTPServer {
         }
 
         return .serve(
-            absolutePath: servePath, partial: false, etag: etag, contentEncoding: contentEncoding,
-            totalSize: size, range: nil)
+            absolutePath: servePath, partial: false, etag: etag, lastModified: lastModified,
+            contentEncoding: contentEncoding, totalSize: size, range: nil)
     }
 
     // MARK: - Blocking helpers (offload pool)

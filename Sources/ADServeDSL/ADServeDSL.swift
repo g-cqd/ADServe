@@ -44,6 +44,10 @@ extension HandlerContext {
     /// The connection's peer IP (the engine-seeded remote address); `nil` for a UDS/unknown peer. Behind
     /// a proxy this is the proxy — read `X-Forwarded-For` for the true client there.
     public var remoteAddress: String? { storage[RemoteAddressKey.self] }
+    /// The verified mTLS client certificate (DER bytes), present only on a mutual-TLS HTTP/1 connection
+    /// (`nil` otherwise). Its presence already implies NIOSSL verified the chain; parse it with your X.509
+    /// library for the subject/claims.
+    public var peerCertificateDER: [UInt8]? { storage[PeerCertificateKey.self] }
     /// The raw request body bytes.
     public var body: [UInt8] { request.body }
     /// Decode the request body into `T` via the configured codec (default: JSON over ADJSON). Throws

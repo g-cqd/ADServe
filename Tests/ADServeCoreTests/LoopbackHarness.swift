@@ -33,7 +33,7 @@ struct InputStubRoutes: HTTPHandling {
 /// socket (the harness sends `Connection: close`, so the server closes after `.end` → the client sees
 /// EOF). `@unchecked Sendable`: `accumulated` is touched ONLY from the channel's event loop
 /// (`channelRead`/`channelInactive`), the standard NIO handler confinement invariant.
-private final class ResponseCollector: ChannelInboundHandler, @unchecked Sendable {
+final class ResponseCollector: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = ByteBuffer
     private let promise: EventLoopPromise<[UInt8]>
     private var accumulated: [UInt8] = []

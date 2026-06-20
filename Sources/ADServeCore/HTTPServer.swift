@@ -66,6 +66,9 @@ struct RequestExchange {
     /// The connection's peer IP (`channel.remoteAddress?.ipAddress`), seeded into `storage` for IP-aware
     /// middleware. `nil` for a UDS/unknown peer.
     let remoteAddress: String?
+    /// The mTLS client certificate (DER), captured once per h1 connection; `nil` unless mutual TLS was
+    /// used. Seeded into `storage` (`PeerCertificateKey`).
+    let peerCertificateDER: [UInt8]?
 }
 
 /// A wait-free admission counter for concurrent CONNECTIONS (the max-connection accept gate). Identical
@@ -217,7 +220,7 @@ public struct HTTPServer: Sendable {
             logger.info(
                 "ad-server listening",
                 metadata: [
-                    "host": "\(listener.host)", "port": "\(listener.port)",
+                    "address": "\(listener.addressDescription)",
                     "tls": "\(listener.wire.tls != nil)", "alpn": "\(listener.wire.alpn.map(\.rawValue))",
                     "threads": "\(threadCount)", "loops": "\(loopCount)"
                 ])

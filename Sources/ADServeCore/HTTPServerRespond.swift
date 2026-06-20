@@ -173,6 +173,9 @@ extension HTTPServer {
         let storage = exchange.storage
         storage[ResponseStatusKey.self] = ResponseStatusBox()
         if let remoteAddress = exchange.remoteAddress { storage[RemoteAddressKey.self] = remoteAddress }
+        if let peerCertificateDER = exchange.peerCertificateDER {
+            storage[PeerCertificateKey.self] = peerCertificateDER
+        }
 
         // Reject directory traversal (`.`/`..` segments) before routing — a catch-all route would
         // otherwise hand `../../etc/passwd` to a handler.

@@ -59,6 +59,14 @@ public enum RemoteAddressKey: StorageKey {
     public typealias Value = String
 }
 
+/// The `RequestStorage` key carrying the mTLS client certificate as DER bytes — seeded by the engine on
+/// an HTTP/1 connection that presented one (mutual TLS). Absent on plaintext, one-way TLS, or HTTP/2
+/// streams. Read via `ctx.peerCertificateDER`; parse it with swift-certificates / your X.509 lib of
+/// choice. Its mere presence means NIOSSL already verified the chain against the configured trust roots.
+public enum PeerCertificateKey: StorageKey {
+    public typealias Value = [UInt8]
+}
+
 // MARK: - Response header decoration
 
 extension ResponseContent {
