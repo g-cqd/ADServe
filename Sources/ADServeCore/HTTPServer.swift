@@ -184,16 +184,23 @@ public struct HTTPServer: Sendable {
     let active = ActiveRequests()
     /// Admission control for concurrent SSE streams (a `.sse` response past the limit gets a 503).
     let sseLimiter: SSELimiter
-    /// Admission control for concurrent connections (`maxConnections`; 0 = unlimited). Past the limit a
-    /// new h1 connection gets a 503 + close, an h2 connection is declined.
+    /// Admission control for concurrent connections (`maxConnections`). Past the limit a new h1 connection
+    /// gets a 503 + close, an h2 connection is declined. `0` opts INTO unlimited (use only behind a proxy
+    /// that caps connections); the default is finite so a fresh server can't be driven to FD/memory
+    /// exhaustion out of the box.
     let connectionLimiter: ConnectionLimiter
+
+    /// The default concurrent-connection cap when `maxConnections` is unspecified — finite by design
+    /// (a bounded server resists connection-flood DoS / FD exhaustion). Tune it to your deployment's
+    /// `RLIMIT_NOFILE`; pass `maxConnections: 0` to disable the cap entirely.
+    public static let defaultMaxConnections = 8192
 
     public init(
         listeners: [ListenerConfig], pool: AnyConnectionPool?, envelope: HTTPFields, logger: Logger,
         threadCount: Int, loopCount: Int = 2, readiness: ServerReadiness? = nil,
         transport: EngineTransport = .nio, middleware: [any HTTPMiddleware] = [],
         codec: ContentCodec = .json, maxBodyBytes: Int = 1_000_000, maxConcurrentSSE: Int = 1024,
-        maxConnections: Int = 0, responseCompression: Bool = true,
+        maxConnections: Int = HTTPServer.defaultMaxConnections, responseCompression: Bool = true,
         keepAlive: KeepAlivePolicy = .keepAlive
     ) {
         self.listeners = listeners
