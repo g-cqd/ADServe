@@ -25,6 +25,9 @@ extension HandlerContext {
     /// Typed access to the percent-decoded query parameters (`?k=v&…`): `ctx.query.page`,
     /// `ctx.query["page"]`, `ctx.query.int("page")`, `try ctx.query.require("page")`.
     public var query: QueryParameters { QueryParameters(request.query) }
+    /// The cookies parsed from the request's `Cookie:` header: `ctx.cookies["session"]`. Set a response
+    /// cookie with `ResponseContent.settingCookie(_:)`.
+    public var cookies: RequestCookies { RequestCookies(request.headers[.cookie]) }
     /// The raw request body bytes.
     public var body: [UInt8] { request.body }
     /// Decode the request body into `T` via the configured codec (default: JSON over ADJSON). Throws

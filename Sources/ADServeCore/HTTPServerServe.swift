@@ -9,7 +9,42 @@ import NIOHTTP2
 import NIOHTTPTypes
 import NIOPosix
 
+/// `Retry-After` — not provided as an `HTTPField.Name` static by swift-http-types.
+private let retryAfterName = HTTPField.Name("retry-after")!
+
 extension HTTPServer {
+    /// Answers a connection rejected by the max-connection gate: a minimal `503 Service Unavailable` +
+    /// `Connection: close` + `Retry-After`, then closes (h1). Best-effort — a peer that has already gone
+    /// just gets a dropped connection.
+    func rejectOverConnectionLimit(_ connection: EngineConnection) async {
+        let body = Array("server at connection capacity\n".utf8)
+        let allocator = connection.channel.allocator
+        do {
+            try await connection.executeThenClose { inbound, outbound in
+                // Read the first request to its `.end` BEFORE responding: the NIO HTTP/1 pipeline handler
+                // pairs a response with a received request and traps on a response written in the idle
+                // state. We answer one request, then close (Connection: close) — never draining the whole
+                // keep-alive stream.
+                for try await part in inbound {
+                    if case .end = part { break }
+                }
+                var headers = HTTPFields()
+                headers[.contentType] = "text/plain; charset=utf-8"
+                headers[.contentLength] = String(body.count)
+                headers[.connection] = "close"
+                headers[retryAfterName] = "1"
+                try await outbound.write(
+                    .head(HTTPResponse(status: .serviceUnavailable, headerFields: headers)))
+                var buffer = allocator.buffer(capacity: body.count)
+                buffer.writeBytes(body)
+                try await outbound.write(.body(buffer))
+                try await outbound.write(.end(nil))
+            }
+        } catch {
+            // The peer may already be gone — the connection just drops.
+        }
+    }
+
     /// The accept loop for a plaintext listener: each connection becomes a child task.
     func servePlainListener(
         _ serverChannel: NIOAsyncChannel<EngineConnection, Never>, routes: any HTTPHandling,
@@ -20,6 +55,11 @@ extension HTTPServer {
                 try await serverChannel.executeThenClose { inbound in
                     for try await connection in inbound {
                         taskGroup.addTask {
+                            guard connectionLimiter.tryAcquire() else {
+                                await rejectOverConnectionLimit(connection)
+                                return
+                            }
+                            defer { connectionLimiter.release() }
                             await serveConnection(
                                 connection, routes: routes, threadPool: threadPool, isHTTP2: false)
                         }
@@ -45,9 +85,18 @@ extension HTTPServer {
                             guard let negotiated = try? await negotiation.get() else { return }
                             switch negotiated {
                                 case .http1_1(let connection):
+                                    guard connectionLimiter.tryAcquire() else {
+                                        await rejectOverConnectionLimit(connection)
+                                        return
+                                    }
+                                    defer { connectionLimiter.release() }
                                     await serveConnection(
                                         connection, routes: routes, threadPool: threadPool, isHTTP2: false)
                                 case .http2(let (_, multiplexer)):
+                                    // An h2 connection (not its streams) takes one slot. Past the limit we
+                                    // decline to serve; the unread connection idle-times out and closes.
+                                    guard connectionLimiter.tryAcquire() else { return }
+                                    defer { connectionLimiter.release() }
                                     await serveMultiplexer(multiplexer, routes: routes, threadPool: threadPool)
                             }
                         }
@@ -142,6 +191,17 @@ extension HTTPServer {
                             // route's own (operator-chosen) ceiling. Skipped once `overflow` is set above.
                             if !overflow, let declaredLength, declaredLength > 0 {
                                 body.reserveCapacity(min(declaredLength, effectiveLimit))
+                            }
+                            // `Expect: 100-continue`: the client announced it is WAITING for our go-ahead
+                            // before sending the body. Send the `100 Continue` interim now (head only, no
+                            // end) so it proceeds — UNLESS we already know the declared body is oversized
+                            // or malformed (`overflow`), in which case the `.end` 413-and-close path answers
+                            // and we never invite a body we would only reject (RFC 9110 §10.1.1).
+                            if !overflow,
+                                let expect = head.headerFields[.expect],
+                                expect.lowercased().contains("100-continue")
+                            {
+                                try await outbound.write(.head(HTTPResponse(status: .continue)))
                             }
                         case .body(let buffer):
                             if !overflow {

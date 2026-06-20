@@ -65,6 +65,35 @@ struct RequestExchange {
     let storage: RequestStorage
 }
 
+/// A wait-free admission counter for concurrent CONNECTIONS (the max-connection accept gate). Identical
+/// CAS-loop mechanics to `SSELimiter`, but `limit == 0` means UNLIMITED (the default — no cap) rather
+/// than "refuse everything". `tryAcquire` brackets each accepted connection (h1 socket / h2 connection,
+/// NOT individual h2 streams); past the limit the engine answers 503 + close (h1) or declines to serve
+/// (h2). Boxed in a class so the (copied) engine value shares one counter.
+final class ConnectionLimiter: Sendable {
+    private let inUse = Atomic<Int>(0)
+    let limit: Int
+    init(limit: Int) { self.limit = max(0, limit) }
+
+    /// Reserve a connection slot, or `false` at capacity. Always succeeds when `limit == 0` (unlimited).
+    func tryAcquire() -> Bool {
+        if limit == 0 { return true }
+        var current = inUse.load(ordering: .relaxed)
+        while current < limit {
+            let (exchanged, original) = inUse.compareExchange(
+                expected: current, desired: current + 1, ordering: .relaxed)
+            if exchanged { return true }
+            current = original
+        }
+        return false
+    }
+
+    func release() {
+        if limit == 0 { return }
+        inUse.wrappingSubtract(1, ordering: .relaxed)
+    }
+}
+
 /// A wait-free admission counter for concurrent SSE streams. `tryAcquire` reserves a slot via a CAS
 /// loop (never overshoots `limit`); the `.sse` write path returns a 503 when it fails, and `release`
 /// frees the slot when the stream ends. Boxed in a class so the engine value shares one counter.
@@ -119,12 +148,16 @@ public struct HTTPServer: Sendable {
     let active = ActiveRequests()
     /// Admission control for concurrent SSE streams (a `.sse` response past the limit gets a 503).
     let sseLimiter: SSELimiter
+    /// Admission control for concurrent connections (`maxConnections`; 0 = unlimited). Past the limit a
+    /// new h1 connection gets a 503 + close, an h2 connection is declined.
+    let connectionLimiter: ConnectionLimiter
 
     public init(
         listeners: [ListenerConfig], pool: AnyConnectionPool?, envelope: HTTPFields, logger: Logger,
         threadCount: Int, loopCount: Int = 2, readiness: ServerReadiness? = nil,
         transport: EngineTransport = .nio, middleware: [any HTTPMiddleware] = [],
-        codec: ContentCodec = .json, maxBodyBytes: Int = 1_000_000, maxConcurrentSSE: Int = 1024
+        codec: ContentCodec = .json, maxBodyBytes: Int = 1_000_000, maxConcurrentSSE: Int = 1024,
+        maxConnections: Int = 0
     ) {
         self.listeners = listeners
         self.pool = pool
@@ -138,6 +171,7 @@ public struct HTTPServer: Sendable {
         self.codec = codec
         self.maxBodyBytes = max(0, maxBodyBytes)
         self.sseLimiter = SSELimiter(limit: maxConcurrentSSE)
+        self.connectionLimiter = ConnectionLimiter(limit: maxConnections)
     }
 
     public func run() async throws {

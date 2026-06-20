@@ -306,7 +306,7 @@ extension HTTPServer {
             var headers = commonHeaders(
                 cache: cache, requestID: requestID, keepAlive: keepAlive, isHTTP2: exchange.isHTTP2)
             headers[.contentType] = contentType
-            for field in extra { headers[field.name] = field.value }
+            mergeResponseHeaders(extra, into: &headers)
             try await exchange.outbound.write(.head(HTTPResponse(status: status, headerFields: headers)))
             if !suppressBody {
                 try await body(
@@ -331,7 +331,7 @@ extension HTTPServer {
             var headers = commonHeaders(
                 cache: .noStore, requestID: requestID, keepAlive: keepAlive, isHTTP2: exchange.isHTTP2)
             headers[.contentType] = "text/event-stream"
-            for field in extra { headers[field.name] = field.value }
+            mergeResponseHeaders(extra, into: &headers)
             try await exchange.outbound.write(.head(HTTPResponse(status: .ok, headerFields: headers)))
             if !suppressBody {
                 try await driveSSE(
@@ -373,8 +373,8 @@ extension HTTPServer {
             headers[.contentType] = materialized.contentType
             headers[.contentLength] = String(materialized.body.count)
         }
-        // Route-supplied headers override the envelope (CORS / the MCP `/mcp` set).
-        for field in materialized.headers { headers[field.name] = field.value }
+        // Route-supplied headers override the envelope (CORS / the MCP `/mcp` set); `set-cookie` appends.
+        mergeResponseHeaders(materialized.headers, into: &headers)
 
         try await exchange.outbound.write(
             .head(HTTPResponse(status: materialized.status, headerFields: headers)))

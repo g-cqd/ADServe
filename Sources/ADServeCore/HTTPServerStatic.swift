@@ -111,7 +111,7 @@ extension HTTPServer {
                 var headers = staticHeaders(
                     cache: cache, requestID: requestID, keepAlive: keepAlive, exchange: exchange)
                 headers[.eTag] = etag
-                for field in file.headers { headers[field.name] = field.value }
+                mergeResponseHeaders(file.headers, into: &headers)
                 try await exchange.outbound.write(.head(HTTPResponse(status: .notModified, headerFields: headers)))
                 try await exchange.outbound.write(.end(nil))
 
@@ -119,7 +119,7 @@ extension HTTPServer {
                 var headers = staticHeaders(
                     cache: cache, requestID: requestID, keepAlive: keepAlive, exchange: exchange)
                 headers[contentRangeName] = "bytes */\(totalSize)"
-                for field in file.headers { headers[field.name] = field.value }
+                mergeResponseHeaders(file.headers, into: &headers)
                 try await exchange.outbound.write(
                     .head(HTTPResponse(status: HTTPResponse.Status(code: 416), headerFields: headers)))
                 try await exchange.outbound.write(.end(nil))
@@ -139,7 +139,7 @@ extension HTTPServer {
                 if let range {
                     headers[contentRangeName] = "bytes \(range.lowerBound)-\(range.upperBound)/\(totalSize)"
                 }
-                for field in file.headers { headers[field.name] = field.value }
+                mergeResponseHeaders(file.headers, into: &headers)
                 let status = partial ? HTTPResponse.Status(code: 206) : .ok
                 try await exchange.outbound.write(.head(HTTPResponse(status: status, headerFields: headers)))
                 if !suppressBody && length > 0 {

@@ -70,16 +70,16 @@ extension ResponseContent {
                     body: Array("Not Found".utf8), contentType: "text/plain; charset=utf-8",
                     status: .notFound, headers: extra)
             case .full(let body, let contentType, let status, var headers):
-                for field in extra { headers[field.name] = field.value }
+                mergeResponseHeaders(extra, into: &headers)
                 return .full(body: body, contentType: contentType, status: status, headers: headers)
             case .stream(let contentType, let status, var headers, let body):
-                for field in extra { headers[field.name] = field.value }
+                mergeResponseHeaders(extra, into: &headers)
                 return .stream(contentType: contentType, status: status, headers: headers, body: body)
             case .sse(var headers, let heartbeat, let body):
-                for field in extra { headers[field.name] = field.value }
+                mergeResponseHeaders(extra, into: &headers)
                 return .sse(headers: headers, heartbeat: heartbeat, body: body)
             case .file(let root, let subpath, let contentType, var headers):
-                for field in extra { headers[field.name] = field.value }
+                mergeResponseHeaders(extra, into: &headers)
                 return .file(root: root, subpath: subpath, contentType: contentType, headers: headers)
         }
     }
@@ -140,21 +140,54 @@ public struct CORS: HTTPMiddleware {
 
 /// Adds a baseline security-header set to every response (a composable, per-scope alternative to the
 /// engine's constant `envelope`). Defaults are conservative; pass your own `HTTPFields` to override.
+/// HSTS is OPT-IN (`hsts:`) — `Strict-Transport-Security` is a long-lived browser commitment that
+/// forces HTTPS for the whole host (and, with `includeSubDomains`, every subdomain) for `maxAgeSeconds`,
+/// so it must be a deliberate choice, never a silent default.
 public struct SecurityHeaders: HTTPMiddleware {
     public var headers: HTTPFields
 
-    public init(_ headers: HTTPFields? = nil) {
+    /// An opt-in HSTS (`Strict-Transport-Security`) policy. Only serve it over TLS — a browser caches
+    /// the directive and will refuse plaintext to the host until it expires; `preload` additionally
+    /// petitions for the browser preload list, which is effectively irreversible, so leave it off unless
+    /// you have committed to permanent HTTPS for the apex + all subdomains.
+    public struct HSTS: Sendable {
+        public var maxAgeSeconds: Int
+        public var includeSubdomains: Bool
+        public var preload: Bool
+        public init(
+            maxAgeSeconds: Int = 31_536_000, includeSubdomains: Bool = true, preload: Bool = false
+        ) {
+            self.maxAgeSeconds = maxAgeSeconds
+            self.includeSubdomains = includeSubdomains
+            self.preload = preload
+        }
+        /// The `Strict-Transport-Security` header value.
+        public var headerValue: String {
+            var out = "max-age=\(maxAgeSeconds)"
+            if includeSubdomains { out += "; includeSubDomains" }
+            if preload { out += "; preload" }
+            return out
+        }
+    }
+
+    public init(_ headers: HTTPFields? = nil, hsts: HSTS? = nil) {
         if let headers {
             self.headers = headers
-            return
+        } else {
+            var defaults = HTTPFields()
+            defaults[name("x-content-type-options")] = "nosniff"
+            defaults[name("x-frame-options")] = "DENY"
+            defaults[name("referrer-policy")] = "strict-origin-when-cross-origin"
+            defaults[name("cross-origin-opener-policy")] = "same-origin"
+            defaults[name("cross-origin-resource-policy")] = "same-origin"
+            // Deny the powerful features a typical API/site never needs, so an injected script can't
+            // reach them. Override by passing your own `HTTPFields` if a feature IS needed.
+            defaults[name("permissions-policy")] =
+                "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), "
+                + "microphone=(), payment=(), usb=()"
+            self.headers = defaults
         }
-        var defaults = HTTPFields()
-        defaults[name("x-content-type-options")] = "nosniff"
-        defaults[name("x-frame-options")] = "DENY"
-        defaults[name("referrer-policy")] = "strict-origin-when-cross-origin"
-        defaults[name("cross-origin-opener-policy")] = "same-origin"
-        defaults[name("cross-origin-resource-policy")] = "same-origin"
-        self.headers = defaults
+        if let hsts { self.headers[name("strict-transport-security")] = hsts.headerValue }
     }
 
     public func intercept(

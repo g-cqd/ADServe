@@ -43,13 +43,25 @@ enum Loopback {
         path: String, routes: any HTTPHandling, headers: [(name: String, value: String)] = [],
         middleware: [any HTTPMiddleware] = []
     ) async throws -> String {
+        // `Connection: close` makes the server close after `.end`, ending the client's read at EOF.
+        var request = "GET \(path) HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n"
+        for header in headers { request += "\(header.name): \(header.value)\r\n" }
+        return try await runRaw(request + "\r\n", routes: routes, middleware: middleware)
+    }
+
+    /// Send a fully-formed raw HTTP/1.1 request (caller supplies request line + headers + body) and read
+    /// the whole response to EOF — for exercising the wire directly (e.g. `Expect: 100-continue`, where
+    /// the engine writes a `100` interim before the final response). Include `Connection: close`.
+    static func runRaw(
+        _ rawRequest: String, routes: any HTTPHandling, middleware: [any HTTPMiddleware] = []
+    ) async throws -> String {
         // The harness ELG (probe + client). `shutdownGracefully` must be awaited (the strict test
         // settings forbid the blocking `syncShutdownGracefully` in an async context), so bracket the
         // work in do/catch rather than a `defer`.
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         do {
             let response = try await serve(
-                path: path, routes: routes, headers: headers, middleware: middleware, group: group)
+                request: rawRequest, routes: routes, middleware: middleware, group: group)
             try? await group.shutdownGracefully()
             return response
         } catch {
@@ -59,8 +71,8 @@ enum Loopback {
     }
 
     private static func serve(
-        path: String, routes: any HTTPHandling, headers: [(name: String, value: String)],
-        middleware: [any HTTPMiddleware], group: MultiThreadedEventLoopGroup
+        request: String, routes: any HTTPHandling, middleware: [any HTTPMiddleware],
+        group: MultiThreadedEventLoopGroup
     ) async throws -> String {
         // Discover a free loopback port (bind :0, read the assignment, release it).
         let probe = try await ServerBootstrap(group: group).bind(host: "127.0.0.1", port: 0).get()
@@ -82,10 +94,6 @@ enum Loopback {
             spins += 1
         }
 
-        // `Connection: close` makes the server close after `.end`, ending the client's read at EOF.
-        var requestLines = "GET \(path) HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n"
-        for header in headers { requestLines += "\(header.name): \(header.value)\r\n" }
-        let request = requestLines + "\r\n"
         let promise = group.next().makePromise(of: [UInt8].self)
         let client = try await ClientBootstrap(group: group)
             .channelInitializer { channel in channel.pipeline.addHandler(ResponseCollector(promise)) }
