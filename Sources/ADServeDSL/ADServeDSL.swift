@@ -136,12 +136,15 @@ public struct CompiledRoute: Sendable {
     let doc: RouteDoc?
     /// A WebSocket handler for a `WS` route (the engine upgrades the matching request), else `nil`.
     let webSocketHandler: WebSocketHandler?
+    /// An async streaming-body handler for a `Stream` route (the engine feeds the body in), else `nil`.
+    let streamingRun: StreamingRequestHandler?
     let bind: @Sendable (Substring) -> (@Sendable (HandlerInput) throws -> ResponseContent)?
 
     init(
         method: HTTPRequest.Method, needsStorage: Bool, cache: CachePolicy, exactPath: String?,
         middleware: [any HTTPMiddleware] = [], maxBodyBytes: Int? = nil,
         pathTemplate: String? = nil, doc: RouteDoc? = nil, webSocketHandler: WebSocketHandler? = nil,
+        streamingRun: StreamingRequestHandler? = nil,
         bind: @escaping @Sendable (Substring) -> (@Sendable (HandlerInput) throws -> ResponseContent)?
     ) {
         self.method = method
@@ -153,6 +156,7 @@ public struct CompiledRoute: Sendable {
         self.pathTemplate = pathTemplate
         self.doc = doc
         self.webSocketHandler = webSocketHandler
+        self.streamingRun = streamingRun
         self.bind = bind
     }
 
@@ -161,8 +165,8 @@ public struct CompiledRoute: Sendable {
     func withMaxBodyBytes(_ bytes: Int) -> CompiledRoute {
         CompiledRoute(
             method: method, needsStorage: needsStorage, cache: cache, exactPath: exactPath,
-            middleware: middleware, maxBodyBytes: bytes,
-            pathTemplate: pathTemplate, doc: doc, webSocketHandler: webSocketHandler, bind: bind)
+            middleware: middleware, maxBodyBytes: bytes, pathTemplate: pathTemplate, doc: doc,
+            webSocketHandler: webSocketHandler, streamingRun: streamingRun, bind: bind)
     }
 
     /// A copy carrying OpenAPI metadata — used by `RouteNode.build` to stamp `.summary`/`.body`/… onto
@@ -170,8 +174,8 @@ public struct CompiledRoute: Sendable {
     func withDoc(_ doc: RouteDoc) -> CompiledRoute {
         CompiledRoute(
             method: method, needsStorage: needsStorage, cache: cache, exactPath: exactPath,
-            middleware: middleware, maxBodyBytes: maxBodyBytes,
-            pathTemplate: pathTemplate, doc: doc, webSocketHandler: webSocketHandler, bind: bind)
+            middleware: middleware, maxBodyBytes: maxBodyBytes, pathTemplate: pathTemplate, doc: doc,
+            webSocketHandler: webSocketHandler, streamingRun: streamingRun, bind: bind)
     }
 }
 
@@ -217,6 +221,7 @@ private struct RoutePayload: Sendable {
     let middleware: [any HTTPMiddleware]
     let maxBodyBytes: Int?
     let webSocketHandler: WebSocketHandler?
+    let streamingRun: StreamingRequestHandler?
     let bind: @Sendable (Substring) -> (@Sendable (HandlerInput) throws -> ResponseContent)?
 
     init(_ route: CompiledRoute) {
@@ -225,13 +230,14 @@ private struct RoutePayload: Sendable {
         middleware = route.middleware
         maxBodyBytes = route.maxBodyBytes
         webSocketHandler = route.webSocketHandler
+        streamingRun = route.streamingRun
         bind = route.bind
     }
 
     func matched(_ run: @escaping @Sendable (HandlerInput) throws -> ResponseContent) -> MatchedRoute {
         MatchedRoute(
             needsStorage: needsStorage, cache: cache, middleware: middleware, maxBodyBytes: maxBodyBytes,
-            webSocketHandler: webSocketHandler, run: run)
+            webSocketHandler: webSocketHandler, streamingRun: streamingRun, run: run)
     }
 }
 

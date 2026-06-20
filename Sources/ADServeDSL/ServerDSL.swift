@@ -285,6 +285,36 @@ public func WS(_ subpath: String, _ handler: @escaping WebSocketHandler) -> Rout
     }
 }
 
+/// A streaming-upload route: the handler is ASYNC and receives the body as a back-pressured
+/// `RequestBodyStream` (`input.bodyStream`) — for large uploads that must not buffer in memory. The
+/// route's own body cap does NOT apply (bound the body yourself, e.g. `try await input.bodyStream
+/// .collect(maxBytes:)`). Route-level middleware is not applied to a streaming route; server-wide
+/// middleware (auth, logging) still wraps it. Defaults to `POST`.
+///
+///   Stream("upload") { input in
+///     var total = 0
+///     for await chunk in input.bodyStream { total += chunk.count }
+///     return .json(Array("{\"bytes\":\(total)}".utf8), as: .jsonRaw)
+///   }
+public func Stream(_ subpath: String, _ handler: @escaping StreamingRequestHandler) -> RouteNode {
+    precondition(
+        !subpath.contains("{"),
+        "ADServe: a streaming route path '\(subpath)' cannot contain a path parameter")
+    return RouteNode(cache: .unset) { prefix, cache, middleware in
+        let full = joinPath(prefix, subpath)
+        let bind: @Sendable (Substring) -> (@Sendable (HandlerInput) throws -> ResponseContent)? = { path in
+            // Placeholder: the engine takes the streaming path when `streamingRun` is set, so `run` is
+            // never invoked for a matched streaming request.
+            path == full[...] ? { @Sendable _ in .plain(.internalServerError, "streaming route\n") } : nil
+        }
+        return [
+            CompiledRoute(
+                method: .post, needsStorage: false, cache: cache, exactPath: full, middleware: middleware,
+                pathTemplate: full, streamingRun: handler, bind: bind)
+        ]
+    }
+}
+
 /// `426 Upgrade Required` + the `Upgrade`/`Connection` headers — the answer to a plain `GET` of a WS
 /// endpoint (RFC 6455 §4.2.1 / RFC 7231 §6.5.15).
 private func webSocketUpgradeRequired() -> ResponseContent {

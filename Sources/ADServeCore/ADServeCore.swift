@@ -596,10 +596,14 @@ public struct MatchedRoute: Sendable {
     /// A WebSocket handler if this route is a `WS` endpoint, else `nil`. The engine reads it (via
     /// `webSocketRoute(path:)`) to decide an HTTP/1 Upgrade; a normal `GET` to the path still runs `run`.
     public let webSocketHandler: WebSocketHandler?
+    /// An async streaming-body handler if this route consumes its body incrementally, else `nil`. When
+    /// present the engine takes the streaming path (`run` is a placeholder, never invoked).
+    public let streamingRun: StreamingRequestHandler?
 
     public init(
         needsStorage: Bool, cache: CachePolicy, middleware: [any HTTPMiddleware] = [],
         maxBodyBytes: Int? = nil, webSocketHandler: WebSocketHandler? = nil,
+        streamingRun: StreamingRequestHandler? = nil,
         run: @escaping @Sendable (HandlerInput) throws -> ResponseContent
     ) {
         self.needsStorage = needsStorage
@@ -607,6 +611,7 @@ public struct MatchedRoute: Sendable {
         self.middleware = middleware
         self.maxBodyBytes = maxBodyBytes
         self.webSocketHandler = webSocketHandler
+        self.streamingRun = streamingRun
         self.run = run
     }
 }

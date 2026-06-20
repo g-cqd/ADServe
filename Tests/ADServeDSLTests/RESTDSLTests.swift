@@ -705,6 +705,23 @@ struct WebSocketDSLTests {
     }
 }
 
+struct StreamingDSLTests {
+    @Test
+    func `Stream registers a POST streaming route resolvable by streamingHandler`() {
+        let routes = table { Stream("upload") { _ in .plain(.ok, "ok") } }
+        #expect(routes.streamingHandler(method: .post, path: "/upload") != nil)
+        #expect(routes.streamingHandler(method: .get, path: "/upload") == nil)  // POST only
+        #expect(routes.streamingHandler(method: .post, path: "/elsewhere") == nil)
+    }
+
+    @Test
+    func `Stream routes nest under a Group prefix`() {
+        let routes = table { Group("api") { Stream("upload") { _ in .plain(.ok, "ok") } } }
+        #expect(routes.streamingHandler(method: .post, path: "/api/upload") != nil)
+        #expect(routes.streamingHandler(method: .post, path: "/upload") == nil)
+    }
+}
+
 private func isNotFoundContent(_ content: ResponseContent?) -> Bool {
     if case .notFound? = content { return true }
     return false
