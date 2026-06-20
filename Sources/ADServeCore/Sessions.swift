@@ -3,7 +3,6 @@
 // `SessionStore` (in-memory by default). The handler reaches the session via `ctx.session`; the
 // middleware persists changes and sets/rotates/expires the cookie after the handler returns.
 
-import Crypto
 import Foundation
 import HTTPTypes
 import Synchronization
@@ -148,7 +147,7 @@ public enum SessionConfigError: Error, Equatable, Sendable {
 /// client cannot read or forge session state.
 public struct Sessions: HTTPMiddleware {
     private let store: any SessionStore
-    private let key: SymmetricKey
+    private let signer: HMACSigner
     private let cookieName: String
     private let maxAgeSeconds: Int
     private let secure: Bool
@@ -172,10 +171,9 @@ public struct Sessions: HTTPMiddleware {
             throw SessionConfigError.secretTooShort(provided: secret.count, minimum: Self.minimumSecretBytes)
         }
         self.store = store
-        self.key = HKDF<SHA256>
-            .deriveKey(
-                inputKeyMaterial: SymmetricKey(data: secret),
-                info: Data("ADServe.Sessions.v1.cookie-signing".utf8), outputByteCount: 32)
+        // The guard above preserves `SessionConfigError` (the documented Sessions API + its test); the
+        // secret is already validated, so this delegated construction never actually throws.
+        self.signer = try HMACSigner(secret: secret, info: "ADServe.Sessions.v1.cookie-signing")
         self.cookieName = cookieName
         self.maxAgeSeconds = maxAgeSeconds
         self.secure = secure
@@ -235,61 +233,15 @@ public struct Sessions: HTTPMiddleware {
     // MARK: - Signing
 
     /// `<id>.<hmac-hex>` — the id plus its HMAC-SHA256 tag, so tampering with the id is detectable.
-    private func sign(_ id: String) -> String {
-        let mac = HMAC<SHA256>.authenticationCode(for: Array(id.utf8), using: key)
-        return "\(id).\(Self.hexEncode(Array(mac)))"
-    }
+    private func sign(_ id: String) -> String { signer.sign(id) }
 
     /// The id from a signed cookie if the HMAC verifies (constant-time), else `nil`.
-    private func verify(_ cookie: String) -> String? {
-        guard let dot = cookie.lastIndex(of: ".") else { return nil }
-        let id = String(cookie[..<dot])
-        let tag = String(cookie[cookie.index(after: dot)...])
-        guard !id.isEmpty, let macBytes = Self.hexDecode(tag) else { return nil }
-        let valid = HMAC<SHA256>
-            .isValidAuthenticationCode(
-                Data(macBytes), authenticating: Array(id.utf8), using: key)
-        return valid ? id : nil
-    }
+    private func verify(_ cookie: String) -> String? { signer.verify(cookie) }
 
     /// 32 CSPRNG bytes as lowercase hex — an unguessable session id.
     static func makeSessionID() -> String {
         var bytes = [UInt8](repeating: 0, count: 32)
         for index in bytes.indices { bytes[index] = UInt8.random(in: .min ... .max) }
-        return hexEncode(bytes)
-    }
-
-    static func hexEncode(_ bytes: [UInt8]) -> String {
-        let digits: [UInt8] = Array("0123456789abcdef".utf8)
-        var out: [UInt8] = []
-        out.reserveCapacity(bytes.count * 2)
-        for byte in bytes {
-            out.append(digits[Int(byte >> 4)])
-            out.append(digits[Int(byte & 0x0F)])
-        }
-        return String(decoding: out, as: UTF8.self)
-    }
-
-    static func hexDecode(_ string: String) -> [UInt8]? {
-        let chars = Array(string.utf8)
-        guard chars.count % 2 == 0 else { return nil }
-        var out: [UInt8] = []
-        out.reserveCapacity(chars.count / 2)
-        var index = 0
-        while index < chars.count {
-            guard let high = nibble(chars[index]), let low = nibble(chars[index + 1]) else { return nil }
-            out.append(high << 4 | low)
-            index += 2
-        }
-        return out
-    }
-
-    private static func nibble(_ byte: UInt8) -> UInt8? {
-        switch byte {
-            case UInt8(ascii: "0") ... UInt8(ascii: "9"): return byte - UInt8(ascii: "0")
-            case UInt8(ascii: "a") ... UInt8(ascii: "f"): return byte - UInt8(ascii: "a") + 10
-            case UInt8(ascii: "A") ... UInt8(ascii: "F"): return byte - UInt8(ascii: "A") + 10
-            default: return nil
-        }
+        return HMACSigner.hexEncode(bytes)
     }
 }
