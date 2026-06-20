@@ -34,8 +34,9 @@ jobs:
     name: MIME table in sync
     if: ${{ vars.AD_SWIFT_SIBLINGS_PUBLISHED == 'true' }}
     runs-on: ubuntu-latest
-    # The canonical 6.4 nightly (matches the reusable workflow's container + `.swift-version`).
-    container: swiftlang/swift:nightly-6.4-jammy
+    # The canonical dated 6.4 nightly (matches the reusable workflow's pinned container + `.swift-version`).
+    # Dated tag pins the toolchain for reproducible CI; bump deliberately like a dependency (#14).
+    container: swiftlang/swift:nightly-6.4-2026-06-18-jammy
     steps:
       - uses: actions/checkout@v4
       - name: Mark workspace safe for git
