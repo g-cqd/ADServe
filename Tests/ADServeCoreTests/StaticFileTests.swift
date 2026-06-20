@@ -93,6 +93,103 @@ import Testing
             path: "/a.js", routes: routes, headers: [("If-None-Match", etag)])
         #expect(second.hasPrefix("HTTP/1.1 304"))
     }
+
+    // MARK: - B1: size in the ETag
+
+    @Test func etagIncludesSizeSoDifferentlySizedFilesDiffer() async throws {
+        let root = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data("short".utf8).write(to: root.appendingPathComponent("a.txt"))
+        try Data(String(repeating: "x", count: 9999).utf8).write(to: root.appendingPathComponent("b.txt"))
+        let routesA = StubRoutes { _ in .file(root: root.path, subpath: "a.txt", contentType: "text/plain") }
+        let routesB = StubRoutes { _ in .file(root: root.path, subpath: "b.txt", contentType: "text/plain") }
+        let etagA = staticTestHeader(try await Loopback.run(path: "/a.txt", routes: routesA), "etag")
+        let etagB = staticTestHeader(try await Loopback.run(path: "/b.txt", routes: routesB), "etag")
+        #expect(etagA != nil)
+        #expect(etagA != etagB)  // size is part of the ETag
+    }
+
+    // MARK: - B3: Range / 206 / 416
+
+    @Test func acceptRangesIsAdvertisedAndARangeRequestGets206() async throws {
+        let root = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data("0123456789".utf8).write(to: root.appendingPathComponent("d.txt"))
+        let routes = StubRoutes { _ in .file(root: root.path, subpath: "d.txt", contentType: "text/plain") }
+        let full = try await Loopback.run(path: "/d.txt", routes: routes)
+        #expect(full.lowercased().contains("accept-ranges: bytes"))
+
+        let partial = try await Loopback.run(
+            path: "/d.txt", routes: routes, headers: [("Range", "bytes=0-3")])
+        let lower = partial.lowercased()
+        #expect(partial.hasPrefix("HTTP/1.1 206"))
+        #expect(lower.contains("content-range: bytes 0-3/10"))
+        #expect(lower.contains("content-length: 4"))
+        #expect(!partial.contains("456789"))  // only the requested slice, not the rest
+    }
+
+    @Test func unsatisfiableRangeGets416() async throws {
+        let root = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data("0123456789".utf8).write(to: root.appendingPathComponent("d.txt"))
+        let routes = StubRoutes { _ in .file(root: root.path, subpath: "d.txt", contentType: "text/plain") }
+        let response = try await Loopback.run(
+            path: "/d.txt", routes: routes, headers: [("Range", "bytes=100-200")])
+        #expect(response.hasPrefix("HTTP/1.1 416"))
+        #expect(response.lowercased().contains("content-range: bytes */10"))
+    }
+
+    // MARK: - B2: precompressed variants
+
+    @Test func precompressedBrotliSiblingIsServedWhenAcceptable() async throws {
+        let root = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data("IDENTITY-CSS".utf8).write(to: root.appendingPathComponent("app.css"))
+        try Data("BROTLI-BYTES".utf8).write(to: root.appendingPathComponent("app.css.br"))
+        let routes = StubRoutes { _ in
+            .file(root: root.path, subpath: "app.css", contentType: "text/css; charset=utf-8")
+        }
+        let compressed = try await Loopback.run(
+            path: "/app.css", routes: routes, headers: [("Accept-Encoding", "br")])
+        let lowerC = compressed.lowercased()
+        #expect(lowerC.contains("content-encoding: br"))
+        #expect(lowerC.contains("vary: accept-encoding"))
+        #expect(lowerC.contains("content-type: text/css; charset=utf-8"))  // the identity type
+        #expect(compressed.contains("BROTLI-BYTES"))
+        #expect(!compressed.contains("IDENTITY-CSS"))
+
+        let identity = try await Loopback.run(path: "/app.css", routes: routes)
+        #expect(!identity.lowercased().contains("content-encoding:"))
+        #expect(identity.contains("IDENTITY-CSS"))
+    }
+
+    @Test func incompressibleTypeIsNeverServedPrecompressed() async throws {
+        let root = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data("PNG-IDENTITY".utf8).write(to: root.appendingPathComponent("img.png"))
+        try Data("PNG-BR".utf8).write(to: root.appendingPathComponent("img.png.br"))
+        let routes = StubRoutes { _ in .file(root: root.path, subpath: "img.png", contentType: "image/png") }
+        // png is not compressible (mime-db), so the .br sibling is ignored even with Accept-Encoding: br.
+        let response = try await Loopback.run(
+            path: "/img.png", routes: routes, headers: [("Accept-Encoding", "br")])
+        #expect(!response.lowercased().contains("content-encoding:"))
+        #expect(response.contains("PNG-IDENTITY"))
+    }
+
+    // MARK: - B4: chunked streaming of large files
+
+    @Test func largeFileStreamsAcrossChunksIntact() async throws {
+        let root = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        // > 256 KiB so it spans multiple read chunks; a tail marker proves the last chunk arrived.
+        let body = String(repeating: "A", count: 600_000) + "TAIL-MARKER"
+        try Data(body.utf8).write(to: root.appendingPathComponent("big.txt"))
+        let routes = StubRoutes { _ in .file(root: root.path, subpath: "big.txt", contentType: "text/plain") }
+        let response = try await Loopback.run(path: "/big.txt", routes: routes)
+        #expect(response.hasPrefix("HTTP/1.1 200"))
+        #expect(response.lowercased().contains("content-length: \(body.utf8.count)"))
+        #expect(response.contains("TAIL-MARKER"))  // the final chunk streamed intact
+    }
 }
 
 /// Reads one header value out of a raw HTTP/1.1 response (case-insensitive name).
