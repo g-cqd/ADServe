@@ -262,7 +262,16 @@ if isDev {
     package.targets.append(
         .executableTarget(
             name: "ADServeSuite",
-            dependencies: ["ADServeCore", .product(name: "Benchmark", package: "benchmark")],
+            dependencies: [
+                "ADServeCore",
+                // The route DSL (`Server`/`App`/`GET` → `RouteTable.match`) lives in ADServeDSL, and the
+                // percent-coding kernel the path/query surface decodes through is `ADFCore.PercentCoding` —
+                // both benchmarked here against their PUBLIC API, so the suite covers the routing + decode
+                // hot paths, not just the cookie pair the original two cases tracked.
+                "ADServeDSL",
+                .product(name: "ADFCore", package: "ADFoundation"),
+                .product(name: "Benchmark", package: "benchmark")
+            ],
             path: "Benchmarks/ADServeSuite",
             swiftSettings: strictSettings,
             plugins: [.plugin(name: "BenchmarkPlugin", package: "benchmark")]))
