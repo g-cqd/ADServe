@@ -24,6 +24,15 @@ jobs:
     with:
       dev-env-var: ADSERVE_DEV
       requires-published-siblings: true
+      # Memory/data-race safety: ADServeCore does manual buffer parsing (MIME sniffing, header
+      # framing), so run the suite under both ASan (heap/stack overflow, use-after-free) and TSan
+      # (data races across the NIO event loops). The reusable workflow's `sanitizers` job iterates
+      # this space-separated list, one `swift test --sanitize=<s>` pass each.
+      enable-sanitizers: true
+      sanitizers: "address thread"
+      # Code coverage on the debug leg (the reusable workflow adds `--enable-code-coverage` only for
+      # the debug config) — surfaces untested parser/branch paths alongside the sanitizer runs.
+      enable-coverage: true
 
   mime-codegen-drift:
     # Drift guard: the MIME table is GENERATED (vendored jshttp/mime-db -> the committed
@@ -45,3 +54,55 @@ jobs:
         run: swift run ADServeMimeCodegen
       - name: Assert the committed table matches the generator output
         run: git diff --exit-code -- Sources/ADServeCore/Generated/MIMEDatabase.swift
+
+  fuzz:
+    # Parser fuzzing: the request-line / header / MIME-sniff parsers consume untrusted bytes, so we
+    # run ADTestKit's property/fuzz suite (ParserFuzzTests) on every push. The seed budget is fixed so
+    # the run is deterministic and bounded — a fresh corpus would make CI duration nondeterministic;
+    # the harness is seeded from the suite, not the wall clock. ADTESTKIT_FUZZ_TRACE=1 makes a failing
+    # case print the minimized byte repro to the log so a crash is reproducible from the CI output
+    # alone. `swift test` resolves the full package (first-party siblings from branch: main), so this
+    # gates on the same AD_SWIFT_SIBLINGS_PUBLISHED signal as `mime-codegen-drift`.
+    name: Parser fuzz
+    if: ${{ vars.AD_SWIFT_SIBLINGS_PUBLISHED == 'true' }}
+    runs-on: ubuntu-latest
+    # Same pinned 6.4 nightly as the other resolution-dependent jobs (matches `.swift-version`); bump
+    # deliberately like a dependency (#14).
+    container: swiftlang/swift:nightly-6.4-2026-06-18-jammy
+    env:
+      # Print the minimized repro on a failing case so a crash is actionable straight from the log.
+      ADTESTKIT_FUZZ_TRACE: 1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Run the parser fuzz suite (fixed seed budget)
+        run: ADSERVE_DEV=1 swift test --filter ParserFuzzTests
+
+  benchmark:
+    # Performance regression guard (ordo-one package-benchmark). Tracks throughput + allocation
+    # counters for the hot parser/serialization paths; `.mallocCountTotal` needs the jemalloc shim, so
+    # we install libjemalloc-dev before the run. NON-BLOCKING for now (continue-on-error) because no
+    # baseline is committed yet — `swift package benchmark` only annotates the numbers. Flip to blocking
+    # (drop continue-on-error, add a `--check-absolute-path <baseline>` / threshold gate) once a
+    # committed baseline lands. `swift package benchmark` resolves the full package (first-party
+    # siblings + ADBUILDTOOLS from branch: main), so this gates on the same
+    # AD_SWIFT_SIBLINGS_PUBLISHED signal as the other resolution-dependent jobs — in CI the published
+    # siblings resolve normally, so only the dev-env + jemalloc are needed here.
+    name: Benchmarks
+    if: ${{ vars.AD_SWIFT_SIBLINGS_PUBLISHED == 'true' }}
+    runs-on: ubuntu-latest
+    # Same pinned 6.4 nightly as the other resolution-dependent jobs (matches `.swift-version`); bump
+    # deliberately like a dependency (#14).
+    container: swiftlang/swift:nightly-6.4-2026-06-18-jammy
+    # TODO: drop continue-on-error and add a threshold/baseline check once a committed benchmark
+    # baseline exists — until then this only reports numbers, it does not gate the merge.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Install jemalloc (required for the .mallocCountTotal metric)
+        run: apt-get update && apt-get install -y libjemalloc-dev
+      - name: Run the benchmark suite
+        run: ADSERVE_DEV=1 swift package benchmark
