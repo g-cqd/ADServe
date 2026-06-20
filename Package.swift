@@ -25,10 +25,12 @@ let strictSettings: [SwiftSetting] = [
 // Tests: strict + runtime actor data-race checks (unsafe flag → test targets only, never the library).
 let testSettings: [SwiftSetting] = strictSettings + [.unsafeFlags(["-enable-actor-data-race-checks"])]
 
-// Shipped-library settings: strict + StrictMemorySafety. Every use of an unsafe construct (raw pointers,
-// `withUnsafe*`, `unsafeBitCast`, C interop, …) must be explicitly marked `unsafe`, matching the AD-family
-// kernel targets. Tests / the dev codegen stay on `strictSettings` (their unsafe scaffolding is not shipped).
-let kernelSettings: [SwiftSetting] = strictSettings + [.strictMemorySafety()]
+// Shipped-library settings: strict + StrictMemorySafety + Lifetimes. Every use of an unsafe construct (raw
+// pointers, `withUnsafe*`, `unsafeBitCast`, C interop, …) must be explicitly marked `unsafe`; `Lifetimes`
+// enables the lifetime-dependence syntax (Span / borrowing results). Both match the other AD-family kernels
+// (ADFCore, ADHTMLCore, ADDBCore). Tests / dev codegen stay on `strictSettings` (unsafe scaffolding, unshipped).
+let kernelSettings: [SwiftSetting] =
+    strictSettings + [.strictMemorySafety(), .enableExperimentalFeature("Lifetimes")]
 
 // Dev-only tooling is gated behind `ADSERVE_DEV` so consumers never resolve it (mirrors the sibling
 // AD-family `*_DEV` convention). Provides the shared ADBuildTools lint/format plugins + DocC.
