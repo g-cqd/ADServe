@@ -240,6 +240,15 @@ extension HTTPServer {
             let identityAttrs = regularFileAttributes(fileManager, identityReal)
         else { return .notFound }
 
+        // Defense in depth: refuse a hidden file — any RESOLVED path component under the root starting with
+        // `.` (e.g. `.env`, `.git/config`) — even when reached via a hand-built `.file()` route. The DSL
+        // `Static()` already rejects dotfiles, but making the engine itself the final gate means a bypassed
+        // DSL can't leak one. (`.`/`..` are already neutralized by canonicalization + the jail; this targets
+        // hidden NAMES, and the root's own dot-components are exempt — only the part below the root counts.)
+        for segment in identityReal.dropFirst(rootReal.count).split(separator: "/") where segment.hasPrefix(".") {
+            return .notFound
+        }
+
         let rangeHeader = headers[rangeName]
 
         // Precompressed negotiation: only for compressible types and only without a Range (a range

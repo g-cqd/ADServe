@@ -251,14 +251,11 @@ import Testing
 
     // MARK: - 6. Dotfile request (`/.env`)
 
-    @Test func dotfileRejectionIsTheDSLLayersJobNotTheEngines() async throws {
-        // The dotfile guard ("reject any segment starting with `.`") lives EXCLUSIVELY in the DSL `Static()`
-        // handler — the ENGINE jail has no dotfile concept. So a `.env` handed to `.file()` directly (i.e.
-        // if the DSL guard were bypassed) is served by the engine as an ordinary jailed regular file. This
-        // test LOCKS that module boundary: with the file PRESENT the engine serves it (proving the engine is
-        // not the layer that blocks dotfiles), and with it ABSENT the engine 404s — so the engine's only
-        // dotfile-related protection is "must exist + be jailed". Production never reaches this with a
-        // dotfile subpath because `Static()` rejects it first (covered by the ADServeDSL test target).
+    @Test func engineRejectsADotfileEvenWhenReachedDirectly() async throws {
+        // Defense in depth: the engine jail now refuses a hidden file (any resolved path segment starting
+        // with `.`), so even a hand-built `.file(subpath: ".env")` that bypasses the DSL `Static()` dotfile
+        // guard is a 404 — the engine is the FINAL gate, not only the DSL. (Production still rejects it at
+        // the DSL layer first; this proves the second layer holds if the first is bypassed.)
         let root = TemporaryDirectory(prefix: "adserve-traversal-dotfile")
         defer { root.cleanup() }
         try Data("SECRET=hunter2".utf8).write(to: URL(fileURLWithPath: root.file(".env")))
@@ -267,10 +264,8 @@ import Testing
             .file(root: root.path, subpath: ".env", contentType: "text/plain")
         }
         let presentResponse = try await Loopback.run(path: "/.env", routes: present)
-        // FINDING (not a bypass): engine has no dotfile guard — it serves a jailed `.env`. The DSL is the
-        // gate. If this ever flips to 404 because a dotfile guard was added to the engine too, update this.
-        #expect(presentResponse.hasPrefix("HTTP/1.1 200"))
-        #expect(presentResponse.contains("SECRET=hunter2"))
+        #expect(presentResponse.hasPrefix("HTTP/1.1 404"))  // engine rejects the hidden file
+        #expect(!presentResponse.contains("SECRET=hunter2"))  // the secret never leaks
 
         // And the dotfile must NEVER be reachable from outside root, even by the engine (jail still holds).
         let outOfRoot =
