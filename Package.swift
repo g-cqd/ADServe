@@ -103,6 +103,11 @@ if isDev {
     }
     packageDependencies.append(
         .package(url: "https://github.com/swiftlang/swift-docc-plugin", from: "1.0.0"))
+    // ordo-one's statistically-rigorous benchmark framework (p-percentile latencies + throughput +
+    // malloc counts), matching the sibling ADFoundation / ADJSON / ADDB suites. The suite lives in
+    // `Benchmarks/ADServeSuite` and runs via `ADSERVE_DEV=1 swift package benchmark`. Dev-only, so
+    // consumers of the engine/DSL never resolve it.
+    packageDependencies.append(.package(url: "https://github.com/ordo-one/benchmark", from: "1.4.0"))
 }
 
 let libraryBuildPlugins: [Target.PluginUsage] =
@@ -243,3 +248,17 @@ let package = Package(
             swiftSettings: testSettings)
     ]
 )
+
+// ordo-one benchmark suite (ADSERVE_DEV-gated): tracks `.mallocCountTotal` on the hot request/response
+// header paths (cookie parse + Set-Cookie serialize) so a reintroduced allocation trips the threshold
+// instead of rotting silently. Runs via `ADSERVE_DEV=1 swift package benchmark`. Mirrors ADFoundation's
+// `Benchmarks/ADFoundationSuite` wiring; dev-only so consumers of the engine never resolve ordo-one.
+if isDev {
+    package.targets.append(
+        .executableTarget(
+            name: "ADServeSuite",
+            dependencies: ["ADServeCore", .product(name: "Benchmark", package: "benchmark")],
+            path: "Benchmarks/ADServeSuite",
+            swiftSettings: strictSettings,
+            plugins: [.plugin(name: "BenchmarkPlugin", package: "benchmark")]))
+}
