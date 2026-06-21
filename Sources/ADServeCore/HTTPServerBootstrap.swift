@@ -50,11 +50,20 @@ extension HTTPServer {
         try channel.pipeline.syncOperations.addHandler(HTTP1ExpectContinueHandler())
     }
 
+    /// The on-the-fly response-compression floor: a body below this many bytes is served uncompressed. A
+    /// response that fits one TCP segment (~1 MTU) gains nothing on the wire from compression — it is one
+    /// packet either way — so compressing it only spends CPU (a per-response Huffman tree, ~17% throughput
+    /// on small responses here) and can ENLARGE it (gzip framing is ~18 bytes). Static precompressed
+    /// `.br`/`.gz` variants (served via `Content-Encoding` pass-through) and large dynamic bodies are
+    /// unaffected. Mirrors nginx's `gzip_min_length`.
+    static let minimumCompressibleResponseBytes = 1400
+
     /// A fresh `HTTPResponseCompressor` (one per connection — it is stateful) gated to compress only what
-    /// is worth it and safe: a body whose bare `Content-Type` is mime-db-compressible, with NO existing
-    /// `Content-Encoding` (so a precompressed `.br`/`.gz` static variant is passed through untouched), and
-    /// NEVER `text/event-stream` (compressing buffers, which would stall a long-lived SSE stream).
-    /// `isSupported` already encodes the client's `Accept-Encoding` (with q-values) ∩ what HTTP allows.
+    /// is worth it and safe: a body whose bare `Content-Type` is mime-db-compressible, at least
+    /// ``minimumCompressibleResponseBytes`` long, with NO existing `Content-Encoding` (so a precompressed
+    /// `.br`/`.gz` static variant is passed through untouched), and NEVER `text/event-stream` (compressing
+    /// buffers, which would stall a long-lived SSE stream). `isSupported` already encodes the client's
+    /// `Accept-Encoding` (with q-values) ∩ what HTTP allows.
     static func makeResponseCompressor() -> HTTPResponseCompressor {
         HTTPResponseCompressor(responseCompressionPredicate: { responseHead, isSupported in
             guard isSupported else { return .doNotCompress }
@@ -63,6 +72,14 @@ extension HTTPServer {
             // `Content-Range` still describes identity bytes — an incoherent range. Serve ranges as
             // identity (nginx does the same); the full entity (200) still compresses normally.
             if responseHead.headers.contains(name: "Content-Range") { return .doNotCompress }
+            // Sub-MTU bodies skip compression (cheap short-circuit BEFORE the Content-Type/mime work too):
+            // a known small Content-Length isn't worth a Huffman tree. An absent length (streamed) falls
+            // through and is still offered to compression.
+            if let lengthText = responseHead.headers.first(name: "Content-Length"),
+                let length = Int(lengthText), length < Self.minimumCompressibleResponseBytes
+            {
+                return .doNotCompress
+            }
             guard let contentType = responseHead.headers.first(name: "Content-Type") else {
                 return .doNotCompress
             }

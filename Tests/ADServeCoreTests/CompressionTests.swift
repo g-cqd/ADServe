@@ -48,6 +48,20 @@ import Testing
         #expect(!response.contains(marker))  // body is compressed, not the literal plaintext
     }
 
+    /// A compressible body BELOW the on-the-fly floor (``HTTPServer/minimumCompressibleResponseBytes``) is
+    /// served identity even though the client accepts gzip and the type IS compressible — a sub-MTU body
+    /// gains nothing on the wire from compression (still one packet), so the engine skips the per-response
+    /// Huffman tree (the `gzip_min_length` practice). Brackets `compressibleResponseIsGzippedWhenAccepted`
+    /// (a ~3 KB body, which DOES gzip).
+    @Test func subThresholdBodyIsNotCompressed() async throws {
+        let marker = "<p>tiny-compressible-marker</p>"  // ~31 B, far under the floor
+        let routes = StubRoutes { _ in .html(Array(marker.utf8)) }
+        let response = try await Loopback.run(
+            path: "/", routes: routes, headers: [("Accept-Encoding", "gzip")])
+        #expect(!response.lowercased().contains("content-encoding"))  // not compressed (sub-threshold)
+        #expect(response.contains(marker))  // served verbatim as plaintext
+    }
+
     @Test func noAcceptEncodingMeansNoCompression() async throws {
         let marker = "<p>plain-body-marker</p>"
         let routes = StubRoutes { _ in .html(Array(String(repeating: marker, count: 100).utf8)) }
