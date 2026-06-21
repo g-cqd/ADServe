@@ -282,3 +282,19 @@ if isDev {
             swiftSettings: strictSettings,
             plugins: [.plugin(name: "BenchmarkPlugin", package: "benchmark")]))
 }
+
+// Runnable load-bench server (ADSERVE_DEV-gated): the live, end-to-end counterpart to `ADServeSuite`'s
+// in-process micro-benchmarks — a real listener serving TechEmpower-shaped routes so a real HTTP client
+// can measure req/s + latency. Also the canonical "how do I run a server" example. Dev-only, so consumers
+// of the engine never build it. Run: `ADSERVE_DEV=1 swift run -c release ADServeBench`.
+if isDev {
+    package.targets.append(
+        .executableTarget(
+            name: "ADServeBench",
+            dependencies: [
+                "ADServeCore", "ADServeDSL",
+                .product(name: "HTTPTypes", package: "swift-http-types"),
+                .product(name: "Logging", package: "swift-log")
+            ],
+            swiftSettings: strictSettings))
+}
