@@ -61,15 +61,8 @@ let adfoundationDependency: Package.Dependency = {
     }
     return .package(url: "https://github.com/g-cqd/ADFoundation.git", branch: "main")
 }()
-// ADMCP_PATH -> the standalone, transport-agnostic MCP JSON-RPC core + `Tool` DSL (extracted from
-// ADServe). ADServeCore `@_exported import`s it, so the MCP surface stays reachable via
-// `import ADServeCore` / `import ADServeDSL` with no consumer source change.
-let admcpDependency: Package.Dependency = {
-    if let path = Context.environment["ADMCP_PATH"], !path.isEmpty {
-        return .package(path: path)
-    }
-    return .package(url: "https://github.com/g-cqd/ADMCP.git", branch: "main")
-}()
+// ADMCP (the transport-agnostic MCP JSON-RPC core + `Tool` DSL) was a standalone package; it is now a
+// target in THIS package (folded in), so there is no longer an ADMCP package dependency to resolve.
 // ADTESTKIT_PATH -> ADTestKit, the family's deterministic-testing toolkit (AsyncEventProbe, managed
 // TemporaryDirectory, seeded RNG, tags). TEST-ONLY: linked solely by the test targets, so a consumer of
 // the shipped libraries never resolves it.
@@ -98,7 +91,6 @@ var packageDependencies: [Package.Dependency] = [
     adjsonDependency,
     adconcurrencyDependency,
     adfoundationDependency,
-    admcpDependency,
     adtestkitDependency
 ]
 if isDev {
@@ -133,17 +125,33 @@ let package = Package(
     ],
     products: [
         // The engine: NIO bootstrap + HTTP/1.1+2 + TLS, the response envelope, and the type-erased
-        // connection pool. Persistence-agnostic. Re-exports the standalone ADMCP package for compat.
+        // connection pool. Persistence-agnostic. `@_exported import`s the in-package ADMCP target.
         .library(name: "ADServeCore", targets: ["ADServeCore"]),
         // The route result-builder DSL over the engine's public surface (the MCP `Tool` DSL now lives
         // in ADMCP, re-exported transitively via ADServeCore).
         .library(name: "ADServeDSL", targets: ["ADServeDSL"]),
         // Opt-in observability middleware (swift-metrics + swift-distributed-tracing) — separate so
         // the bare engine stays dependency-light. A consumer adds it only if it wants the integration.
-        .library(name: "ADServeObservability", targets: ["ADServeObservability"])
+        .library(name: "ADServeObservability", targets: ["ADServeObservability"]),
+        // The transport-agnostic MCP JSON-RPC core + `Tool` DSL, folded in from the former standalone
+        // ADMCP package. Its own product so a consumer can use MCP (e.g. over stdio) without the HTTP
+        // engine — it depends only on ADJSON / ADConcurrency / swift-log, not NIO.
+        .library(name: "ADMCP", targets: ["ADMCP"])
     ],
     dependencies: packageDependencies,
     targets: [
+        // ADMCP — transport-agnostic MCP JSON-RPC core + `Tool` DSL, folded in from the former
+        // standalone package. Depends only on ADJSON / ADConcurrency / swift-log — NOT the NIO engine —
+        // so the ADMCP product stays usable over stdio without HTTP. ADServeCore @_exported imports it.
+        .target(
+            name: "ADMCP",
+            dependencies: [
+                .product(name: "ADJSON", package: "ADJSON"),
+                .product(name: "ADConcurrency", package: "ADConcurrency"),
+                .product(name: "Logging", package: "swift-log")
+            ],
+            swiftSettings: strictSettings,
+            plugins: libraryBuildPlugins),
         .target(
             name: "ADServeCore",
             dependencies: [
@@ -169,7 +177,7 @@ let package = Package(
                 .product(name: "ADJSON", package: "ADJSON"),
                 .product(name: "ADConcurrency", package: "ADConcurrency"),
                 .product(name: "ADFCore", package: "ADFoundation"),
-                .product(name: "ADMCP", package: "ADMCP")
+                "ADMCP"
             ],
             swiftSettings: kernelSettings,
             plugins: libraryBuildPlugins),
@@ -251,6 +259,16 @@ let package = Package(
                 .product(name: "Instrumentation", package: "swift-distributed-tracing"),
                 .product(name: "InMemoryTracing", package: "swift-distributed-tracing"),
                 .product(name: "ServiceContextModule", package: "swift-service-context")
+            ],
+            swiftSettings: testSettings),
+        // Folded in from the former standalone ADMCP package.
+        .testTarget(
+            name: "ADMCPTests",
+            dependencies: [
+                "ADMCP",
+                .product(name: "ADJSON", package: "ADJSON"),
+                .product(name: "ADConcurrency", package: "ADConcurrency"),
+                .product(name: "Logging", package: "swift-log")
             ],
             swiftSettings: testSettings)
     ]
