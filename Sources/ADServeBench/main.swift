@@ -52,9 +52,24 @@ let apps = Server {
     }
 }
 
+// The constant response envelope. Empty by default (the leanest cross-stack comparison vs bare peer
+// servers). ADSERVE_BENCH_ENVELOPE=1 installs a realistic security-header set — what a real deployment
+// carries on EVERY response — so the bench can represent that work (and exercise the per-response
+// envelope-merge path).
+var envelope = HTTPFields()
+if ProcessInfo.processInfo.environment["ADSERVE_BENCH_ENVELOPE"] != nil {
+    envelope[HTTPField.Name("Strict-Transport-Security")!] = "max-age=63072000; includeSubDomains"
+    envelope[HTTPField.Name("X-Content-Type-Options")!] = "nosniff"
+    envelope[HTTPField.Name("X-Frame-Options")!] = "DENY"
+    envelope[HTTPField.Name("Referrer-Policy")!] = "no-referrer"
+    envelope[HTTPField.Name("Content-Security-Policy")!] = "default-src 'self'"
+    envelope[HTTPField.Name("Permissions-Policy")!] = "geolocation=(), microphone=()"
+    envelope[HTTPField.Name("Vary")!] = "Accept-Encoding"
+}
+
 let server = HTTPServer(
     listeners: listeners(apps, defaultPort: port),
-    pool: nil, envelope: HTTPFields(), logger: logger, threadCount: threads, loopCount: loops)
+    pool: nil, envelope: envelope, logger: logger, threadCount: threads, loopCount: loops)
 
 logger.logLevel = .info
 logger.info(
