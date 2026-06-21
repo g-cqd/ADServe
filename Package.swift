@@ -46,12 +46,7 @@ let adjsonDependency: Package.Dependency = {
     }
     return .package(url: "https://github.com/g-cqd/ADJSON.git", branch: "main")
 }()
-let adconcurrencyDependency: Package.Dependency = {
-    if let path = Context.environment["ADCONCURRENCY_PATH"], !path.isEmpty {
-        return .package(path: path)
-    }
-    return .package(url: "https://github.com/g-cqd/ADConcurrency.git", branch: "main")
-}()
+// (ADConcurrency is folded into the ADFoundation umbrella package — resolved via adfoundationDependency.)
 // ADFOUNDATION_PATH -> ADFCore, the canonical RFC 3986 `PercentCoding` byte kernel used to decode
 // path captures + query values (and reject traversal smuggling). Already transitive via ADJSON;
 // declared directly so ADServe reuses the family primitive instead of re-rolling percent-coding.
@@ -63,15 +58,8 @@ let adfoundationDependency: Package.Dependency = {
 }()
 // ADMCP (the transport-agnostic MCP JSON-RPC core + `Tool` DSL) was a standalone package; it is now a
 // target in THIS package (folded in), so there is no longer an ADMCP package dependency to resolve.
-// ADTESTKIT_PATH -> ADTestKit, the family's deterministic-testing toolkit (AsyncEventProbe, managed
-// TemporaryDirectory, seeded RNG, tags). TEST-ONLY: linked solely by the test targets, so a consumer of
-// the shipped libraries never resolves it.
-let adtestkitDependency: Package.Dependency = {
-    if let path = Context.environment["ADTESTKIT_PATH"], !path.isEmpty {
-        return .package(path: path)
-    }
-    return .package(url: "https://github.com/g-cqd/ADTestKit.git", branch: "main")
-}()
+// ADTestKit (the deterministic-testing toolkit, TEST-ONLY) is also folded into the ADFoundation umbrella
+// package now; the test targets reference it via `package: "ADFoundation"`.
 
 var packageDependencies: [Package.Dependency] = [
     .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
@@ -89,9 +77,7 @@ var packageDependencies: [Package.Dependency] = [
     .package(url: "https://github.com/apple/swift-distributed-tracing.git", from: "1.1.2"),
     .package(url: "https://github.com/apple/swift-service-context.git", from: "1.1.0"),
     adjsonDependency,
-    adconcurrencyDependency,
-    adfoundationDependency,
-    adtestkitDependency
+    adfoundationDependency
 ]
 if isDev {
     if let path = Context.environment["ADBUILDTOOLS_PATH"], !path.isEmpty {
@@ -147,7 +133,7 @@ let package = Package(
             name: "ADMCP",
             dependencies: [
                 .product(name: "ADJSON", package: "ADJSON"),
-                .product(name: "ADConcurrency", package: "ADConcurrency"),
+                .product(name: "ADConcurrency", package: "ADFoundation"),
                 .product(name: "Logging", package: "swift-log")
             ],
             swiftSettings: strictSettings,
@@ -175,7 +161,7 @@ let package = Package(
                 .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"),
                 .product(name: "UnixSignals", package: "swift-service-lifecycle"),
                 .product(name: "ADJSON", package: "ADJSON"),
-                .product(name: "ADConcurrency", package: "ADConcurrency"),
+                .product(name: "ADConcurrency", package: "ADFoundation"),
                 .product(name: "ADFCore", package: "ADFoundation"),
                 "ADMCP"
             ],
@@ -185,7 +171,7 @@ let package = Package(
             name: "ADServeDSL",
             dependencies: [
                 "ADServeCore",
-                .product(name: "ADConcurrency", package: "ADConcurrency"),
+                .product(name: "ADConcurrency", package: "ADFoundation"),
                 .product(name: "ADFCore", package: "ADFoundation"),
                 .product(name: "HTTPTypes", package: "swift-http-types"),
                 .product(name: "ADJSON", package: "ADJSON")
@@ -236,7 +222,7 @@ let package = Package(
                 .product(name: "NIOHTTPTypesHTTP2", package: "swift-nio-extras"),
                 // Deterministic-testing toolkit: AsyncEventProbe (wait-or-throw, no polling), managed
                 // temp dirs — replacing ad-hoc `Flag`+poll loops in the timing-sensitive integration tests.
-                .product(name: "ADTestKit", package: "ADTestKit")
+                .product(name: "ADTestKit", package: "ADFoundation")
             ],
             swiftSettings: testSettings),
         .testTarget(
@@ -267,7 +253,7 @@ let package = Package(
             dependencies: [
                 "ADMCP",
                 .product(name: "ADJSON", package: "ADJSON"),
-                .product(name: "ADConcurrency", package: "ADConcurrency"),
+                .product(name: "ADConcurrency", package: "ADFoundation"),
                 .product(name: "Logging", package: "swift-log")
             ],
             swiftSettings: testSettings)
