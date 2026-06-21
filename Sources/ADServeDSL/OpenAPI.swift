@@ -103,7 +103,6 @@ extension RouteNode {
 // text rides as a single `.raw` leaf — so the recursive walk can't be driven deep by user data.
 indirect enum DocJSON {
     case string(String)
-    case int(Int)
     case bool(Bool)
     case array([DocJSON])
     case object([(String, DocJSON)])
@@ -118,7 +117,6 @@ indirect enum DocJSON {
     private func write(into out: inout String) {
         switch self {
             case .string(let value): DocJSON.escape(value, into: &out)
-            case .int(let value): out += String(value)
             case .bool(let value): out += value ? "true" : "false"
             case .raw(let value): out += value
             case .array(let items):
