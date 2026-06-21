@@ -490,13 +490,20 @@ private func joinPath(_ prefix: String, _ sub: String) -> String {
 }
 
 /// Trailing-slash-insensitive exact-path comparison — the acceptance oracle for the exact/WS/streaming
-/// binds. ADServe canonicalizes a trailing slash onto every request, so `/parts` and `/parts/` address
-/// the SAME route: in particular a scope-root route (the default `"/"` subpath inside `Scope("parts")`,
-/// which compiles to `"/parts/"`) is reachable as `/parts`. Both sides are compared with exactly one
-/// trailing slash appended (the process root `"/"` stays `"/"`); the segment trie is already
-/// slash-insensitive (`omittingEmptySubsequences`), so this just brings the oracle into line with it.
+/// binds. ADServe treats a trailing slash as canonical, so `/parts` and `/parts/` address the SAME route:
+/// in particular a scope-root route (the default `"/"` subpath inside `Scope("parts")`, which compiles to
+/// `"/parts/"`) is reachable as `/parts`. Both sides are compared with one trailing slash *trimmed* (the
+/// process root `"/"` is preserved); the segment trie is already slash-insensitive
+/// (`omittingEmptySubsequences`), so this just brings the oracle into line with it. **Allocation-free** —
+/// only zero-copy `Substring` slicing, so it adds nothing to `mallocCountTotal` on the hot routing path.
 private func pathMatchesExact(_ requestPath: Substring, _ routePath: String) -> Bool {
-    let normalizedRequest = requestPath.hasSuffix("/") ? String(requestPath) : String(requestPath) + "/"
-    let normalizedRoute = routePath.hasSuffix("/") ? routePath : routePath + "/"
-    return normalizedRequest == normalizedRoute
+    trimmedTrailingSlash(requestPath) == trimmedTrailingSlash(routePath[...])
+}
+
+/// `s` with a single trailing `/` removed, **except** a lone `"/"` (the process root) which is preserved.
+/// Returns a zero-copy slice — no allocation. O(1): inspects only the last element + one index step.
+private func trimmedTrailingSlash(_ s: Substring) -> Substring {
+    guard s.last == "/" else { return s }
+    let trimmed = s.dropLast()
+    return trimmed.isEmpty ? s : trimmed
 }
