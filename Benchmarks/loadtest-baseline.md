@@ -65,12 +65,39 @@ use it for a quick portable smoke, oha for real numbers.
   constrained container gets its CPU quota, not the host count), so it is safe by default; apps still pass an
   explicit `loopCount:` to pin it. Verified: out-of-box `swift run ADServeBench` now serves **86.1k** req/s
   (was ~72k), 273 tests green.
+- **FIXED — sub-MTU responses no longer on-the-fly-compressed** (`gzip_min_length`;
+  `HTTPServer.minimumCompressibleResponseBytes = 1400`). The Hummingbird comparison below surfaced it +
+  `sample` localized it: ADServe was building a gzip Huffman tree for a 13-byte body (the predicate gated on
+  MIME + not-206 but had no size floor). Skipping it recovered `/plaintext` from ~88k to **~99–106k** req/s.
+  Compressing a sub-MTU body never helps (one packet either way) and can enlarge it; large + streamed bodies
+  still compress. 274 tests green.
+
+## Comparison — vs Hummingbird 2.25 (the closest NIO peer)
+
+Same machine, same oha (`-z 5s -c 64`), routes byte-matched, each server benchmarked ALONE (never
+co-resident), default config both (≈core-count event loops). Caveat: this is **default vs default**, not
+feature-matched — Hummingbird's default is leaner (no built-in response compression / connection-limiter /
+idle-timeout), whereas ADServe ships those DoS defenses ON.
+
+| Route          | ADServe (before fix) | ADServe (after `gzip_min_length`) | Hummingbird |
+|----------------|---------------------:|----------------------------------:|------------:|
+| `/plaintext`   |                87.7k |                          ~99–106k |      117.5k |
+| `/json`        |                90.2k |                            ~90–98k |      116.9k |
+| `/users/{id}`  |                83.5k |                              ~90k |      113.6k |
+
+**Honest read:** ADServe is **not yet the fastest here** — Hummingbird leads. ~Half the original ~34% gap was
+ADServe compressing tiny bodies (now fixed → ~15% gap). The **residual ~15% is the core per-request path**
+(per-request active-count atomics + response materialization vs Hummingbird's leaner handler) — the next #1
+target. ADServe does hold a slightly better p99 tail (its safety machinery costs throughput but smooths tails).
 
 ## Caveats / next steps
 
 - **Co-located ceiling:** server + load generator share these 8 cores, so the multicore plateau is a machine
   artifact. The true server ceiling needs the load driven from a SEPARATE host.
-- **Comparative claim:** to substantiate "most performant," benchmark the same routes against
-  Hummingbird / Vapor under this identical harness. (Blocked here — SPM can't fetch new deps offline.)
+- **Comparative claim:** done vs Hummingbird (above) — ADServe trails by ~15% after the compression fix.
+  The network is NOT blocked for public deps (only private AD* repos need local paths), so a Vapor leg + a
+  feature-matched comparison (Hummingbird with the same DoS defenses on) are the next comparative steps.
+- **Close the residual gap (the live #1 target):** profile + trim the core per-request path — the per-request
+  active-request atomics, the response-head materialization/envelope merge — to reach Hummingbird's ~117k.
 - **Tails:** oha is open-loop, so its p99/p99.9 are sound; push `-q` (rate limiting) for latency-at-fixed-load
   curves if needed.
