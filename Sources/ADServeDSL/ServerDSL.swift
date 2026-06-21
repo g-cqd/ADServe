@@ -306,6 +306,24 @@ public func WS(_ subpath: String = "/", _ handler: @escaping WebSocketHandler) -
     }
 }
 
+/// A `WS` endpoint bound to a ``WebSocketHub`` topic: the connection AUTO-subscribes when the socket opens
+/// and AUTO-unsubscribes when it closes (or drops, or the server quiesces), collapsing the
+/// subscribe / hold-open / unsubscribe lifecycle into one line. The server pushes to every subscriber with
+/// `hub.broadcast(_:to:)` (typically fired from a mutation route). This is the server-push ("live updates")
+/// shape; inbound frames are not surfaced here — a typed inbound handler is a planned overload. Cleanup is
+/// awaited inline after the message stream ends (deterministic), not a fire-and-forget `defer`.
+///
+///     let hub = WebSocketHub()
+///     Channel("/ws/parts", on: hub, topic: "parts")            // clients subscribe to receive pushes
+///     // …from the mutation route:  Task { await hub.broadcast(partJSON, to: "parts") }
+public func Channel(_ subpath: String = "/", on hub: WebSocketHub, topic: String) -> RouteNode {
+    WS(subpath) { connection in
+        let token = await hub.subscribe(topic, connection)
+        for await _ in connection.messages {}  // hold the socket open until the peer closes / drops / quiesces
+        await hub.unsubscribe(token, from: topic)
+    }
+}
+
 /// A streaming-upload route: the handler is ASYNC and receives the body as a back-pressured
 /// `RequestBodyStream` (`input.bodyStream`) — for large uploads that must not buffer in memory. The
 /// route's own body cap does NOT apply (bound the body yourself, e.g. `try await input.bodyStream

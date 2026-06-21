@@ -742,3 +742,43 @@ private func staticSubpath(_ content: ResponseContent?) -> String? {
     if case .file(_, let subpath, _, _)? = content { return subpath }
     return nil
 }
+
+/// `Channel(_:on:topic:)` — the WS endpoint that auto-subscribes a connection to a `WebSocketHub` topic for
+/// the socket's lifetime. Verified structurally (it resolves as a WS route) and behaviourally (subscribe on
+/// open, unsubscribe on close) with a controllable inbound stream — deterministic, no sleeps.
+@Suite struct ChannelDSLTests {
+    /// A connection whose inbound stream the test finishes on demand; send/ping/close are no-ops.
+    private struct StreamConn: WebSocketConnection {
+        let messages: AsyncStream<WebSocketMessage>
+        func send(_ message: WebSocketMessage) async throws {}
+        func ping(_ data: [UInt8]) async throws {}
+        func close(code: WebSocketCloseCode) async throws {}
+    }
+
+    @Test func channelResolvesToAWebSocketRouteAtItsPath() {
+        let hub = WebSocketHub()
+        let routes = table { Channel("/ws/parts", on: hub, topic: "parts") }
+        #expect(routes.webSocketRoute(path: "/ws/parts") != nil)
+        #expect(routes.webSocketRoute(path: "/ws/other") == nil)
+    }
+
+    @Test func channelAutoSubscribesWhileOpenAndUnsubscribesOnClose() async {
+        let hub = WebSocketHub()
+        let routes = table { Channel("/ws/parts", on: hub, topic: "parts") }
+        guard let route = routes.webSocketRoute(path: "/ws/parts") else {
+            Issue.record("expected a WS route at /ws/parts")
+            return
+        }
+        var continuation: AsyncStream<WebSocketMessage>.Continuation!
+        let stream = AsyncStream<WebSocketMessage> { continuation = $0 }
+        let handlerTask = Task { await route.handler(StreamConn(messages: stream)) }
+
+        // The handler subscribes (await) then suspends on the stream; yield until that lands (no sleep).
+        while await hub.subscriberCount("parts") == 0 { await Task.yield() }
+        #expect(await hub.subscriberCount("parts") == 1)
+
+        continuation.finish()  // end the inbound stream → the handler loop exits → inline unsubscribe
+        await handlerTask.value
+        #expect(await hub.subscriberCount("parts") == 0)
+    }
+}
