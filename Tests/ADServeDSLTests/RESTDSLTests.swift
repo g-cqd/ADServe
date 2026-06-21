@@ -755,6 +755,12 @@ private func staticSubpath(_ content: ResponseContent?) -> String? {
         func close(code: WebSocketCloseCode) async throws {}
     }
 
+    private struct Ping: Codable, Equatable, Sendable { let n: Int }
+    private actor Sink {
+        private(set) var got: [Ping] = []
+        func add(_ ping: Ping) { got.append(ping) }
+    }
+
     @Test func channelResolvesToAWebSocketRouteAtItsPath() {
         let hub = WebSocketHub()
         let routes = table { Channel("/ws/parts", on: hub, topic: "parts") }
@@ -780,5 +786,29 @@ private func staticSubpath(_ content: ResponseContent?) -> String? {
         continuation.finish()  // end the inbound stream → the handler loop exits → inline unsubscribe
         await handlerTask.value
         #expect(await hub.subscriberCount("parts") == 0)
+    }
+
+    @Test func typedChannelDecodesInboundFramesAndSkipsGarbage() async {
+        let hub = WebSocketHub()
+        let sink = Sink()
+        let routes = table {
+            Channel("/ws/ping", on: hub, topic: "ping", receiving: Ping.self) { ping, _ in
+                await sink.add(ping)
+            }
+        }
+        guard let route = routes.webSocketRoute(path: "/ws/ping") else {
+            Issue.record("expected a WS route at /ws/ping")
+            return
+        }
+        var continuation: AsyncStream<WebSocketMessage>.Continuation!
+        let stream = AsyncStream<WebSocketMessage> { continuation = $0 }
+        let handlerTask = Task { await route.handler(StreamConn(messages: stream)) }
+        continuation.yield(.text(#"{"n":1}"#))  // decodes → delivered
+        continuation.yield(.text("not json"))  // garbage → skipped, not thrown
+        continuation.yield(.binary([1, 2, 3]))  // non-text → skipped
+        continuation.yield(.text(#"{"n":2}"#))  // decodes → delivered
+        continuation.finish()
+        await handlerTask.value
+        #expect(await sink.got == [Ping(n: 1), Ping(n: 2)])  // only the two valid frames, in order
     }
 }

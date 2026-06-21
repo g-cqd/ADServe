@@ -20,6 +20,7 @@
 //     }
 //   }
 
+import ADJSON
 public import ADServeCore
 import HTTPTypes
 
@@ -306,21 +307,56 @@ public func WS(_ subpath: String = "/", _ handler: @escaping WebSocketHandler) -
     }
 }
 
+/// Run `serve` with `connection` subscribed to `hub`'s `topic` for the call's duration, then unsubscribe —
+/// awaited inline after `serve` returns (deterministic cleanup on close/drop/quiesce), never a fire-and-
+/// forget `defer`. The shared lifecycle behind both `Channel` overloads.
+private func serveSubscribed(
+    _ connection: any WebSocketConnection, on hub: WebSocketHub, topic: String,
+    _ serve: (any WebSocketConnection) async -> Void
+) async {
+    let token = await hub.subscribe(topic, connection)
+    await serve(connection)
+    await hub.unsubscribe(token, from: topic)
+}
+
 /// A `WS` endpoint bound to a ``WebSocketHub`` topic: the connection AUTO-subscribes when the socket opens
 /// and AUTO-unsubscribes when it closes (or drops, or the server quiesces), collapsing the
 /// subscribe / hold-open / unsubscribe lifecycle into one line. The server pushes to every subscriber with
 /// `hub.broadcast(_:to:)` (typically fired from a mutation route). This is the server-push ("live updates")
-/// shape; inbound frames are not surfaced here — a typed inbound handler is a planned overload. Cleanup is
-/// awaited inline after the message stream ends (deterministic), not a fire-and-forget `defer`.
+/// shape; inbound frames are ignored — use the typed overload to react to them.
 ///
 ///     let hub = WebSocketHub()
 ///     Channel("/ws/parts", on: hub, topic: "parts")            // clients subscribe to receive pushes
 ///     // …from the mutation route:  Task { await hub.broadcast(partJSON, to: "parts") }
 public func Channel(_ subpath: String = "/", on hub: WebSocketHub, topic: String) -> RouteNode {
     WS(subpath) { connection in
-        let token = await hub.subscribe(topic, connection)
-        for await _ in connection.messages {}  // hold the socket open until the peer closes / drops / quiesces
-        await hub.unsubscribe(token, from: topic)
+        await serveSubscribed(connection, on: hub, topic: topic) { conn in
+            for await _ in conn.messages {}  // hold the socket open until the peer closes / drops / quiesces
+        }
+    }
+}
+
+/// The bidirectional ``Channel``: as the subscribe-only form, plus inbound text frames are decoded as
+/// `Inbound` (JSON, via ADJSON) and delivered to `onMessage` with the connection. Failure-safe — a non-text
+/// or undecodable frame is skipped, never thrown (a hostile peer can't tear the serve loop down). The server
+/// still pushes with `hub.broadcast(_:to:)`.
+///
+///     Channel("/ws/room", on: hub, topic: "room", receiving: ChatLine.self) { line, conn in
+///       await hub.broadcast(render(line), to: "room")          // re-broadcast to everyone
+///     }
+public func Channel<Inbound: Decodable & Sendable>(
+    _ subpath: String = "/", on hub: WebSocketHub, topic: String, receiving: Inbound.Type = Inbound.self,
+    _ onMessage: @escaping @Sendable (Inbound, any WebSocketConnection) async -> Void
+) -> RouteNode {
+    WS(subpath) { connection in
+        await serveSubscribed(connection, on: hub, topic: topic) { conn in
+            for await message in conn.messages {
+                guard case .text(let text) = message,
+                    let value = try? ADJSON.JSONDecoder().decode(Inbound.self, from: Array(text.utf8))
+                else { continue }  // skip a non-text / undecodable frame (failure-safe)
+                await onMessage(value, conn)
+            }
+        }
     }
 }
 
