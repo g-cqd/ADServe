@@ -56,6 +56,62 @@ extension WebSocketConnection {
 /// closes). A typical body is `for await message in conn.messages { try await conn.send(...) }`.
 public typealias WebSocketHandler = @Sendable (any WebSocketConnection) async -> Void
 
+/// A topic-keyed broadcast hub for live WebSocket fan-out — the server-push half of "an edit on one client
+/// appears on the others" (RFC-0008 Phase 2). A mutation route calls ``broadcast(_:to:)`` and every
+/// connection subscribed to that topic receives the frame. An `actor`, so concurrent
+/// subscribe/unsubscribe/broadcast can't race; each send is failure-isolated (a peer that just dropped never
+/// blocks the rest) and the sends run concurrently (no head-of-line blocking on a slow peer).
+///
+/// The author owns the lifecycle: ``subscribe(_:_:)`` when the socket opens, ``unsubscribe(_:from:)`` in a
+/// `defer` when the serve loop ends. (A handler that forgets to unsubscribe holds the reference until the
+/// next failed send; auto-pruning a connection on send failure is a planned refinement.)
+///
+///     let hub = WebSocketHub()
+///     WS("/ws/parts") { conn in
+///       let token = await hub.subscribe("parts", conn)
+///       defer { Task { await hub.unsubscribe(token, from: "parts") } }
+///       for await _ in conn.messages {}                 // hold the socket open
+///     }
+///     // …from the mutation route:  await hub.broadcast(partJSON, to: "parts")
+public actor WebSocketHub {
+    public init() {}
+
+    /// `topic` → (`token` → subscribed connection). Actor-isolated; mutated only on this executor.
+    private var topics: [String: [Int: any WebSocketConnection]] = [:]
+    /// Monotonic subscription token (wrapping; 2⁶³ subscriptions is unreachable, but `&+` never traps).
+    private var nextToken = 0
+
+    /// Subscribe `connection` to `topic`; returns the token to pass to ``unsubscribe(_:from:)`` on disconnect.
+    public func subscribe(_ topic: String, _ connection: any WebSocketConnection) -> Int {
+        let token = nextToken
+        nextToken &+= 1
+        topics[topic, default: [:]][token] = connection
+        return token
+    }
+
+    /// Remove a subscription (idempotent); drops the topic entry when its last subscriber leaves.
+    public func unsubscribe(_ token: Int, from topic: String) {
+        topics[topic]?.removeValue(forKey: token)
+        if topics[topic]?.isEmpty == true { topics.removeValue(forKey: topic) }
+    }
+
+    /// The live subscriber count on `topic` (for metrics/tests).
+    public func subscriberCount(_ topic: String) -> Int { topics[topic]?.count ?? 0 }
+
+    /// Broadcast `text` to every connection on `topic`, concurrently and failure-isolated. The subscriber
+    /// set is snapshotted before the sends, so a concurrent subscribe/unsubscribe can't invalidate the
+    /// in-flight fan-out.
+    public func broadcast(_ text: String, to topic: String) async {
+        let connections = Array(topics[topic, default: [:]].values)
+        guard !connections.isEmpty else { return }
+        await withTaskGroup(of: Void.self) { group in
+            for connection in connections {
+                group.addTask { try? await connection.sendText(text) }
+            }
+        }
+    }
+}
+
 /// A matched WebSocket route — the engine upgrades the request and runs `handler`. The DSL's `WS(_:)`
 /// lowers to this; `HTTPHandling.webSocketRoute(path:)` resolves it for the upgrade decision.
 public struct WebSocketRoute: Sendable {

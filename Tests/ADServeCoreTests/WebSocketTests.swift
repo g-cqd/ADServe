@@ -270,3 +270,72 @@ struct WebSocketStubRoutes: HTTPHandling {
         #expect(!webSocketOriginAllowed(origin: "https://app.com", host: nil))  // missing Host → reject
     }
 }
+
+/// `WebSocketHub` — the topic-keyed broadcast actor. A recording mock connection captures sent text; a
+/// failing mock proves a dropped peer never blocks the rest of the fan-out.
+@Suite struct WebSocketHubTests {
+    private actor RecordingConn: WebSocketConnection {
+        private(set) var sent: [String] = []
+        nonisolated var messages: AsyncStream<WebSocketMessage> { AsyncStream { $0.finish() } }
+        func send(_ message: WebSocketMessage) async throws {
+            if case .text(let text) = message { sent.append(text) }
+        }
+        func ping(_ data: [UInt8]) async throws {}
+        func close(code: WebSocketCloseCode) async throws {}
+    }
+
+    private actor FailingConn: WebSocketConnection {
+        struct Dropped: Error {}
+        nonisolated var messages: AsyncStream<WebSocketMessage> { AsyncStream { $0.finish() } }
+        func send(_ message: WebSocketMessage) async throws { throw Dropped() }
+        func ping(_ data: [UInt8]) async throws {}
+        func close(code: WebSocketCloseCode) async throws {}
+    }
+
+    @Test func broadcastReachesOnlyTheTopicSubscribers() async {
+        let hub = WebSocketHub()
+        let a = RecordingConn()
+        let b = RecordingConn()
+        let other = RecordingConn()
+        _ = await hub.subscribe("parts", a)
+        _ = await hub.subscribe("parts", b)
+        _ = await hub.subscribe("orders", other)
+        #expect(await hub.subscriberCount("parts") == 2)
+
+        await hub.broadcast(#"{"id":1}"#, to: "parts")
+        #expect(await a.sent == [#"{"id":1}"#])
+        #expect(await b.sent == [#"{"id":1}"#])
+        #expect(await other.sent.isEmpty)  // a different topic never receives
+    }
+
+    @Test func unsubscribeStopsDelivery() async {
+        let hub = WebSocketHub()
+        let a = RecordingConn()
+        let b = RecordingConn()
+        let tokenA = await hub.subscribe("parts", a)
+        _ = await hub.subscribe("parts", b)
+
+        await hub.unsubscribe(tokenA, from: "parts")
+        #expect(await hub.subscriberCount("parts") == 1)
+        await hub.broadcast("x", to: "parts")
+        #expect(await a.sent.isEmpty)  // unsubscribed before the broadcast
+        #expect(await b.sent == ["x"])
+        // Idempotent + drops the topic when empty.
+        await hub.unsubscribe(tokenA, from: "parts")  // no-op, no trap
+    }
+
+    @Test func broadcastIsFailureIsolated() async {
+        let hub = WebSocketHub()
+        let good = RecordingConn()
+        _ = await hub.subscribe("t", FailingConn())  // throws on send
+        _ = await hub.subscribe("t", good)
+        await hub.broadcast("payload", to: "t")
+        #expect(await good.sent == ["payload"])  // the failing peer did not block this one
+    }
+
+    @Test func broadcastToUnknownTopicIsANoOp() async {
+        let hub = WebSocketHub()
+        await hub.broadcast("nobody-home", to: "ghost")  // must not trap
+        #expect(await hub.subscriberCount("ghost") == 0)
+    }
+}
