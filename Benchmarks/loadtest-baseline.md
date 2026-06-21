@@ -72,23 +72,34 @@ use it for a quick portable smoke, oha for real numbers.
   Compressing a sub-MTU body never helps (one packet either way) and can enlarge it; large + streamed bodies
   still compress. 274 tests green.
 
-## Comparison — vs Hummingbird 2.25 (the closest NIO peer)
+## Cross-stack comparison (5-way)
 
 Same machine, same oha (`-z 5s -c 64`), routes byte-matched, each server benchmarked ALONE (never
-co-resident), default config both (≈core-count event loops). Caveat: this is **default vs default**, not
-feature-matched — Hummingbird's default is leaner (no built-in response compression / connection-limiter /
-idle-timeout), whereas ADServe ships those DoS defenses ON.
+co-resident, so each gets the full 8-core box), best-of-2. ADServe is run with the `gzip_min_length` fix.
 
-| Route          | ADServe (before fix) | ADServe (after `gzip_min_length`) | Hummingbird |
-|----------------|---------------------:|----------------------------------:|------------:|
-| `/plaintext`   |                87.7k |                          ~99–106k |      117.5k |
-| `/json`        |                90.2k |                            ~90–98k |      116.9k |
-| `/users/{id}`  |                83.5k |                              ~90k |      113.6k |
+| Server (stack)                | /plaintext | /json  | /users/{id} | p50      |
+|-------------------------------|-----------:|-------:|------------:|----------|
+| **Bun** (JS / Zig, `routes`)  | **203.8k** | 197.5k |      169.2k | 0.28 ms  |
+| **Go** `net/http` (Go)        |     162.9k | 155.7k |      156.4k | 0.33 ms  |
+| **Erlang** raw `gen_tcp` (BEAM)|    142.9k | 140.5k |      136.8k | 0.33 ms  |
+| **Hummingbird 2.25** (Swift/NIO)| 114.7k | 112.4k |      109.2k | 0.27 ms  |
+| **ADServe** (Swift/NIO)       |     102.4k | 100.5k |       95.5k | 0.36 ms  |
 
-**Honest read:** ADServe is **not yet the fastest here** — Hummingbird leads. ~Half the original ~34% gap was
-ADServe compressing tiny bodies (now fixed → ~15% gap). The **residual ~15% is the core per-request path**
-(per-request active-count atomics + response materialization vs Hummingbird's leaner handler) — the next #1
-target. ADServe does hold a slightly better p99 tail (its safety machinery costs throughput but smooths tails).
+**Honest read — ADServe is LAST of the five.** Ranking: Bun > Go > Erlang > Hummingbird > ADServe. Two
+distinct gaps:
+- **Within Swift/NIO:** ADServe trails Hummingbird by ~11% (`102k` vs `115k`). Same runtime, so this is purely
+  ADServe's heavier per-request path — the live, closeable #1 target (per-request active-count atomics +
+  response-head materialization/envelope merge vs HB's leaner handler).
+- **Cross-language:** Go / Erlang / Bun are 1.4–2.0× faster. Some is the comparison's shape (the Erlang server
+  is RAW `gen_tcp` pattern-matching with minimal headers, not a framework like Cowboy; Bun's `routes` is a
+  precompiled static fast path; Go's `net/http` is a decade-tuned stdlib), and some is real runtime cost —
+  Swift's ARC retain/release + the NIO `ChannelHandler` pipeline are heavier per request than goroutines / BEAM
+  processes / Bun's Zig core. Closing to Hummingbird is realistic; matching Bun/Go would need much deeper work
+  (or is a runtime ceiling).
+
+Reproduce: the four external servers are tiny (~15 lines each) — a Bun `Bun.serve({routes})`, a Go
+`net/http.ServeMux`, an Erlang `gen_tcp` listener with `{packet, http_bin}`, and the Hummingbird `Router`
+quickstart — all with the same `/plaintext` `/json` `/users/:id` `/health` routes.
 
 ## Caveats / next steps
 
