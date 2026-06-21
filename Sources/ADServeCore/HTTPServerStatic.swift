@@ -353,9 +353,13 @@ extension HTTPServer {
     // the local `Array` for the duration of the call and bounded by `count`, and `fd` is a plain `Int32`
     // (Sendable) opened/closed by the single owner (`writeFile`'s `.serve` case, via `defer`).
 
-    /// Open `path` read-only; `nil` on failure (e.g. the file vanished since the plan's stat).
+    /// Open `path` read-only; `nil` on failure (e.g. the file vanished since the plan's stat). `O_NOFOLLOW`
+    /// is defense-in-depth against a TOCTOU symlink swap: the plan only ever passes a symlink-RESOLVED,
+    /// jailed path (a real asset's final component is never a symlink, and a symlinked deploy root is already
+    /// resolved away), so only a final component that BECAME a symlink since the stat — an attacker racing a
+    /// planted link to escape the root — makes the open fail (ELOOP), collapsing the response to 404.
     static func openForReading(_ path: String) -> Int32? {
-        let fd = path.withCString { cString in unsafe open(cString, O_RDONLY) }
+        let fd = path.withCString { cString in unsafe open(cString, O_RDONLY | O_NOFOLLOW) }
         return fd >= 0 ? fd : nil
     }
 

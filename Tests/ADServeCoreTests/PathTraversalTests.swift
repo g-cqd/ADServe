@@ -351,4 +351,30 @@ import Testing
         #expect(response.hasPrefix("HTTP/1.1 404"))
         #expect(!response.contains("PREFIX-SIBLING-SECRET"))
     }
+
+    // MARK: - O_NOFOLLOW on the file open (TOCTOU symlink-swap defense)
+
+    @Test func openForReadingRefusesAFinalComponentSymlink() throws {
+        // `planStaticFile` only ever hands `openForReading` a symlink-RESOLVED, jailed path, so a real
+        // asset's final component is never a symlink — O_NOFOLLOW never rejects a legitimate file (a
+        // symlinked deploy root is resolved away before the open). But if that final component has BECOME a
+        // symlink between the plan's stat and the open — an attacker racing a planted link to read OUTSIDE
+        // the jailed root — O_NOFOLLOW makes the open fail (ELOOP) → the stream collapses to 404. This pins
+        // that open-time guard directly: a regular file opens; a symlink to it (even an in-tree, otherwise
+        // legitimate target) does not.
+        let dir = TemporaryDirectory(prefix: "adserve-nofollow")
+        defer { dir.cleanup() }
+        let real = dir.file("real.txt")
+        try Data("REAL-BYTES".utf8).write(to: URL(fileURLWithPath: real))
+        let link = dir.file("link.txt")
+        try FileManager.default.createSymbolicLink(atPath: link, withDestinationPath: real)
+
+        // A regular file opens cleanly.
+        let realFd = HTTPServer.openForReading(real)
+        #expect(realFd != nil)
+        if let fd = realFd { HTTPServer.closeDescriptor(fd) }
+
+        // A final-component symlink — even to the in-tree real file — is refused by O_NOFOLLOW.
+        #expect(HTTPServer.openForReading(link) == nil)
+    }
 }
