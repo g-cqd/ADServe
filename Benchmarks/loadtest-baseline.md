@@ -2,49 +2,74 @@
 
 End-to-end HTTP throughput + latency for the engine over a real socket — the live counterpart to the
 in-process `ADServeSuite` micro-benchmarks (which time pure routing under `swift package benchmark`).
-Captured with the runnable `ADServeBench` server (`Sources/ADServeBench/`) + the dep-free Bun load
-generator (`Benchmarks/loadtest.js`).
+Captured with the runnable `ADServeBench` server (`Sources/ADServeBench/`).
 
 ## Reproduce
 
 ```sh
-# 1. build + run the bench server (engine defaults: 2 event loops, full security envelope, keep-alive,
-#    idle-timeout + connection-limiter installed — i.e. a REAL server, not a toy)
-ADSERVE_DEV=1 swift run -c release --build-system native ADServeBench 18080
+# build + run the bench server. ADSERVE_BENCH_LOOPS tunes the event-loop count (the perf-critical knob;
+# the engine's HTTPServer default is 2). Set it to the core count for peak multicore throughput.
+ADSERVE_DEV=1 ADSERVE_BENCH_LOOPS=8 swift run -c release --build-system native ADServeBench 18080
 
-# 2. in another shell, drive load (closed-loop, fixed concurrency)
+# drive load — oha (Rust, open-loop, low client overhead → leaves cores for the server) is the primary
+# tool; the committed Benchmarks/loadtest.js (dep-free Bun) is the portable smoke check.
+oha -z 5s -c 64 --no-tui http://127.0.0.1:18080/plaintext
 bun Benchmarks/loadtest.js http://127.0.0.1:18080/plaintext 64 5000 1000
 ```
 
 ## Baseline — 2026-06-21
 
-Host: Apple Silicon, 8 logical cores (macOS / Darwin 25.5.0). Release build. Bun 1.3 client.
-Server config: engine defaults (`loopCount: 2`, `maxConnections: 8192`, response compression on, idle
-60 s). 64 concurrent connections, 4 s measured window after 0.8 s warmup.
+Host: Apple Silicon, 8 logical cores (macOS / Darwin 25.5.0). Release build. Server through the FULL engine
+(security envelope, keep-alive, idle timeout, connection limiter, response compression). Driver: oha 1.14,
+`/plaintext`, 4 s window.
 
-| Route          | req/s  | p50 (ms) | p90 (ms) | p99 (ms) | errors |
-|----------------|-------:|---------:|---------:|---------:|-------:|
-| `/json`        | 74,883 |    0.827 |    1.093 |    1.524 |      0 |
-| `/plaintext`   | 71,214 |    0.853 |    1.156 |    1.616 |      0 |
-| `/users/{id}`  | 68,247 |    0.892 |    1.174 |    1.780 |      0 |
+### Event-loop scaling (the architecture check), oha, 64 connections
 
-Concurrency sweep, `/plaintext` (req/s): c=16 → 62,093 · c=64 → 67,132 · c=128 → 65,859 · c=256 → 66,246.
+| `loopCount`         | req/s  | p50 (ms) | p99 (ms) |
+|---------------------|-------:|---------:|---------:|
+| 1                   | 36,685 |    1.739 |    2.412 |
+| 2 *(engine default)*| 72,605 |    0.828 |    1.476 |
+| 4                   | 81,271 |    0.673 |    1.936 |
+| 8                   | 85,122 |    0.529 |    4.614 |
+| 8 @ conc 128        | 86,415 |    1.087 |    8.682 |
+| 8 @ conc 256        | 85,791 |    2.253 |   16.609 |
 
-## Interpretation
+**1 → 2 loops scales near-linearly (36.7k → 72.6k)** — the accept/serve path parallelizes cleanly. 2 → 8
+shows diminishing returns that are a CO-LOCATED artifact: oha and the server share the same 8 cores, so past
+~half the cores the load generator and the server start competing. The ~86k plateau is this machine's
+combined server+client ceiling, not the server's.
 
-- **~70k req/s, sub-ms p50, p99 < 1.8 ms, zero errors** through the full engine path (routing + per-route
-  no-pool context + response framing + the constant envelope). Param routing (`/users/{id}`) costs only
-  ~9% over raw plaintext — the segment trie + one path capture are cheap.
-- **These are a client-limited LOWER BOUND, not the server's ceiling.** Throughput plateaus from c=16
-  onward (62k→67k across a 16× concurrency range), which is the signature of a saturated *load generator*,
-  not a saturated server (server p99 stays ~1.6 ms with plenty of headroom on only 2 event loops). A single
-  Bun process can't push harder; the server has more to give.
+### Per route, oha, `loopCount: 8`, 64 connections
+
+| Route          | req/s  | p50 (ms) | p99 (ms) | success |
+|----------------|-------:|---------:|---------:|--------:|
+| `/json`        | 89,329 |    0.509 |    4.225 | 100.00% |
+| `/plaintext`   | 87,634 |    0.534 |    3.861 | 100.00% |
+| `/users/{id}`  | 84,705 |    0.528 |    4.823 | 100.00% |
+
+Param routing costs only ~3% over raw plaintext — the segment trie + one path capture are nearly free.
+
+### Portable dep-free check (Bun `loadtest.js`, closed-loop, `loopCount: 2`)
+
+`/json` 74.9k · `/plaintext` 71.2k · `/users/{id}` 68.2k req/s, 0 errors, p99 < 1.8 ms. Lower than oha
+because the single-process JS client is itself CPU-bound (it caps near ~70k regardless of server loops);
+use it for a quick portable smoke, oha for real numbers.
+
+## Findings
+
+- **~85–89k req/s, sub-ms p50, p99 ~4 ms, 100% success** through the full engine on 8 loops — solid for a
+  real server (not a bare socket). Clean 1→2 loop scaling shows the design parallelizes.
+- **The engine's `HTTPServer` default `loopCount: 2` leaves ~17% throughput on the table** on an 8-core host
+  (72.6k vs 85–87k at 4–8 loops). An app that constructs `HTTPServer` without setting `loopCount` only uses 2
+  loops. Worth reconsidering whether the default should track `System.coreCount` (the NIO
+  `MultiThreadedEventLoopGroup` convention) — flagged as a follow-up, since a conservative default may be
+  deliberate for low-core/containerized targets.
 
 ## Caveats / next steps
 
-- **Coordinated omission:** the generator is closed-loop, so the measured tail (p99) is optimistic. For
-  rigorous tails, drive `ADServeBench` with an open-loop / constant-rate tool (`oha`, `wrk2`).
-- **Find the real ceiling:** run the load generator from multiple processes/hosts (or a faster tool) and
-  raise the server's `loopCount` toward the core count, to push past the single-client plateau.
-- **Comparative numbers:** to substantiate "most performant," benchmark the same routes against
-  Hummingbird / Vapor under the identical harness. Tracked as a follow-up.
+- **Co-located ceiling:** server + load generator share these 8 cores, so the multicore plateau is a machine
+  artifact. The true server ceiling needs the load driven from a SEPARATE host.
+- **Comparative claim:** to substantiate "most performant," benchmark the same routes against
+  Hummingbird / Vapor under this identical harness. (Blocked here — SPM can't fetch new deps offline.)
+- **Tails:** oha is open-loop, so its p99/p99.9 are sound; push `-q` (rate limiting) for latency-at-fixed-load
+  curves if needed.

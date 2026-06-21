@@ -27,6 +27,10 @@ let port =
 let threads =
     ProcessInfo.processInfo.environment["ADSERVE_BENCH_THREADS"].flatMap(Int.init)
     ?? ProcessInfo.processInfo.activeProcessorCount
+// Event loops (the perf-critical knob: one accept/serve loop per core is the NIO norm). Defaults to the
+// engine's own `HTTPServer` default of 2; override with ADSERVE_BENCH_LOOPS to measure multicore scaling.
+let loops =
+    ProcessInfo.processInfo.environment["ADSERVE_BENCH_LOOPS"].flatMap(Int.init) ?? 2
 
 var logger = Logger(label: "adserve-bench")
 // Suppress per-connection info logs so request logging can't skew throughput; the engine's "listening"
@@ -49,8 +53,10 @@ let apps = Server {
 
 let server = HTTPServer(
     listeners: listeners(apps, defaultPort: port),
-    pool: nil, envelope: HTTPFields(), logger: logger, threadCount: threads)
+    pool: nil, envelope: HTTPFields(), logger: logger, threadCount: threads, loopCount: loops)
 
 logger.logLevel = .info
-logger.info("adserve-bench starting", metadata: ["port": "\(port)", "threads": "\(threads)"])
+logger.info(
+    "adserve-bench starting",
+    metadata: ["port": "\(port)", "loops": "\(loops)", "threads": "\(threads)"])
 try await server.run()
