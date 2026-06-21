@@ -121,8 +121,16 @@ extension HTTPServer {
             let wsUpgrader = NIOTypedWebSocketServerUpgrader<EngineH1Result>(
                 maxFrameSize: 1 << 20,
                 shouldUpgrade: { channel, head in
+                    // Upgrade only a matched WS path AND a same-origin (or originless) handshake — the
+                    // CSWSH gate (`webSocketOriginAllowed`). A cross-origin `Origin` means another site is
+                    // opening a socket with the victim's ambient cookies; reject it (no upgrade → 426).
                     let matched = routes.webSocketRoute(path: head.uri.prefix { $0 != "?" }) != nil
-                    return channel.eventLoop.makeSucceededFuture(matched ? HTTPHeaders() : nil)
+                    let allowed =
+                        matched
+                        && webSocketOriginAllowed(
+                            origin: head.headers.first(name: "origin"),
+                            host: head.headers.first(name: "host"))
+                    return channel.eventLoop.makeSucceededFuture(allowed ? HTTPHeaders() : nil)
                 },
                 upgradePipelineHandler: { channel, head in
                     channel.eventLoop.makeCompletedFuture {

@@ -242,3 +242,31 @@ struct WebSocketStubRoutes: HTTPHandling {
         return try await promise.futureResult.get()
     }
 }
+
+/// The CSWSH gate (`webSocketOriginAllowed`) applied in the upgrader's `shouldUpgrade`: same-origin or
+/// originless handshakes upgrade; a cross-origin / malformed Origin is rejected before any socket opens.
+@Suite struct WebSocketOriginGateTests {
+    @Test func originlessHandshakeIsAllowed() {
+        // A non-browser client (CLI/native) sends no Origin → no ambient cookies → no CSWSH risk.
+        #expect(webSocketOriginAllowed(origin: nil, host: "app.com"))
+        #expect(webSocketOriginAllowed(origin: "", host: "app.com"))
+    }
+
+    @Test func sameOriginIsAllowed() {
+        #expect(webSocketOriginAllowed(origin: "https://app.com", host: "app.com"))
+        #expect(webSocketOriginAllowed(origin: "http://app.com:8080", host: "app.com:8080"))
+        #expect(webSocketOriginAllowed(origin: "https://APP.com", host: "app.com"))  // case-insensitive host
+    }
+
+    @Test func crossOriginIsRejected() {
+        #expect(!webSocketOriginAllowed(origin: "https://evil.com", host: "app.com"))  // the CSWSH attempt
+        #expect(!webSocketOriginAllowed(origin: "https://app.com.evil.com", host: "app.com"))  // suffix trick
+        #expect(!webSocketOriginAllowed(origin: "https://app.com:9999", host: "app.com:8080"))  // port mismatch
+    }
+
+    @Test func malformedOrNullOriginIsRejected() {
+        #expect(!webSocketOriginAllowed(origin: "null", host: "app.com"))  // sandboxed iframe / file://
+        #expect(!webSocketOriginAllowed(origin: "app.com", host: "app.com"))  // no scheme → malformed
+        #expect(!webSocketOriginAllowed(origin: "https://app.com", host: nil))  // missing Host → reject
+    }
+}

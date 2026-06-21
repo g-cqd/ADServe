@@ -63,6 +63,25 @@ public struct WebSocketRoute: Sendable {
     public init(handler: @escaping WebSocketHandler) { self.handler = handler }
 }
 
+/// The Cross-Site WebSocket Hijacking (CSWSH) gate, applied in the upgrader's `shouldUpgrade` before any
+/// socket opens. A browser ALWAYS sends `Origin` on a WebSocket handshake along with the target site's
+/// ambient cookies, so a cross-origin `Origin` means another site is opening an authenticated socket on the
+/// victim's behalf — the WebSocket analogue of CSRF, which CORS does NOT protect (the upgrade is not a
+/// CORS-gated request). Allow the upgrade only when:
+///   • `Origin` is ABSENT — a non-browser client (CLI, native, server-to-server): no ambient cookies, no
+///     CSWSH risk; or
+///   • `Origin`'s authority (host[:port]) equals the request `Host` — a same-origin page.
+/// A present-but-cross-origin or malformed/`null` Origin, or a missing `Host`, is rejected (no upgrade → the
+/// route's plain-GET path answers `426`). Pure + framework-agnostic so it unit-tests without a live socket.
+/// Secure-by-default and zero-config; a future per-route allowlist can widen it for legitimate cross-origin
+/// sockets. No recursion; O(origin length).
+func webSocketOriginAllowed(origin: String?, host: String?) -> Bool {
+    guard let origin, !origin.isEmpty else { return true }  // no Origin → non-browser client, no CSWSH risk
+    // A malformed/`null` Origin (no "://" authority) or a missing `Host` header is rejected.
+    guard let host, let schemeEnd = origin.firstRange(of: "://") else { return false }
+    return origin[schemeEnd.upperBound...].lowercased() == host.lowercased()
+}
+
 extension HTTPHandling {
     /// The WebSocket route for `path` (a `GET` carrying the `Upgrade: websocket` headers), or `nil` if the
     /// path is not a WebSocket endpoint. The engine calls this in the upgrader's `shouldUpgrade`. Resolves
