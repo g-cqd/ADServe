@@ -80,22 +80,20 @@ co-resident, so each gets the full 8-core box), best-of-2. ADServe is run with t
 | Server (stack)                | /plaintext | /json  | /users/{id} | p50      |
 |-------------------------------|-----------:|-------:|------------:|----------|
 | **Bun** (JS / Zig, `routes`)  | **203.8k** | 197.5k |      169.2k | 0.28 ms  |
+| **raw-swift** (no NIO, `Benchmarks/raw-spike`) | **196.8k** | 180.2k | 173.9k | 0.30 ms |
 | **Go** `net/http` (Go)        |     162.9k | 155.7k |      156.4k | 0.33 ms  |
 | **Erlang** raw `gen_tcp` (BEAM)|    142.9k | 140.5k |      136.8k | 0.33 ms  |
 | **Hummingbird 2.25** (Swift/NIO)| 114.7k | 112.4k |      109.2k | 0.27 ms  |
 | **ADServe** (Swift/NIO)       |     102.4k | 100.5k |       95.5k | 0.36 ms  |
 
-**Honest read — ADServe is LAST of the five.** Ranking: Bun > Go > Erlang > Hummingbird > ADServe. Two
-distinct gaps:
-- **Within Swift/NIO:** ADServe trails Hummingbird by ~11% (`102k` vs `115k`). Same runtime, so this is purely
-  ADServe's heavier per-request path — the live, closeable #1 target (per-request active-count atomics +
-  response-head materialization/envelope merge vs HB's leaner handler).
-- **Cross-language:** Go / Erlang / Bun are 1.4–2.0× faster. Some is the comparison's shape (the Erlang server
-  is RAW `gen_tcp` pattern-matching with minimal headers, not a framework like Cowboy; Bun's `routes` is a
-  precompiled static fast path; Go's `net/http` is a decade-tuned stdlib), and some is real runtime cost —
-  Swift's ARC retain/release + the NIO `ChannelHandler` pipeline are heavier per request than goroutines / BEAM
-  processes / Bun's Zig core. Closing to Hummingbird is realistic; matching Bun/Go would need much deeper work
-  (or is a runtime ceiling).
+**Headline — the bottleneck is SwiftNIO, not Swift.** A from-scratch raw-Darwin-socket Swift server
+(`Benchmarks/raw-spike`) hits **196.8k — ~2× NIO-ADServe and ~1.7× NIO-Hummingbird** — second overall, behind
+only Bun. Both NIO servers sit at the bottom; raw Swift vaults to the top. So Swift/ARC is *not* the floor: the
+NIO `ChannelHandler` pipeline is ~half the throughput on this micro-workload. (Caveat: tiny-response keep-alive
+is the BEST case for raw — TLS/HTTP-2/large bodies shrink the gap. And the spike has no TLS/robustness; see its
+README.) **Implication:** the path to "most performant" is a Darwin-only from-scratch transport (likely
+`Network.framework` for TLS + perf, or a kqueue reactor) under ADServe's existing HTTP/routing/security layer
+— not micro-tuning the NIO path (the per-request header A/B confirmed that's a dead end: 93.2k vs 93.7k, noise).
 
 Reproduce: the four external servers are tiny (~15 lines each) — a Bun `Bun.serve({routes})`, a Go
 `net/http.ServeMux`, an Erlang `gen_tcp` listener with `{packet, http_bin}`, and the Hummingbird `Router`
