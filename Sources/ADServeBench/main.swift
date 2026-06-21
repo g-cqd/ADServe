@@ -28,9 +28,10 @@ let threads =
     ProcessInfo.processInfo.environment["ADSERVE_BENCH_THREADS"].flatMap(Int.init)
     ?? ProcessInfo.processInfo.activeProcessorCount
 // Event loops (the perf-critical knob: one accept/serve loop per core is the NIO norm). Defaults to the
-// engine's own `HTTPServer` default of 2; override with ADSERVE_BENCH_LOOPS to measure multicore scaling.
+// engine's `HTTPServer.defaultLoopCount` (= System.coreCount); override with ADSERVE_BENCH_LOOPS to sweep.
 let loops =
-    ProcessInfo.processInfo.environment["ADSERVE_BENCH_LOOPS"].flatMap(Int.init) ?? 2
+    ProcessInfo.processInfo.environment["ADSERVE_BENCH_LOOPS"].flatMap(Int.init)
+    ?? HTTPServer.defaultLoopCount
 
 var logger = Logger(label: "adserve-bench")
 // Suppress per-connection info logs so request logging can't skew throughput; the engine's "listening"

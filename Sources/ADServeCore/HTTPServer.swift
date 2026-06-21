@@ -221,9 +221,17 @@ public struct HTTPServer: Sendable {
     /// `RLIMIT_NOFILE`; pass `maxConnections: 0` to disable the cap entirely.
     public static let defaultMaxConnections = 8192
 
+    /// The default event-loop count: one loop per available core (`System.coreCount`, which honors Linux
+    /// cgroup v1/v2 CPU quotas — a constrained container gets its quota, not the host's core count). This is
+    /// the NIO / swift-server convention, and what lets the accept/serve path scale across cores; the prior
+    /// hardcoded `2` left multicore throughput unused (~17% on an 8-core host, and more as cores grow). Pass
+    /// an explicit `loopCount:` to pin it (tests use `1` for determinism; a latency-isolated deployment may
+    /// want fewer). Evaluated once.
+    public static let defaultLoopCount = System.coreCount
+
     public init(
         listeners: [ListenerConfig], pool: AnyConnectionPool?, envelope: HTTPFields, logger: Logger,
-        threadCount: Int, loopCount: Int = 2, readiness: ServerReadiness? = nil,
+        threadCount: Int, loopCount: Int = HTTPServer.defaultLoopCount, readiness: ServerReadiness? = nil,
         transport: EngineTransport = .nio, middleware: [any HTTPMiddleware] = [],
         codec: ContentCodec = .json, maxBodyBytes: Int = 1_000_000, maxConcurrentSSE: Int = 1024,
         maxConnections: Int = HTTPServer.defaultMaxConnections, responseCompression: Bool = true,

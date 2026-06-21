@@ -7,9 +7,9 @@ Captured with the runnable `ADServeBench` server (`Sources/ADServeBench/`).
 ## Reproduce
 
 ```sh
-# build + run the bench server. ADSERVE_BENCH_LOOPS tunes the event-loop count (the perf-critical knob;
-# the engine's HTTPServer default is 2). Set it to the core count for peak multicore throughput.
-ADSERVE_DEV=1 ADSERVE_BENCH_LOOPS=8 swift run -c release --build-system native ADServeBench 18080
+# build + run the bench server. Event loops now default to HTTPServer.defaultLoopCount (= System.coreCount,
+# cgroup-aware) — peak multicore out of the box. ADSERVE_BENCH_LOOPS overrides it (e.g. to sweep scaling).
+ADSERVE_DEV=1 swift run -c release --build-system native ADServeBench 18080
 
 # drive load — oha (Rust, open-loop, low client overhead → leaves cores for the server) is the primary
 # tool; the committed Benchmarks/loadtest.js (dep-free Bun) is the portable smoke check.
@@ -59,11 +59,12 @@ use it for a quick portable smoke, oha for real numbers.
 
 - **~85–89k req/s, sub-ms p50, p99 ~4 ms, 100% success** through the full engine on 8 loops — solid for a
   real server (not a bare socket). Clean 1→2 loop scaling shows the design parallelizes.
-- **The engine's `HTTPServer` default `loopCount: 2` leaves ~17% throughput on the table** on an 8-core host
-  (72.6k vs 85–87k at 4–8 loops). An app that constructs `HTTPServer` without setting `loopCount` only uses 2
-  loops. Worth reconsidering whether the default should track `System.coreCount` (the NIO
-  `MultiThreadedEventLoopGroup` convention) — flagged as a follow-up, since a conservative default may be
-  deliberate for low-core/containerized targets.
+- **FIXED — `HTTPServer` now defaults `loopCount` to `System.coreCount`** (`defaultLoopCount`). This sweep is
+  what surfaced it: the prior hardcoded `2` left ~17% throughput unused on an 8-core host (72.6k vs 85–87k),
+  and far more as cores grow. `System.coreCount` is the NIO/swift-server convention and is cgroup-aware (a
+  constrained container gets its CPU quota, not the host count), so it is safe by default; apps still pass an
+  explicit `loopCount:` to pin it. Verified: out-of-box `swift run ADServeBench` now serves **86.1k** req/s
+  (was ~72k), 273 tests green.
 
 ## Caveats / next steps
 
