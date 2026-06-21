@@ -812,3 +812,24 @@ private func staticSubpath(_ content: ResponseContent?) -> String? {
         #expect(await sink.got == [Ping(n: 1), Ping(n: 2)])  // only the two valid frames, in order
     }
 }
+
+/// `App(cors:)` — the one-line, discoverable way to install a `CORS` middleware OUTERMOST (the cross-port
+/// `ctx.fetch` use case). Verified structurally: the sugar wires CORS as the first middleware, and it stays
+/// strictly opt-in.
+@Suite struct AppCORSSugarTests {
+    @Test func appCorsSugarInstallsCORSOutermostAndIsOptIn() {
+        let withCORS = Server {
+            App(pool: .none, cors: CORS(allowOrigin: "https://web.app")) {
+                GET("x", pool: .none) { _ in .plain(.ok, "ok") }
+            }
+        }
+        let middleware = withCORS[0].routes.first?.middleware
+        #expect(middleware?.first is CORS)  // present AND outermost — it owns the OPTIONS preflight
+        #expect((middleware?.first as? CORS)?.allowOrigin == "https://web.app")
+
+        let withoutCORS = Server {
+            App(pool: .none) { GET("x", pool: .none) { _ in .plain(.ok, "ok") } }
+        }
+        #expect(withoutCORS[0].routes.first?.middleware.contains { $0 is CORS } == false)  // opt-in only
+    }
+}

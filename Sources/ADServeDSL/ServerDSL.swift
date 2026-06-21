@@ -492,14 +492,21 @@ public struct Application: Sendable {
 /// An application served on a port. Omit `port` to bind the process default; give distinct
 /// ports for multiple `App`s under one `Server` (e.g. a TLS listener + the loopback listener).
 /// `protocol:` overrides the `Server`-level default `Wire` (HTTP version(s) × TLS).
+///
+/// `cors:` installs a ``CORS`` middleware OUTERMOST (so it owns the preflight before routing) — the one-line,
+/// discoverable way to allow a cross-origin caller, e.g. a sibling web app's components reaching this app's
+/// JSON API on another port (`App(port: apiPort, cors: CORS(allowOrigin: "https://web.app")) { … }`). It is
+/// exactly `middleware: [CORS(…)] + middleware`; reach for the `middleware:` array directly for finer control.
 public func App(
     port: Int? = nil, `protocol` wire: Wire? = nil, pool: PoolRef = .shared,
-    middleware: [any HTTPMiddleware] = [],
+    cors: CORS? = nil, middleware: [any HTTPMiddleware] = [],
     @RouteGroupBuilder _ routes: () -> [RouteNode]
 ) -> Application {
-    Application(
+    var stack = middleware
+    if let cors { stack.insert(cors, at: 0) }  // outermost: CORS must see the OPTIONS preflight before routing
+    return Application(
         port: port, wire: wire,
-        routes: routes().flatMap { $0.build(prefix: "", inheritedMiddleware: middleware) })
+        routes: routes().flatMap { $0.build(prefix: "", inheritedMiddleware: stack) })
 }
 
 @resultBuilder
