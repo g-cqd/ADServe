@@ -98,17 +98,34 @@ public actor WebSocketHub {
     /// The live subscriber count on `topic` (for metrics/tests).
     public func subscriberCount(_ topic: String) -> Int { topics[topic]?.count ?? 0 }
 
-    /// Broadcast `text` to every connection on `topic`, concurrently and failure-isolated. The subscriber
-    /// set is snapshotted before the sends, so a concurrent subscribe/unsubscribe can't invalidate the
-    /// in-flight fan-out.
+    /// Broadcast `text` to every connection on `topic`, concurrently and failure-isolated — then PRUNE any
+    /// subscriber whose send threw. That reclaims a half-open / dropped peer whose inbound stream hasn't
+    /// ended yet (so its `Channel` serve loop hasn't unsubscribed it), instead of re-attempting a doomed send
+    /// on every future broadcast. The subscriber set is snapshotted before the sends, so a concurrent
+    /// (un)subscribe can't invalidate the in-flight fan-out; the post-send prune is actor-isolated and
+    /// removes only the snapshot's failed tokens — monotonic tokens guarantee that can't drop a subscriber
+    /// that (re)joined during the await.
     public func broadcast(_ text: String, to topic: String) async {
-        let connections = Array(topics[topic, default: [:]].values)
-        guard !connections.isEmpty else { return }
-        await withTaskGroup(of: Void.self) { group in
-            for connection in connections {
-                group.addTask { try? await connection.sendText(text) }
+        let subscribers = topics[topic, default: [:]]  // snapshot of (token → connection)
+        guard !subscribers.isEmpty else { return }
+        let failedTokens = await withTaskGroup(of: Int?.self) { group -> [Int] in
+            for (token, connection) in subscribers {
+                group.addTask {
+                    do {
+                        try await connection.sendText(text)
+                        return nil
+                    } catch {
+                        return token  // this peer is gone — mark it for pruning
+                    }
+                }
             }
+            var dead: [Int] = []
+            for await failed in group where failed != nil { dead.append(failed!) }
+            return dead
         }
+        guard !failedTokens.isEmpty else { return }
+        for token in failedTokens { topics[topic]?.removeValue(forKey: token) }
+        if topics[topic]?.isEmpty == true { topics.removeValue(forKey: topic) }
     }
 }
 

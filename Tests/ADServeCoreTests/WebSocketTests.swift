@@ -338,4 +338,20 @@ struct WebSocketStubRoutes: HTTPHandling {
         await hub.broadcast("nobody-home", to: "ghost")  // must not trap
         #expect(await hub.subscriberCount("ghost") == 0)
     }
+
+    @Test func broadcastPrunesAConnectionThatFailedToSend() async {
+        let hub = WebSocketHub()
+        let good = RecordingConn()
+        _ = await hub.subscribe("t", FailingConn())  // a half-open / dropped peer: send throws
+        _ = await hub.subscribe("t", good)
+        #expect(await hub.subscriberCount("t") == 2)
+
+        await hub.broadcast("x", to: "t")
+        #expect(await good.sent == ["x"])  // the live peer received it…
+        #expect(await hub.subscriberCount("t") == 1)  // …and the dead peer was pruned on its failed send
+
+        await hub.broadcast("y", to: "t")  // a later broadcast no longer re-attempts the doomed send
+        #expect(await good.sent == ["x", "y"])
+        #expect(await hub.subscriberCount("t") == 1)
+    }
 }
