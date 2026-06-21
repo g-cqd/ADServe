@@ -91,9 +91,11 @@ co-resident, so each gets the full 8-core box), best-of-2. ADServe is run with t
 only Bun. Both NIO servers sit at the bottom; raw Swift vaults to the top. So Swift/ARC is *not* the floor: the
 NIO `ChannelHandler` pipeline is ~half the throughput on this micro-workload. (Caveat: tiny-response keep-alive
 is the BEST case for raw — TLS/HTTP-2/large bodies shrink the gap. And the spike has no TLS/robustness; see its
-README.) **Implication:** the path to "most performant" is a Darwin-only from-scratch transport (likely
-`Network.framework` for TLS + perf, or a kqueue reactor) under ADServe's existing HTTP/routing/security layer
-— not micro-tuning the NIO path (the per-request header A/B confirmed that's a dead end: 93.2k vs 93.7k, noise).
+README.) **Implication:** the path to "most performant" is a Darwin-only from-scratch transport on **raw
+sockets** under ADServe's existing HTTP/routing/security layer — NOT micro-tuning the NIO path (the per-request
+header A/B confirmed that's a dead end: 93.2k vs 93.7k, noise), and NOT `Network.framework` (tested + ruled out:
+**89.9k, slower than NIO** with 2.3× the latency — see `raw-spike/README.md`). TLS for the fast path comes from
+the fronting proxy (ADServe is proxy-fronted); the NIO engine stays for direct-TLS / HTTP-2.
 
 Reproduce: the four external servers are tiny (~15 lines each) — a Bun `Bun.serve({routes})`, a Go
 `net/http.ServeMux`, an Erlang `gen_tcp` listener with `{packet, http_bin}`, and the Hummingbird `Router`

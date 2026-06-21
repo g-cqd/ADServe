@@ -40,9 +40,30 @@ second overall, a hair behind Bun and ahead of Go/Erlang/everything else.
 - Thread-per-connection is fine for moderate connection counts; high-C10k scaling wants a kqueue reactor or
   `Network.framework`.
 
+## Network.framework: tested + RULED OUT (`server-networkframework.swift`)
+
+The obvious "production transport with TLS for free" is Apple's `Network.framework` (NWListener/NWConnection).
+Built + benchmarked it (per-connection serial queue, receive→route→send keep-alive). Result:
+
+| Server                         | /plaintext | p50     |
+|--------------------------------|-----------:|---------|
+| raw-swift (raw sockets)        |   178.1k   | 0.35 ms |
+| ADServe (NIO)                  |    97.6k   | 0.37 ms |
+| **nw-swift (Network.framework)**|   **89.9k**| **0.81 ms** |
+
+**Network.framework is SLOWER than NIO** (89.9k vs 97.6k) and **2.3× the latency** — half the raw-socket
+throughput. Its NWConnection / dispatch-queue model adds real per-request overhead. So the TLS-for-free path
+does NOT deliver the win; it's out.
+
 ## The path (Darwin-only — Linux is out of scope per the project)
 
-Replace NIO as ADServe's transport with a from-scratch Darwin engine — likely **`Network.framework`** (TLS +
-perf + connection mgmt for free) or a hand-rolled kqueue reactor — keeping ADServe's HTTP semantics (routing
-DSL, the security envelope, the response model, the path-traversal/static hardening, the 275 tests) on top.
-Phased + continuously benchmarked against this spike's ~197k ceiling.
+The fast transport is **raw sockets** (the spike), not Network.framework. TLS for the fast path comes from the
+**fronting proxy** — ADServe's canonical deployment is already proxy-fronted (Caddy terminates TLS + adds the
+`Date` header), so a raw *plaintext* HTTP/1.1 engine needs no in-process TLS for that case. Direct-TLS / HTTP-2
+deployments keep the existing NIO engine (a feature path, where the perf delta matters less).
+
+So: a from-scratch raw-Darwin engine as the **plaintext fast path**, the NIO engine retained for TLS/HTTP-2,
+both under ADServe's HTTP semantics (routing DSL, security envelope, response model, path-traversal/static
+hardening, the 275 tests). Production-grade means a robust parser + limits/timeouts/backpressure + likely a
+**kqueue reactor** (rather than thread-per-connection) for connection scaling. Phased + continuously
+benchmarked against this spike's ~178–197k ceiling.
