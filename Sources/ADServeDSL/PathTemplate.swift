@@ -85,11 +85,18 @@ public struct PathTemplate: Sendable {
     }
 
     /// Percent-decode one path segment (RFC 3986 via `ADFCore.PercentCoding`), rejecting malformed
-    /// escapes and traversal/separator smuggling (`.`, `..`, or a decoded `/`).
+    /// escapes, traversal/separator smuggling (`.`, `..`, or a decoded `/`), and NUL / C0 / DEL control
+    /// bytes. The control-byte guard is defense-in-depth against a smuggled NUL (`%00`): a path segment
+    /// never legitimately contains one, and a NUL can TRUNCATE the path at the `open()` syscall — serving a
+    /// different file than the extension allow-list checked on the pre-NUL bytes. Rejecting it here (on the
+    /// decoded bytes, not via Foundation's escaping) closes the bypass platform-independently.
     static func decodeSegment(_ segment: Substring) -> String? {
         guard let bytes = PercentCoding.decode(Array(segment.utf8)) else { return nil }
         let decoded = String(decoding: bytes, as: UTF8.self)
         if decoded == "." || decoded == ".." || decoded.contains("/") { return nil }
+        for scalar in decoded.unicodeScalars where scalar.value < 0x20 || scalar.value == 0x7f {
+            return nil
+        }
         return decoded
     }
 }

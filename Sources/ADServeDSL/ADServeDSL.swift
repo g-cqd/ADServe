@@ -1,5 +1,5 @@
 // ADServeDSL — the engine-facing route types + handler contexts. The DSL
-// SURFACE (`Server`/`App`/`Group`/`GET`…) lives in ServerDSL.swift; this file holds what the
+// SURFACE (`Server`/`App`/`Scope`/`GET`…) lives in ServerDSL.swift; this file holds what the
 // surface lowers TO: the `@dynamicMemberLookup` handler contexts (the connection is only
 // reachable on a `.shared` (storage) context — compile-time enforced), the `CompiledRoute`
 // the engine dispatches, and the `RouteTable` (`HTTPHandling`) it dispatches against. The
@@ -133,7 +133,7 @@ public struct CompiledRoute: Sendable {
     let needsStorage: Bool
     let cache: CachePolicy
     let exactPath: String?
-    /// Group + route middleware wrapping this route's handler (outermost first). Empty for most routes.
+    /// Scope + route middleware wrapping this route's handler (outermost first). Empty for most routes.
     let middleware: [any HTTPMiddleware]
     /// A per-route request-body ceiling (bytes), or `nil` for the server default.
     let maxBodyBytes: Int?

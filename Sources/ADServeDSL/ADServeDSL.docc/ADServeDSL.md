@@ -11,7 +11,7 @@ A server definition reads as a tree and lowers to the engine's route table:
 Server {
   App(pool: .shared) {
     GET("search") { ctx in .json(Cascade.search(ctx.db, …), as: .jsonRaw) }
-    Group("api") {
+    Scope("api") {
       GET("filters") { ctx in .json(WebRoutes.filters(ctx.db), as: .json) }.cache(.apiCorpus)
     }
     POST("mcp") { ctx in handleMCPPost(ctx, dispatcher: dispatcher) }.cache(.noStore)
@@ -38,7 +38,7 @@ applied by the engine.
 - ``GET(_:pool:_:)``
 - ``POST(_:pool:_:)``
 - ``OPTIONS(_:pool:_:)``
-- ``Group(_:_:)``
+- ``Scope(_:_:)``
 - ``RouteNode``
 - ``RouteTable``
 

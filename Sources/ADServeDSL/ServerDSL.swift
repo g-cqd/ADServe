@@ -10,11 +10,11 @@
 //   Server {
 //     App(pool: .shared) {                        // an application on a port; the central shared pool
 //       GET("search") { ctx in .json(…, as: .jsonRaw) }
-//       Group("api") {                            // → /api/*
+//       Scope("api") {                            // → /api/*
 //         GET("filters") { ctx in .json(WebRoutes.filters(ctx.db)) }.cache(.apiCorpus)
-//         Group("symbols") { GET("index.json") { ctx in … }.etag }
+//         Scope("symbols") { GET("index.json") { ctx in … }.etag }
 //       }
-//       Group("discovery", pool: .none) {         // no ctx.db in here (compile-enforced)
+//       Scope("discovery", pool: .none) {         // no ctx.db in here (compile-enforced)
 //         GET("robots.txt") { ctx in .text(Discovery.robotsTxt(cfg), as: .text) }.cache(.discovery, etag: true)
 //       }
 //     }
@@ -51,7 +51,7 @@ extension PoolScope where Self == NoPool { public static var none: NoPool { NoPo
 
 // MARK: - The definition tree
 
-/// A node in the definition tree — a leaf route or a path `Group`. Lowers to
+/// A node in the definition tree — a leaf route or a path `Scope`. Lowers to
 /// `[CompiledRoute]` given an accumulated path prefix.
 public struct RouteNode: Sendable {
     var cache: CachePolicy
@@ -62,7 +62,7 @@ public struct RouteNode: Sendable {
         @Sendable (_ prefix: String, _ cache: CachePolicy, _ middleware: [any HTTPMiddleware]) ->
             [CompiledRoute]
 
-    /// Set the route's cache policy (`Cache-Control` + ETag). No-op on a `Group`.
+    /// Set the route's cache policy (`Cache-Control` + ETag). No-op on a `Scope`.
     public func cache(_ policy: CachePolicy) -> RouteNode {
         var copy = self
         copy.cache = policy
@@ -79,7 +79,7 @@ public struct RouteNode: Sendable {
         return copy
     }
 
-    /// Wrap this route — or, on a `Group`, every route inside it — with middleware (outermost first).
+    /// Wrap this route — or, on a `Scope`, every route inside it — with middleware (outermost first).
     public func middleware(_ middleware: any HTTPMiddleware...) -> RouteNode {
         var copy = self
         copy.middleware += middleware
@@ -87,7 +87,7 @@ public struct RouteNode: Sendable {
     }
 
     /// Set this route's request-body ceiling to `bytes` (a 413 before the handler runs) — *higher* than
-    /// the server default for an upload endpoint, or *lower* for a tighter bound. On a `Group`, applies
+    /// the server default for an upload endpoint, or *lower* for a tighter bound. On a `Scope`, applies
     /// to every route inside that doesn't set its own.
     public func maxBody(_ bytes: Int) -> RouteNode {
         var copy = self
@@ -121,13 +121,21 @@ public enum RouteGroupBuilder {
     public static func buildEither(second: [RouteNode]) -> [RouteNode] { second }
 }
 
-/// A path-prefix group; composes its prefix into the children's paths. Nestable.
-public func Group(_ prefix: String, @RouteGroupBuilder _ children: () -> [RouteNode]) -> RouteNode {
+/// A path-prefix scope; composes its prefix into the children's paths. Nestable — `Scope("api") {
+/// Scope("v1") { GET … } }` mounts the children under `/api/v1`.
+public func Scope(_ prefix: String, @RouteGroupBuilder _ children: () -> [RouteNode]) -> RouteNode {
     let nodes = children()
-    return RouteNode(cache: .unset) { parentPrefix, _, groupMiddleware in
-        let groupPrefix = joinPath(parentPrefix, prefix)
-        return nodes.flatMap { $0.build(prefix: groupPrefix, inheritedMiddleware: groupMiddleware) }
+    return RouteNode(cache: .unset) { parentPrefix, _, scopeMiddleware in
+        let scopePrefix = joinPath(parentPrefix, prefix)
+        return nodes.flatMap { $0.build(prefix: scopePrefix, inheritedMiddleware: scopeMiddleware) }
     }
+}
+
+/// The former spelling of ``Scope(_:_:)`` — kept as a deprecated alias so existing route trees keep
+/// compiling. Prefer `Scope` (Rails-style path scoping).
+@available(*, deprecated, renamed: "Scope(_:_:)")
+public func Group(_ prefix: String, @RouteGroupBuilder _ children: () -> [RouteNode]) -> RouteNode {
+    Scope(prefix, children)
 }
 
 // MARK: - Static assets
@@ -140,6 +148,12 @@ public func Group(_ prefix: String, @RouteGroupBuilder _ children: () -> [RouteN
 /// allow-list (so source files, `.env`, etc. are never served), and stamps the `cache` policy
 /// (`.immutable` by default — pair it with content-hashed filenames). SRI hashing stays in
 /// ADHTML/`ADHTMLSRI`; ADServe just serves the bytes.
+///
+/// - Important: `root` is a TRUST BOUNDARY. The request path can never escape it (`..`, encoded
+///   separators, NUL, and symlinks are all rejected), but EVERY regular file *inside* `root` whose
+///   extension is on the servable allow-list (`.css`, `.js`, `.json`, `.svg`, `.txt`, …) is publicly
+///   readable. Point `root` ONLY at a directory that contains exclusively public assets — never a project
+///   root, a config/secrets directory, or a path that climbs out of the app (`../../…`).
 public func Static(
     _ mountPath: String, root: String, index: String? = "index.html", cache: CachePolicy = .immutable
 ) -> RouteNode {
@@ -209,58 +223,65 @@ let staticServableExtensions: Set<String> = [
 // verbs default to the shared pool (`ctx.db`); `OPTIONS` defaults to no pool.
 
 public func GET<P: PoolScope>(
-    _ subpath: String, pool: P = SharedPool(), _ handler: @escaping @Sendable (P.Context) throws -> ResponseContent
+    _ subpath: String = "/", pool: P = SharedPool(),
+    _ handler: @escaping @Sendable (P.Context) throws -> ResponseContent
 ) -> RouteNode { exactRoute(.get, subpath, pool: pool, handler) }
 public func GET<P: PoolScope>(
-    _ template: String, pool: P = SharedPool(),
+    _ template: String = "/", pool: P = SharedPool(),
     _ handler: @escaping @Sendable (P.Context, PathParameters) throws -> ResponseContent
 ) -> RouteNode { templateRoute(.get, template, pool: pool, handler) }
 
 public func POST<P: PoolScope>(
-    _ subpath: String, pool: P = SharedPool(), _ handler: @escaping @Sendable (P.Context) throws -> ResponseContent
+    _ subpath: String = "/", pool: P = SharedPool(),
+    _ handler: @escaping @Sendable (P.Context) throws -> ResponseContent
 ) -> RouteNode { exactRoute(.post, subpath, pool: pool, handler) }
 public func POST<P: PoolScope>(
-    _ template: String, pool: P = SharedPool(),
+    _ template: String = "/", pool: P = SharedPool(),
     _ handler: @escaping @Sendable (P.Context, PathParameters) throws -> ResponseContent
 ) -> RouteNode { templateRoute(.post, template, pool: pool, handler) }
 
 public func PUT<P: PoolScope>(
-    _ subpath: String, pool: P = SharedPool(), _ handler: @escaping @Sendable (P.Context) throws -> ResponseContent
+    _ subpath: String = "/", pool: P = SharedPool(),
+    _ handler: @escaping @Sendable (P.Context) throws -> ResponseContent
 ) -> RouteNode { exactRoute(.put, subpath, pool: pool, handler) }
 public func PUT<P: PoolScope>(
-    _ template: String, pool: P = SharedPool(),
+    _ template: String = "/", pool: P = SharedPool(),
     _ handler: @escaping @Sendable (P.Context, PathParameters) throws -> ResponseContent
 ) -> RouteNode { templateRoute(.put, template, pool: pool, handler) }
 
 public func PATCH<P: PoolScope>(
-    _ subpath: String, pool: P = SharedPool(), _ handler: @escaping @Sendable (P.Context) throws -> ResponseContent
+    _ subpath: String = "/", pool: P = SharedPool(),
+    _ handler: @escaping @Sendable (P.Context) throws -> ResponseContent
 ) -> RouteNode { exactRoute(.patch, subpath, pool: pool, handler) }
 public func PATCH<P: PoolScope>(
-    _ template: String, pool: P = SharedPool(),
+    _ template: String = "/", pool: P = SharedPool(),
     _ handler: @escaping @Sendable (P.Context, PathParameters) throws -> ResponseContent
 ) -> RouteNode { templateRoute(.patch, template, pool: pool, handler) }
 
 public func DELETE<P: PoolScope>(
-    _ subpath: String, pool: P = SharedPool(), _ handler: @escaping @Sendable (P.Context) throws -> ResponseContent
+    _ subpath: String = "/", pool: P = SharedPool(),
+    _ handler: @escaping @Sendable (P.Context) throws -> ResponseContent
 ) -> RouteNode { exactRoute(.delete, subpath, pool: pool, handler) }
 public func DELETE<P: PoolScope>(
-    _ template: String, pool: P = SharedPool(),
+    _ template: String = "/", pool: P = SharedPool(),
     _ handler: @escaping @Sendable (P.Context, PathParameters) throws -> ResponseContent
 ) -> RouteNode { templateRoute(.delete, template, pool: pool, handler) }
 
 public func HEAD<P: PoolScope>(
-    _ subpath: String, pool: P = SharedPool(), _ handler: @escaping @Sendable (P.Context) throws -> ResponseContent
+    _ subpath: String = "/", pool: P = SharedPool(),
+    _ handler: @escaping @Sendable (P.Context) throws -> ResponseContent
 ) -> RouteNode { exactRoute(.head, subpath, pool: pool, handler) }
 public func HEAD<P: PoolScope>(
-    _ template: String, pool: P = SharedPool(),
+    _ template: String = "/", pool: P = SharedPool(),
     _ handler: @escaping @Sendable (P.Context, PathParameters) throws -> ResponseContent
 ) -> RouteNode { templateRoute(.head, template, pool: pool, handler) }
 
 public func OPTIONS<P: PoolScope>(
-    _ subpath: String, pool: P = NoPool(), _ handler: @escaping @Sendable (P.Context) throws -> ResponseContent
+    _ subpath: String = "/", pool: P = NoPool(),
+    _ handler: @escaping @Sendable (P.Context) throws -> ResponseContent
 ) -> RouteNode { exactRoute(.options, subpath, pool: pool, handler) }
 public func OPTIONS<P: PoolScope>(
-    _ template: String, pool: P = NoPool(),
+    _ template: String = "/", pool: P = NoPool(),
     _ handler: @escaping @Sendable (P.Context, PathParameters) throws -> ResponseContent
 ) -> RouteNode { templateRoute(.options, template, pool: pool, handler) }
 
@@ -269,13 +290,13 @@ public func OPTIONS<P: PoolScope>(
 /// Upgrade Required`. WebSocket-over-TLS (wss direct) is not wired; terminate TLS at the proxy.
 ///
 ///   WS("chat") { conn in for await message in conn.messages { try? await conn.send(message) } }
-public func WS(_ subpath: String, _ handler: @escaping WebSocketHandler) -> RouteNode {
+public func WS(_ subpath: String = "/", _ handler: @escaping WebSocketHandler) -> RouteNode {
     precondition(
         !subpath.contains("{"), "ADServe: a WS route path '\(subpath)' cannot contain a path parameter")
     return RouteNode(cache: .unset) { prefix, cache, middleware in
         let full = joinPath(prefix, subpath)
         let bind: @Sendable (Substring) -> (@Sendable (HandlerInput) throws -> ResponseContent)? = { path in
-            path == full[...] ? { @Sendable _ in webSocketUpgradeRequired() } : nil
+            pathMatchesExact(path, full) ? { @Sendable _ in webSocketUpgradeRequired() } : nil
         }
         return [
             CompiledRoute(
@@ -305,7 +326,7 @@ public func Stream(_ subpath: String, _ handler: @escaping StreamingRequestHandl
         let bind: @Sendable (Substring) -> (@Sendable (HandlerInput) throws -> ResponseContent)? = { path in
             // Placeholder: the engine takes the streaming path when `streamingRun` is set, so `run` is
             // never invoked for a matched streaming request.
-            path == full[...] ? { @Sendable _ in .plain(.internalServerError, "streaming route\n") } : nil
+            pathMatchesExact(path, full) ? { @Sendable _ in .plain(.internalServerError, "streaming route\n") } : nil
         }
         return [
             CompiledRoute(
@@ -327,7 +348,7 @@ private func webSocketUpgradeRequired() -> ResponseContent {
 }
 
 /// `GET` with an opaque typed-capture matcher — for irregular path grammars. Matched against the
-/// full request path, so the enclosing `Group` prefix does not apply.
+/// full request path, so the enclosing `Scope` prefix does not apply.
 public func GET<P: PoolScope, Captures: Sendable>(
     match: @escaping @Sendable (Substring) -> Captures?, pool: P = SharedPool(),
     _ handler: @escaping @Sendable (P.Context, Captures) throws -> ResponseContent
@@ -350,7 +371,7 @@ private func exactRoute<P: PoolScope>(
     return RouteNode(cache: .unset) { prefix, cache, middleware in
         let full = joinPath(prefix, subpath)
         let bind: @Sendable (Substring) -> (@Sendable (HandlerInput) throws -> ResponseContent)? = {
-            $0 == full[...] ? run : nil
+            pathMatchesExact($0, full) ? run : nil
         }
         return [
             CompiledRoute(
@@ -460,8 +481,22 @@ public func listeners(
 
 // MARK: - helpers
 
-/// `joinPath("", "search") → "/search"`; `joinPath("/api", "filters") → "/api/filters"`.
+/// `joinPath("", "search") → "/search"`; `joinPath("/api", "filters") → "/api/filters"`. A scope-root
+/// route (the default `"/"` subpath inside `Scope("parts")`) composes to `"/parts/"`; the trailing slash
+/// is canonicalized away at match time by ``pathMatchesExact(_:_:)``, so it is reachable as `/parts` too.
 private func joinPath(_ prefix: String, _ sub: String) -> String {
     let suffix = sub.hasPrefix("/") ? String(sub.dropFirst()) : sub
     return prefix + "/" + suffix
+}
+
+/// Trailing-slash-insensitive exact-path comparison — the acceptance oracle for the exact/WS/streaming
+/// binds. ADServe canonicalizes a trailing slash onto every request, so `/parts` and `/parts/` address
+/// the SAME route: in particular a scope-root route (the default `"/"` subpath inside `Scope("parts")`,
+/// which compiles to `"/parts/"`) is reachable as `/parts`. Both sides are compared with exactly one
+/// trailing slash appended (the process root `"/"` stays `"/"`); the segment trie is already
+/// slash-insensitive (`omittingEmptySubsequences`), so this just brings the oracle into line with it.
+private func pathMatchesExact(_ requestPath: Substring, _ routePath: String) -> Bool {
+    let normalizedRequest = requestPath.hasSuffix("/") ? String(requestPath) : String(requestPath) + "/"
+    let normalizedRoute = routePath.hasSuffix("/") ? routePath : routePath + "/"
+    return normalizedRequest == normalizedRoute
 }

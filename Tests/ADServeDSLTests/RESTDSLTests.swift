@@ -69,6 +69,17 @@ struct PathTemplateTests {
     }
 
     @Test
+    func `rejects NUL and control bytes (open() truncation guard)`() {
+        // A smuggled NUL can truncate the path at open(), serving a different file than the extension
+        // allow-list checked — so `decodeSegment` rejects any C0/DEL byte, on the decoded bytes.
+        #expect(PathTemplate("items/{id}").match("/items/passwd%00.css") == nil)  // NUL truncation attempt
+        #expect(PathTemplate("items/{id}").match("/items/%00") == nil)  // bare encoded NUL
+        #expect(PathTemplate("files/{rest*}").match("/files/a/%09/b") == nil)  // TAB (C0) in catch-all
+        #expect(PathTemplate("items/{id}").match("/items/x%7fy") == nil)  // DEL (0x7f)
+        #expect(PathTemplate("items/{id}").match("/items/normal.css")?.id == "normal.css")  // unaffected
+    }
+
+    @Test
     func `pathHasTraversal flags literal dot-segments`() {
         #expect(pathHasTraversal("/a/../b"[...]))
         #expect(pathHasTraversal("/a/./b"[...]))
@@ -95,9 +106,9 @@ struct RESTRoutingTests {
     }
 
     @Test
-    func `Group prefix composes with typed templates`() {
+    func `Scope prefix composes with typed templates`() {
         let routes = table {
-            Group("api/v1") {
+            Scope("api/v1") {
                 GET("items/{id}", pool: .none) { _, params in .plain(.ok, params.id ?? "?") }
             }
         }
@@ -428,7 +439,7 @@ struct BodyLimitTests {
     func `.maxBody surfaces on the matched route; a group default applies; an inner route wins`() {
         let routes = table {
             POST("upload", pool: .none) { _ in .noContent }.maxBody(10)
-            Group("admin") {
+            Scope("admin") {
                 POST("small", pool: .none) { _ in .noContent }  // inherits the group's 100
                 POST("tiny", pool: .none) { _ in .noContent }.maxBody(5)  // own 5 wins over the group
             }
@@ -698,8 +709,8 @@ struct WebSocketDSLTests {
     }
 
     @Test
-    func `WS routes nest under a Group prefix`() {
-        let routes = table { Group("api") { WS("socket") { _ in } } }
+    func `WS routes nest under a Scope prefix`() {
+        let routes = table { Scope("api") { WS("socket") { _ in } } }
         #expect(routes.webSocketRoute(path: "/api/socket") != nil)
         #expect(routes.webSocketRoute(path: "/socket") == nil)
     }
@@ -715,8 +726,8 @@ struct StreamingDSLTests {
     }
 
     @Test
-    func `Stream routes nest under a Group prefix`() {
-        let routes = table { Group("api") { Stream("upload") { _ in .plain(.ok, "ok") } } }
+    func `Stream routes nest under a Scope prefix`() {
+        let routes = table { Scope("api") { Stream("upload") { _ in .plain(.ok, "ok") } } }
         #expect(routes.streamingHandler(method: .post, path: "/api/upload") != nil)
         #expect(routes.streamingHandler(method: .post, path: "/upload") == nil)
     }
