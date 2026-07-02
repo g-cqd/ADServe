@@ -1,4 +1,4 @@
-// Streaming request bodies (M6): a route variant whose handler is ASYNC and receives the inbound
+// Streaming request bodies: a route variant whose handler is ASYNC and receives the inbound
 // body as an incremental `AsyncSequence` of byte chunks — for large uploads that must not
 // materialize in memory. The engine resolves the streaming opt-in at the request HEAD (via the
 // `RouteResolver` seam) and delivers the body as it arrives off the wire, draining it to completion
