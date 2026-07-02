@@ -1,8 +1,8 @@
 // swift-tools-version: 6.4
 import PackageDescription
 
-// ADServe — a reusable, **persistence-agnostic** HTTP/2 + TLS server engine and a result-builder
-// route DSL, extracted from the apple-docs `ad-server`. The engine (`ADServeCore`) pools
+// ADServe — a reusable, **persistence-agnostic** HTTP/1.1+2 + TLS server engine and a result-builder
+// route DSL over the in-house `HTTP` package (SwiftNIO-free). The engine (`ADServeCore`) pools
 // `any PooledResource` through a type-erased `AnyConnectionPool`, so it depends on NO storage
 // package — an application pins the concrete connection type at its composition root. `ADServeCore`
 // also carries the in-house Model Context Protocol (MCP) JSON-RPC core; `ADServeDSL` adds the
@@ -56,11 +56,10 @@ let adfoundationDependency: Package.Dependency = {
     }
     return .package(url: "https://github.com/g-cqd/ADFoundation.git", branch: "main")
 }()
-// HTTP — the from-scratch, SwiftNIO-free HTTP/1.1·2·3 stack ADServe is re-basing onto (the engine,
+// HTTP — the from-scratch, SwiftNIO-free HTTP/1.1·2·3 stack ADServe runs on (the engine,
 // transport backbones, sans-I/O protocol engines, and the commodity middleware). Same env→URL shape
 // as the other first-party deps: override with HTTP_PATH for a local checkout, else resolve the
-// published repo. Wired in alongside NIO during the strangler migration; NIO is removed once the
-// engine swap + currency-type migration land.
+// published repo. The strangler migration is complete: ADServe resolves NO SwiftNIO package.
 let httpDependency: Package.Dependency = {
     if let path = Context.environment["HTTP_PATH"], !path.isEmpty {
         return .package(path: path)
@@ -73,12 +72,6 @@ let httpDependency: Package.Dependency = {
 // package now; the test targets reference it via `package: "ADFoundation"`.
 
 var packageDependencies: [Package.Dependency] = [
-    .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
-    .package(url: "https://github.com/apple/swift-nio-extras.git", from: "1.34.1"),
-    .package(url: "https://github.com/apple/swift-nio-ssl.git", from: "2.37.0"),
-    .package(url: "https://github.com/apple/swift-nio-http2.git", from: "1.44.0"),
-    .package(url: "https://github.com/apple/swift-nio-transport-services.git", from: "1.28.0"),
-    .package(url: "https://github.com/apple/swift-http-types.git", from: "1.6.0"),
     .package(url: "https://github.com/apple/swift-log.git", from: "1.13.2"),
     .package(url: "https://github.com/apple/swift-crypto.git", from: "3.0.0"),
     .package(url: "https://github.com/swift-server/swift-service-lifecycle.git", from: "2.6.0"),
@@ -122,8 +115,9 @@ let package = Package(
         .visionOS(.v2)
     ],
     products: [
-        // The engine: NIO bootstrap + HTTP/1.1+2 + TLS, the response envelope, and the type-erased
-        // connection pool. Persistence-agnostic. `@_exported import`s the in-package ADMCP target.
+        // The engine: the HTTP package's serving stack (h1/h2 + TLS via kqueue/epoll +
+        // Network.framework), the response envelope, and the type-erased connection pool.
+        // Persistence-agnostic. `@_exported import`s the in-package ADMCP target.
         .library(name: "ADServeCore", targets: ["ADServeCore"]),
         // The route result-builder DSL over the engine's public surface (the MCP `Tool` DSL now lives
         // in ADMCP, re-exported transitively via ADServeCore).
@@ -164,21 +158,6 @@ let package = Package(
         .target(
             name: "ADServeCore",
             dependencies: [
-                .product(name: "NIOCore", package: "swift-nio"),
-                .product(name: "NIOPosix", package: "swift-nio"),
-                .product(name: "NIOHTTP1", package: "swift-nio"),
-                // WebSockets: the HTTP/1 Upgrade + frame codec/aggregator (apple/swift-nio, already a dep).
-                .product(name: "NIOWebSocket", package: "swift-nio"),
-                .product(name: "NIOExtras", package: "swift-nio-extras"),
-                .product(name: "NIOHTTPTypes", package: "swift-nio-extras"),
-                .product(name: "NIOHTTPTypesHTTP1", package: "swift-nio-extras"),
-                .product(name: "NIOHTTPTypesHTTP2", package: "swift-nio-extras"),
-                // On-the-fly response compression (gzip/deflate) — already a package dep; add the product.
-                .product(name: "NIOHTTPCompression", package: "swift-nio-extras"),
-                .product(name: "NIOSSL", package: "swift-nio-ssl"),
-                .product(name: "NIOHTTP2", package: "swift-nio-http2"),
-                .product(name: "NIOTransportServices", package: "swift-nio-transport-services"),
-                .product(name: "HTTPTypes", package: "swift-http-types"),
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"),
@@ -186,8 +165,9 @@ let package = Package(
                 .product(name: "ADJSON", package: "ADJSON"),
                 .product(name: "ADConcurrency", package: "ADFoundation"),
                 .product(name: "ADFCore", package: "ADFoundation"),
-                // ../HTTP — the from-scratch engine ADServe is re-basing onto (strangler: wired in
-                // alongside NIO; the NIO products above are removed once the engine swap lands).
+                // ../HTTP — the from-scratch engine ADServe runs on: HTTPCore currency types,
+                // the HTTPServer runtime (h1/h2 + route-scoped WebSocket), and the transport
+                // backbones (kqueue/epoll + Network.framework TLS/ALPN).
                 .product(name: "HTTPCore", package: "HTTP"),
                 .product(name: "HTTPServer", package: "HTTP"),
                 .product(name: "HTTPTransport", package: "HTTP"),
@@ -208,7 +188,6 @@ let package = Package(
                 "ADServeCore",
                 .product(name: "ADConcurrency", package: "ADFoundation"),
                 .product(name: "ADFCore", package: "ADFoundation"),
-                .product(name: "HTTPTypes", package: "swift-http-types"),
                 .product(name: "HTTPCore", package: "HTTP"),
                 .product(name: "WebSocket", package: "HTTP"),
                 .product(name: "ADJSON", package: "ADJSON")
@@ -219,7 +198,6 @@ let package = Package(
             name: "ADServeObservability",
             dependencies: [
                 "ADServeCore",
-                .product(name: "HTTPTypes", package: "swift-http-types"),
                 .product(name: "HTTPCore", package: "HTTP"),
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "Metrics", package: "swift-metrics"),
@@ -243,29 +221,13 @@ let package = Package(
             dependencies: [
                 "ADServeCore",
                 .product(name: "ADJSON", package: "ADJSON"),
-                .product(name: "HTTPTypes", package: "swift-http-types"),
-                // The HTTP engine's currency + transport seams: the loopback/in-memory harnesses
-                // drive the server through `FakeTransport`/`FakeConnection` and the public
-                // `HTTPServing` (module-aliased HTTPServer) surface.
+                // The HTTP engine's currency + server + WebSocket seams the harnesses drive; the
+                // loopback clients are raw POSIX sockets + URLSession (TLS/h2) — no client library.
                 .product(name: "HTTPCore", package: "HTTP"),
                 .product(name: "HTTPServer", package: "HTTP"),
                 .product(name: "HTTPTransport", package: "HTTP"),
                 .product(name: "WebSocket", package: "HTTP"),
                 "ADServeEngineNames",
-                // Loopback integration tests bind a real listener + drive a raw NIO client.
-                .product(name: "NIOCore", package: "swift-nio"),
-                .product(name: "NIOPosix", package: "swift-nio"),
-                .product(name: "NIOEmbedded", package: "swift-nio"),
-                .product(name: "NIOExtras", package: "swift-nio-extras"),
-                // The TLS + HTTP/2 loopback client (`.stream`/`.sse`/`.file` over h2+TLS): NIOSSL for
-                // the insecure test client context, NIOHTTP2 + NIOHTTPTypesHTTP2 for the h2 stream
-                // multiplexer speaking the same swift-http-types parts the engine serves.
-                .product(name: "NIOSSL", package: "swift-nio-ssl"),
-                .product(name: "NIOHTTP2", package: "swift-nio-http2"),
-                .product(name: "NIOHTTP1", package: "swift-nio"),
-                .product(name: "NIOWebSocket", package: "swift-nio"),
-                .product(name: "NIOHTTPTypes", package: "swift-nio-extras"),
-                .product(name: "NIOHTTPTypesHTTP2", package: "swift-nio-extras"),
                 // Deterministic-testing toolkit: AsyncEventProbe (wait-or-throw, no polling), managed
                 // temp dirs — replacing ad-hoc `Flag`+poll loops in the timing-sensitive integration tests.
                 .product(name: "ADTestKit", package: "ADFoundation")
@@ -275,7 +237,6 @@ let package = Package(
             name: "ADServeDSLTests",
             dependencies: [
                 "ADServeDSL", "ADServeCore",
-                .product(name: "HTTPTypes", package: "swift-http-types"),
                 .product(name: "HTTPCore", package: "HTTP"),
                 .product(name: "HTTPServer", package: "HTTP"),
                 .product(name: "WebSocket", package: "HTTP"),
@@ -286,7 +247,6 @@ let package = Package(
             name: "ADServeObservabilityTests",
             dependencies: [
                 "ADServeObservability", "ADServeCore",
-                .product(name: "HTTPTypes", package: "swift-http-types"),
                 .product(name: "HTTPCore", package: "HTTP"),
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "Metrics", package: "swift-metrics"),
@@ -343,7 +303,6 @@ if isDev {
             name: "ADServeBench",
             dependencies: [
                 "ADServeCore", "ADServeDSL",
-                .product(name: "HTTPTypes", package: "swift-http-types"),
                 .product(name: "HTTPCore", package: "HTTP"),
                 .product(name: "Logging", package: "swift-log")
             ],
