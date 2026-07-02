@@ -45,7 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     # The canonical dated 6.4 nightly (matches the reusable workflow's pinned container + `.swift-version`).
     # Dated tag pins the toolchain for reproducible CI; bump deliberately like a dependency (#14).
-    container: swiftlang/swift:nightly-6.4-2026-06-18-jammy
+    container: swiftlang/swift:nightly-6.4.x-noble@sha256:54970846d48a8255eee5986aa5bbd259b7f73bbf38429cc2428ce6a62a390b47
     steps:
       - uses: actions/checkout@v4
       - name: Mark workspace safe for git
@@ -68,7 +68,7 @@ jobs:
     runs-on: ubuntu-latest
     # Same pinned 6.4 nightly as the other resolution-dependent jobs (matches `.swift-version`); bump
     # deliberately like a dependency (#14).
-    container: swiftlang/swift:nightly-6.4-2026-06-18-jammy
+    container: swiftlang/swift:nightly-6.4.x-noble@sha256:54970846d48a8255eee5986aa5bbd259b7f73bbf38429cc2428ce6a62a390b47
     env:
       # Print the minimized repro on a failing case so a crash is actionable straight from the log.
       ADTESTKIT_FUZZ_TRACE: 1
@@ -94,7 +94,7 @@ jobs:
     runs-on: ubuntu-latest
     # Same pinned 6.4 nightly as the other resolution-dependent jobs (matches `.swift-version`); bump
     # deliberately like a dependency (#14).
-    container: swiftlang/swift:nightly-6.4-2026-06-18-jammy
+    container: swiftlang/swift:nightly-6.4.x-noble@sha256:54970846d48a8255eee5986aa5bbd259b7f73bbf38429cc2428ce6a62a390b47
     # TODO: drop continue-on-error and add a threshold/baseline check once a committed benchmark
     # baseline exists — until then this only reports numbers, it does not gate the merge.
     continue-on-error: true
