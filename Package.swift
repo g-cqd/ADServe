@@ -177,9 +177,17 @@ let package = Package(
                 .product(name: "ADFCore", package: "ADFoundation"),
                 // ../HTTP — the from-scratch engine ADServe is re-basing onto (strangler: wired in
                 // alongside NIO; the NIO products above are removed once the engine swap lands).
+                // The HTTPServer MODULE is aliased to `HTTPServing`: ADServeCore's own public engine
+                // type is named `HTTPServer`, and a same-named type shadows the module for
+                // qualification, so the import must carry a distinct name (SE-0339).
                 .product(name: "HTTPCore", package: "HTTP"),
-                .product(name: "HTTPServer", package: "HTTP"),
+                .product(
+                    name: "HTTPServer", package: "HTTP",
+                    moduleAliases: ["HTTPServer": "HTTPServing"]),
                 .product(name: "HTTPTransport", package: "HTTP"),
+                // The sans-I/O WebSocket engine types (handler/action/event/close-code) — ADServe's
+                // route-scoped WS surface re-exports them.
+                .product(name: "WebSocket", package: "HTTP"),
                 "ADMCP"
             ],
             swiftSettings: kernelSettings,
@@ -191,6 +199,8 @@ let package = Package(
                 .product(name: "ADConcurrency", package: "ADFoundation"),
                 .product(name: "ADFCore", package: "ADFoundation"),
                 .product(name: "HTTPTypes", package: "swift-http-types"),
+                .product(name: "HTTPCore", package: "HTTP"),
+                .product(name: "WebSocket", package: "HTTP"),
                 .product(name: "ADJSON", package: "ADJSON")
             ],
             swiftSettings: kernelSettings,
@@ -200,6 +210,7 @@ let package = Package(
             dependencies: [
                 "ADServeCore",
                 .product(name: "HTTPTypes", package: "swift-http-types"),
+                .product(name: "HTTPCore", package: "HTTP"),
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "Metrics", package: "swift-metrics"),
                 .product(name: "Tracing", package: "swift-distributed-tracing"),
@@ -223,6 +234,15 @@ let package = Package(
                 "ADServeCore",
                 .product(name: "ADJSON", package: "ADJSON"),
                 .product(name: "HTTPTypes", package: "swift-http-types"),
+                // The HTTP engine's currency + transport seams: the loopback/in-memory harnesses
+                // drive the server through `FakeTransport`/`FakeConnection` and the public
+                // `HTTPServing` (module-aliased HTTPServer) surface.
+                .product(name: "HTTPCore", package: "HTTP"),
+                .product(
+                    name: "HTTPServer", package: "HTTP",
+                    moduleAliases: ["HTTPServer": "HTTPServing"]),
+                .product(name: "HTTPTransport", package: "HTTP"),
+                .product(name: "WebSocket", package: "HTTP"),
                 // Loopback integration tests bind a real listener + drive a raw NIO client.
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOPosix", package: "swift-nio"),
@@ -247,6 +267,8 @@ let package = Package(
             dependencies: [
                 "ADServeDSL", "ADServeCore",
                 .product(name: "HTTPTypes", package: "swift-http-types"),
+                .product(name: "HTTPCore", package: "HTTP"),
+                .product(name: "WebSocket", package: "HTTP"),
                 .product(name: "ADJSON", package: "ADJSON")
             ],
             swiftSettings: testSettings),
@@ -255,6 +277,7 @@ let package = Package(
             dependencies: [
                 "ADServeObservability", "ADServeCore",
                 .product(name: "HTTPTypes", package: "swift-http-types"),
+                .product(name: "HTTPCore", package: "HTTP"),
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "Metrics", package: "swift-metrics"),
                 .product(name: "MetricsTestKit", package: "swift-metrics"),
@@ -311,6 +334,7 @@ if isDev {
             dependencies: [
                 "ADServeCore", "ADServeDSL",
                 .product(name: "HTTPTypes", package: "swift-http-types"),
+                .product(name: "HTTPCore", package: "HTTP"),
                 .product(name: "Logging", package: "swift-log")
             ],
             swiftSettings: strictSettings))
