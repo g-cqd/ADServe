@@ -1,7 +1,7 @@
 import ADJSON
 import ADServeCore
 import ADServeDSL
-import HTTPTypes
+import HTTPCore
 import Testing
 
 @Schemable

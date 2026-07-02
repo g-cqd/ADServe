@@ -14,7 +14,7 @@
 
 import ADTestKit
 import Foundation
-import HTTPTypes
+import HTTPCore
 import Logging
 import Synchronization
 import Testing
@@ -177,12 +177,12 @@ import Testing
         // (no cross-key contention bleeds one bucket into the other).
         let limit = 25
         let limiter = RateLimit(limit: limit, windowSeconds: 600) { request, _ in
-            request.headers[HTTPField.Name("x-key")!] ?? "none"
+            request.headers[HTTPFieldName("x-key")!] ?? "none"
         }
         struct RateLimited: Error {}
         let outcome = await expectAllConcurrent(count: 2 * limit) { worker in
             var headers = HTTPFields()
-            headers[HTTPField.Name("x-key")!] = worker.isMultiple(of: 2) ? "a" : "b"
+            headers.setValue(worker.isMultiple(of: 2) ? "a" : "b", for: HTTPFieldName("x-key")!)
             let request = ServerRequest(method: .get, target: "/", headers: headers)
             let context = MiddlewareContext(requestID: "r", logger: Logger(label: "t"))
             let response = await limiter.intercept(request, context) { _ in

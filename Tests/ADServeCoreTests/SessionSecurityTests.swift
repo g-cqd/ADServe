@@ -4,7 +4,7 @@
 
 import ADTestKit
 import Foundation
-import HTTPTypes
+import HTTPCore
 import Testing
 
 @testable import ADServeCore
@@ -47,7 +47,7 @@ import Testing
             secret: [UInt8](repeating: 0x07, count: 32), store: InMemorySessionStore(), secure: false)
         let routes = InputStubRoutes { input in
             input.storage[SessionKey.self]?["k"] = "v"
-            if input.request.headers[HTTPField.Name("x-rotate")!] != nil {
+            if input.request.headers[HTTPFieldName("x-rotate")!] != nil {
                 input.storage[SessionKey.self]?.rotate()
             }
             return .raw(body: Array("ok".utf8), contentType: "text/plain", status: .ok)

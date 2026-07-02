@@ -6,10 +6,8 @@
 // response (bomb), and the feature is OFF by default.
 
 import Foundation
-import HTTPTypes
+import HTTPCore
 import Logging
-import NIOCore
-import NIOPosix
 import Testing
 
 @testable import ADServeCore
@@ -59,57 +57,18 @@ import Testing
         headerText: String, body: [UInt8], routes: any HTTPHandling,
         requestDecompression: RequestDecompressionPolicy, maxBodyBytes: Int = 1_000_000
     ) async throws -> [UInt8] {
-        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-        do {
-            let response = try await serve(
-                headerText: headerText, body: body, routes: routes,
-                requestDecompression: requestDecompression, maxBodyBytes: maxBodyBytes, group: group)
-            try? await group.shutdownGracefully()
-            return response
-        } catch {
-            try? await group.shutdownGracefully()
-            throw error
+        var assembled = Array(headerText.utf8)
+        assembled += body
+        let request = assembled
+        return try await Loopback.withServer(
+            routes: routes, maxBodyBytes: maxBodyBytes, requestDecompression: requestDecompression
+        ) { port in
+            let client = try TestSocket.connect(host: "127.0.0.1", port: port)
+            // Write the header text and the raw body bytes (binary gzip survives — no lossy
+            // `String` round trip), then read to EOF.
+            try client.send(request)
+            return client.readToEOF()
         }
-    }
-
-    private static func serve(
-        headerText: String, body: [UInt8], routes: any HTTPHandling,
-        requestDecompression: RequestDecompressionPolicy, maxBodyBytes: Int,
-        group: MultiThreadedEventLoopGroup
-    ) async throws -> [UInt8] {
-        // A free loopback port (bind :0, read the assignment, release it).
-        let probe = try await ServerBootstrap(group: group).bind(host: "127.0.0.1", port: 0).get()
-        let port = probe.localAddress?.port ?? 0
-        try await probe.close().get()
-
-        let readiness = ServerReadiness()
-        let server = HTTPServer(
-            listeners: [ListenerConfig(host: "127.0.0.1", port: port, routes: routes)], pool: nil,
-            envelope: HTTPFields(), logger: Logger(label: "decompression-test"), threadCount: 1,
-            loopCount: 1, readiness: readiness, maxBodyBytes: maxBodyBytes,
-            requestDecompression: requestDecompression)
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-
-        // Await readiness, bounded (≤2s) so a bind failure surfaces as a connect error, never a hang.
-        var spins = 0
-        while !readiness.isReady && spins < 200 {
-            try await Task.sleep(for: .milliseconds(10))
-            spins += 1
-        }
-
-        let promise = group.next().makePromise(of: [UInt8].self)
-        let client = try await ClientBootstrap(group: group)
-            .channelInitializer { channel in channel.pipeline.addHandler(ResponseCollector(promise)) }
-            .connect(host: "127.0.0.1", port: port).get()
-        // Write the header text and the raw body bytes (binary gzip survives — no lossy `String` round trip).
-        var buffer = client.allocator.buffer(capacity: headerText.utf8.count + body.count)
-        buffer.writeString(headerText)
-        buffer.writeBytes(body)
-        try await client.writeAndFlush(buffer).get()
-        let bytes = try await promise.futureResult.get()
-        try? await client.close().get()
-        return bytes
     }
 
     /// A handler that echoes the EXACT request body it received back as the response body, so a test can

@@ -1,8 +1,8 @@
 // HTTP/2 multiplexing stress: many concurrent streams on ONE connection complete with per-stream-isolated
-// responses, even ABOVE the server's advertised SETTINGS_MAX_CONCURRENT_STREAMS (NIO's default 100) — the
-// client throttles the excess and they finish as slots free (a graceful cap, not dropped work).
+// responses, even ABOVE the server's advertised SETTINGS_MAX_CONCURRENT_STREAMS (the engine's default 128) —
+// the client throttles the excess and they finish as slots free (a graceful cap, not dropped work).
 
-import HTTPTypes
+import HTTPCore
 import Testing
 
 @testable import ADServeCore
@@ -12,10 +12,10 @@ import Testing
         // Each stream sends `x-stream: <i>`; the route echoes it, so a crossed wire (stream i receiving
         // stream j's body) fails the per-stream assertion below.
         let routes = StubRoutes { request in
-            let id = request.headers[HTTPField.Name("x-stream")!] ?? "?"
+            let id = request.headers[HTTPFieldName("x-stream")!] ?? "?"
             return .raw(body: Array("stream-\(id)".utf8), contentType: "text/plain", status: .ok)
         }
-        let count = 150  // ABOVE the 100-stream cap → the client throttles the excess; all must still finish.
+        let count = 150  // ABOVE the 128-stream cap → the client throttles the excess; all must still finish.
         let results = try await LoopbackTLS.runH2Concurrent(count: count, routes: routes)
 
         #expect(results.count == count)

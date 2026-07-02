@@ -1,5 +1,5 @@
 import ADServeCore
-import HTTPTypes
+import HTTPCore
 import InMemoryTracing
 import Instrumentation
 import Logging
@@ -89,7 +89,7 @@ struct ObservabilityTests {
     @Test
     func `HTTPFieldsExtractor reads propagation headers off the carrier`() {
         var headers = HTTPFields()
-        headers[HTTPField.Name("traceparent")!] = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+        headers.setValue("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01", for: HTTPFieldName("traceparent")!)
         let extractor = HTTPFieldsExtractor()
         #expect(
             extractor.extract(key: "traceparent", from: headers)

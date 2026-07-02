@@ -1,4 +1,4 @@
-import HTTPTypes
+import HTTPCore
 import Logging
 import Testing
 
@@ -27,7 +27,7 @@ import Testing
         }
         let nonceHandlerSaw = String(decoding: body, as: UTF8.self)
         #expect(nonceHandlerSaw != "MISSING")  // the handler saw a stored nonce
-        let csp = headers[HTTPField.Name("content-security-policy")!] ?? ""
+        let csp = headers[HTTPFieldName("content-security-policy")!] ?? ""
         #expect(csp.contains("'nonce-\(nonceHandlerSaw)'"))  // the CSP carries the SAME nonce
         #expect(csp.contains("strict-dynamic"))  // the default strict policy
     }
@@ -56,7 +56,7 @@ import Testing
             Issue.record("expected .full")
             return
         }
-        let csp = headers[HTTPField.Name("content-security-policy")!] ?? ""
+        let csp = headers[HTTPFieldName("content-security-policy")!] ?? ""
         #expect(csp.hasPrefix("default-src 'self'; script-src 'nonce-"))
         #expect(!csp.contains("strict-dynamic"))  // the default policy was not used
     }

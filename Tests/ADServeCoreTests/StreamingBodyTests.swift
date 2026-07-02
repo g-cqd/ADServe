@@ -2,7 +2,7 @@
 // AsyncSequence of chunks — a large upload is processed without materializing, exceeds the buffered-body
 // cap that a normal route enforces, and `bodyStream.collect(maxBytes:)` bounds it when the handler wants.
 
-import HTTPTypes
+import HTTPCore
 import Testing
 
 @testable import ADServeCore
@@ -11,7 +11,7 @@ import Testing
 struct StreamingStubRoutes: HTTPHandling {
     let path: String
     let handler: StreamingRequestHandler
-    func match(method: HTTPRequest.Method, path: Substring) -> RouteMatch {
+    func match(method: HTTPMethod, path: Substring) -> RouteMatch {
         guard path == self.path[...] else { return .notFound }
         let streamingHandler = handler
         return .matched(
@@ -65,7 +65,7 @@ struct StreamingStubRoutes: HTTPHandling {
                 _ = try await input.bodyStream.collect(maxBytes: 1000)
                 return .plain(.ok, "ok\n")
             } catch {
-                return .plain(HTTPResponse.Status(code: 413), "too large\n")
+                return .plain(HTTPStatus(code: 413)!, "too large\n")
             }
         }
         let request =

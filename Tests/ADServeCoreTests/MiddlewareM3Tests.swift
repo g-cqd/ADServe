@@ -4,7 +4,7 @@
 
 import ADTestKit
 import Foundation
-import HTTPTypes
+import HTTPCore
 import Testing
 
 @testable import ADServeCore
@@ -99,7 +99,7 @@ import Testing
     @Test func distinctKeysHaveIndependentBuckets() async throws {
         // Keying by a request header lets two different values exhaust independently.
         let limiter = RateLimit(limit: 1, windowSeconds: 60) { request, _ in
-            request.headers[HTTPField.Name("x-api-key")!] ?? "none"
+            request.headers[HTTPFieldName("x-api-key")!] ?? "none"
         }
         let routes = StubRoutes { _ in .raw(body: Array("ok".utf8), contentType: "text/plain", status: .ok) }
         // key "a": first ok, second 429.

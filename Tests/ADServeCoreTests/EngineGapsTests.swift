@@ -5,7 +5,7 @@
 
 import ADTestKit
 import Foundation
-import HTTPTypes
+import HTTPCore
 import Testing
 
 @testable import ADServeCore
@@ -64,7 +64,7 @@ import Testing
     @Test func nonFileResponseFallsBackToNominalStatus() async throws {
         let captured = AsyncEventProbe<Int>()
         let routes = StubRoutes { _ in
-            .full(body: [], contentType: "text/plain; charset=utf-8", status: .created, headers: [:])
+            .full(body: [], contentType: "text/plain; charset=utf-8", status: .created, headers: HTTPFields())
         }
         let response = try await Loopback.run(
             path: "/created", routes: routes, middleware: [StatusCaptureMiddleware(captured)])

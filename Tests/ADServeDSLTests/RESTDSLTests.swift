@@ -1,7 +1,9 @@
 import ADServeCore
-import HTTPTypes
+import HTTPCore
+import HTTPServer
 import Logging
 import Testing
+import WebSocket
 
 @testable import ADServeDSL
 
@@ -19,7 +21,7 @@ private func table(@RouteGroupBuilder _ routes: () -> [RouteNode]) -> any HTTPHa
 }
 
 private func runMatched(
-    _ table: any HTTPHandling, _ method: HTTPRequest.Method, _ path: String, body: [UInt8] = [],
+    _ table: any HTTPHandling, _ method: HTTPMethod, _ path: String, body: [UInt8] = [],
     codec: ContentCodec = .json
 ) -> ResponseContent? {
     guard case .matched(let route) = table.match(method: method, path: path[...]) else { return nil }
@@ -28,7 +30,7 @@ private func runMatched(
         HandlerInput(request: request, connection: nil, logger: Logger(label: "t"), requestID: "r", codec: codec))
 }
 
-private func plain(_ content: ResponseContent?) -> (HTTPResponse.Status, String)? {
+private func plain(_ content: ResponseContent?) -> (HTTPStatus, String)? {
     guard case .plain(let status, let message)? = content else { return nil }
     return (status, message)
 }
@@ -136,7 +138,7 @@ struct RESTRoutingTests {
 }
 
 struct RequestHelperTests {
-    private func context(target: String, body: [UInt8] = [], codec: ContentCodec = .json) -> RequestContext {
+    private func context(target: String, body: [UInt8] = [], codec: ContentCodec = .json) -> ADServeDSL.RequestContext {
         RequestContext(
             HandlerInput(
                 request: ServerRequest(method: .post, target: target, headers: HTTPFields(), body: body),
@@ -164,8 +166,8 @@ struct RequestHelperTests {
         #expect(ctx.query.bool("absent") == nil)
         #expect(try ctx.query.require("limit") == "10")
         #expect(try ctx.query.requireInt("limit") == 10)
-        #expect(throws: HTTPError.self) { _ = try ctx.query.require("absent") }
-        #expect(throws: HTTPError.self) { _ = try ctx.query.requireInt("ratio") }
+        #expect(throws: ADServeCore.HTTPError.self) { _ = try ctx.query.require("absent") }
+        #expect(throws: ADServeCore.HTTPError.self) { _ = try ctx.query.requireInt("ratio") }
     }
 
     @Test
@@ -217,7 +219,7 @@ struct MiddlewareTests {
         func append(_ entry: String) { entries.append(entry) }
     }
 
-    private struct Recorder: HTTPMiddleware {
+    private struct Recorder: ADServeCore.HTTPMiddleware {
         let tag: String
         let log: OrderLog
         func intercept(
@@ -231,7 +233,7 @@ struct MiddlewareTests {
         }
     }
 
-    private struct Gate: HTTPMiddleware {
+    private struct Gate: ADServeCore.HTTPMiddleware {
         func intercept(
             _ request: ServerRequest, _ context: MiddlewareContext,
             next: @Sendable (ServerRequest) async -> ResponseContent
@@ -309,13 +311,13 @@ struct ErrorTests {
     @Test
     func `a throwing handler propagates HTTPError through the route's run`() {
         let routes = table {
-            GET("boom", pool: .none) { _ in throw HTTPError.badRequest("no") }
+            GET("boom", pool: .none) { _ in throw ADServeCore.HTTPError.badRequest("no") }
         }
         guard case .matched(let route) = routes.match(method: .get, path: "/boom"[...]) else {
             Issue.record("expected match")
             return
         }
-        #expect(throws: HTTPError.self) {
+        #expect(throws: ADServeCore.HTTPError.self) {
             _ = try route.run(
                 HandlerInput(
                     request: ServerRequest(method: .get, target: "/boom", headers: HTTPFields()),
@@ -342,7 +344,7 @@ struct ErrorTests {
             #expect(status.code == 308)
         }
         if case .full(let body, let contentType, let status, _) = ResponseContent.problem(
-            HTTPError.notFound("gone"))
+            ADServeCore.HTTPError.notFound("gone"))
         {
             #expect(status == .notFound)
             #expect(contentType == "application/problem+json")
@@ -355,9 +357,9 @@ struct ErrorTests {
     }
 }
 
-private func fieldName(_ token: String) -> HTTPField.Name { HTTPField.Name(token)! }
+private func fieldName(_ token: String) -> HTTPFieldName { HTTPFieldName(token)! }
 private enum CurrentUser: StorageKey { typealias Value = String }
-private struct SetUser: HTTPMiddleware {
+private struct SetUser: ADServeCore.HTTPMiddleware {
     func intercept(
         _ request: ServerRequest, _ context: MiddlewareContext,
         next: @Sendable (ServerRequest) async -> ResponseContent
@@ -376,7 +378,7 @@ struct MiddlewareBuiltinsTests {
             [CORS(allowOrigin: "https://x.com", allowMethods: [.get, .post])], context: ctx,
             terminal: { _ in .plain(.ok, "handler ran") })
         var headers = HTTPFields()
-        headers[fieldName("access-control-request-method")] = "GET"
+        headers.setValue("GET", for: fieldName("access-control-request-method"))
         let response = await chain(ServerRequest(method: .options, target: "/x", headers: headers))
         guard case .full(_, _, let status, let h) = response else {
             Issue.record("preflight not a full response")
@@ -424,7 +426,7 @@ struct MiddlewareBuiltinsTests {
     @Test
     func `the JSON codec rejects a non-JSON content type with 415`() throws {
         let body = Array(#"{"id":1,"name":"x"}"#.utf8)
-        #expect(throws: HTTPError.self) {
+        #expect(throws: ADServeCore.HTTPError.self) {
             _ = try JSONBodyCodec().decode(Item.self, from: body, contentType: "text/xml")
         }
         #expect(
@@ -446,7 +448,7 @@ struct BodyLimitTests {
             .maxBody(100)
             POST("plain", pool: .none) { _ in .noContent }  // no limit → nil
         }
-        func limit(_ method: HTTPRequest.Method, _ path: String) -> Int? {
+        func limit(_ method: HTTPMethod, _ path: String) -> Int? {
             guard case .matched(let route) = routes.match(method: method, path: path[...]) else {
                 Issue.record("no route for \(method) \(path)")
                 return nil
@@ -468,161 +470,6 @@ struct BodyLimitTests {
         #expect(routes.bodyLimit(method: .post, path: "/upload"[...]) == 50_000_000)
         #expect(routes.bodyLimit(method: .post, path: "/plain"[...]) == nil)
         #expect(routes.bodyLimit(method: .post, path: "/missing"[...]) == nil)  // no match → nil
-    }
-}
-
-struct RoutingSpecificityTests {
-    @Test
-    func `literal routes are scoped to their segment; param/catch-all reached by structure`() {
-        let routes = table {
-            GET("items/{id}", pool: .none) { _, p in .plain(.ok, "item-\(p.id ?? "?")") }
-            GET("users/{id}", pool: .none) { _, p in .plain(.ok, "user-\(p.id ?? "?")") }
-            GET("{resource}/{id}/raw", pool: .none) { _, p in .plain(.ok, "raw-\(p.resource ?? "?")") }
-        }
-        #expect(plain(runMatched(routes, .get, "/items/42"))?.1 == "item-42")
-        #expect(plain(runMatched(routes, .get, "/users/7"))?.1 == "user-7")
-        #expect(plain(runMatched(routes, .get, "/anything/9/raw"))?.1 == "raw-anything")  // param-first reached
-        #expect(runMatched(routes, .get, "/nope/1") == nil)  // no 2-segment route for first-segment "nope"
-    }
-
-    @Test(
-        "a literal segment beats a {param} regardless of declaration order",
-        arguments: [true, false])
-    func literalBeatsParam(literalFirst: Bool) {
-        // Build the SAME overlapping pair in both declaration orders; specificity must pick the literal
-        // `items/{id}` for `/items/5` either way — proving the result no longer depends on order.
-        let routes: any HTTPHandling
-        if literalFirst {
-            routes = table {
-                GET("items/{id}", pool: .none) { _, p in .plain(.ok, "lit-\(p.id ?? "?")") }
-                GET("{resource}/{id}", pool: .none) { _, p in .plain(.ok, "wild-\(p.resource ?? "?")") }
-            }
-        } else {
-            routes = table {
-                GET("{resource}/{id}", pool: .none) { _, p in .plain(.ok, "wild-\(p.resource ?? "?")") }
-                GET("items/{id}", pool: .none) { _, p in .plain(.ok, "lit-\(p.id ?? "?")") }
-            }
-        }
-        #expect(plain(runMatched(routes, .get, "/items/5"))?.1 == "lit-5")  // literal wins both orders
-        #expect(plain(runMatched(routes, .get, "/widgets/9"))?.1 == "wild-widgets")  // param catches the rest
-    }
-}
-
-struct RoutingTrieAdversarialTests {
-    @Test
-    func `exact beats param beats catch-all at one position`() {
-        let routes = table {
-            GET("files/readme", pool: .none) { _ in .plain(.ok, "exact") }
-            GET("files/{id}", pool: .none) { _, p in .plain(.ok, "param-\(p.id ?? "?")") }
-            GET("files/{rest*}", pool: .none) { _, p in .plain(.ok, "catchall-\(p.rest ?? "?")") }
-        }
-        #expect(plain(runMatched(routes, .get, "/files/readme"))?.1 == "exact")
-        #expect(plain(runMatched(routes, .get, "/files/other"))?.1 == "param-other")
-        #expect(plain(runMatched(routes, .get, "/files/a/b"))?.1 == "catchall-a/b")
-    }
-
-    @Test
-    func `backtracks when a more-specific branch dead-ends`() {
-        let routes = table {
-            GET("a/b/c", pool: .none) { _ in .plain(.ok, "exact-abc") }
-            GET("a/{x}", pool: .none) { _, p in .plain(.ok, "ax-\(p.x ?? "?")") }
-            GET("a/{x}/{y}", pool: .none) { _, p in .plain(.ok, "axy-\(p.x ?? "?")-\(p.y ?? "?")") }
-            GET("{p}/{q}", pool: .none) { _, p in .plain(.ok, "pq-\(p.p ?? "?")") }
-        }
-        #expect(plain(runMatched(routes, .get, "/a/b/c"))?.1 == "exact-abc")  // exact wins
-        #expect(plain(runMatched(routes, .get, "/a/zzz"))?.1 == "ax-zzz")  // literal "a" then param {x}
-        // The literal "a/b" branch dead-ends on the 3rd segment "d"; backtrack into "a"'s param subtree.
-        #expect(plain(runMatched(routes, .get, "/a/b/d"))?.1 == "axy-b-d")
-        #expect(plain(runMatched(routes, .get, "/m/n"))?.1 == "pq-m")  // root-level param branch
-    }
-
-    @Test
-    func `405 collects every method at a node, de-duplicated`() {
-        let routes = table {
-            GET("items/{id}", pool: .none) { _, p in .plain(.ok, p.id ?? "?") }
-            DELETE("items/{id}", pool: .none) { _, _ in .plain(.ok, "del") }
-            PATCH("items/{id}", pool: .none) { _, _ in .plain(.ok, "patch") }
-        }
-        guard case .methodNotAllowed(let allowed) = routes.match(method: .put, path: "/items/1"[...]) else {
-            Issue.record("expected methodNotAllowed")
-            return
-        }
-        #expect(Set(allowed) == [.get, .delete, .patch])
-        #expect(allowed.count == 3)  // no duplicates
-    }
-
-    @Test
-    func `405 unions methods across backtracking branches`() {
-        let routes = table {
-            GET("{a}/{b}", pool: .none) { _, _ in .plain(.ok, "ab") }
-            POST("files/{rest*}", pool: .none) { _, _ in .plain(.ok, "files") }
-        }
-        // DELETE /files/x reaches GET via {a}/{b} AND POST via files/{rest*} — two different terminals.
-        guard case .methodNotAllowed(let allowed) = routes.match(method: .delete, path: "/files/x"[...]) else {
-            Issue.record("expected methodNotAllowed union")
-            return
-        }
-        #expect(allowed.contains(.get))
-        #expect(allowed.contains(.post))
-    }
-
-    @Test
-    func `exact path and a param overlap: exact serves its method; both fold into the 405 set`() {
-        let routes = table {
-            GET("users/me", pool: .none) { _ in .plain(.ok, "me") }
-            GET("users/{id}", pool: .none) { _, p in .plain(.ok, "id-\(p.id ?? "?")") }
-        }
-        #expect(plain(runMatched(routes, .get, "/users/me"))?.1 == "me")  // exact wins
-        #expect(plain(runMatched(routes, .get, "/users/42"))?.1 == "id-42")  // param for the rest
-        guard case .methodNotAllowed(let allowed) = routes.match(method: .post, path: "/users/me"[...]) else {
-            Issue.record("expected methodNotAllowed")
-            return
-        }
-        #expect(allowed == [.get])  // exact GET + param GET, de-duped to a single entry
-    }
-
-    @Test
-    func `encoded traversal is rejected under specificity backtracking`() {
-        let routes = table {
-            GET("files/{id}", pool: .none) { _, p in .plain(.ok, "id-\(p.id ?? "?")") }
-            GET("files/{rest*}", pool: .none) { _, p in .plain(.ok, "rest-\(p.rest ?? "?")") }
-        }
-        #expect(runMatched(routes, .get, "/files/%2e%2e") == nil)  // encoded ".." — param + catch-all both reject
-        #expect(runMatched(routes, .get, "/files/a%2Fb") == nil)  // encoded "/" in a single param
-        #expect(runMatched(routes, .get, "/files/a/%2e%2e/x") == nil)  // encoded ".." inside the catch-all
-        #expect(plain(runMatched(routes, .get, "/files/readme"))?.1 == "id-readme")  // normal → param
-        #expect(plain(runMatched(routes, .get, "/files/a/b/c"))?.1 == "rest-a/b/c")  // normal multi → catch-all
-    }
-
-    @Test
-    func `root path matches, and 405/404 behave at the root`() {
-        let routes = table {
-            GET("/", pool: .none) { _ in .plain(.ok, "root") }
-        }
-        #expect(plain(runMatched(routes, .get, "/"))?.1 == "root")
-        guard case .methodNotAllowed(let allowed) = routes.match(method: .post, path: "/"[...]) else {
-            Issue.record("expected methodNotAllowed at root")
-            return
-        }
-        #expect(allowed.contains(.get))
-        #expect(runMatched(routes, .get, "/anything") == nil)
-    }
-
-    @Test
-    func `opaque GET(match:) matchers are residual — the trie wins; opaque serves only trie misses`() {
-        let routes = table {
-            GET("items/{id}", pool: .none) { _, p in .plain(.ok, "trie-\(p.id ?? "?")") }
-            GET(match: { $0.hasPrefix("/legacy/") ? true : nil }, pool: .none) { _, _ in .plain(.ok, "opaque") }
-        }
-        #expect(plain(runMatched(routes, .get, "/items/9"))?.1 == "trie-9")  // structured route wins
-        #expect(plain(runMatched(routes, .get, "/legacy/x"))?.1 == "opaque")  // only the opaque matcher fits
-        #expect(runMatched(routes, .get, "/nope") == nil)  // neither
-        // The opaque matcher still contributes its method to a 405 for a path it accepts.
-        guard case .methodNotAllowed(let allowed) = routes.match(method: .post, path: "/legacy/x"[...]) else {
-            Issue.record("expected methodNotAllowed from the opaque-only path")
-            return
-        }
-        #expect(allowed.contains(.get))
     }
 }
 
@@ -693,46 +540,6 @@ struct StaticAssetDSLTests {
     }
 }
 
-struct WebSocketDSLTests {
-    @Test
-    func `WS registers a websocket route and answers 426 to a plain GET`() {
-        let routes = table { WS("chat") { _ in } }
-        #expect(routes.webSocketRoute(path: "/chat") != nil)
-        #expect(routes.webSocketRoute(path: "/other") == nil)
-        guard case .full(_, _, let status, let headers)? = runMatched(routes, .get, "/chat") else {
-            Issue.record("expected a 426 .full response for a non-upgrade GET")
-            return
-        }
-        #expect(status.code == 426)
-        #expect(headers[HTTPField.Name("upgrade")!] == "websocket")
-        #expect(headers[HTTPField.Name("connection")!] == "Upgrade")
-    }
-
-    @Test
-    func `WS routes nest under a Scope prefix`() {
-        let routes = table { Scope("api") { WS("socket") { _ in } } }
-        #expect(routes.webSocketRoute(path: "/api/socket") != nil)
-        #expect(routes.webSocketRoute(path: "/socket") == nil)
-    }
-}
-
-struct StreamingDSLTests {
-    @Test
-    func `Stream registers a POST streaming route resolvable by streamingHandler`() {
-        let routes = table { Stream("upload") { _ in .plain(.ok, "ok") } }
-        #expect(routes.streamingHandler(method: .post, path: "/upload") != nil)
-        #expect(routes.streamingHandler(method: .get, path: "/upload") == nil)  // POST only
-        #expect(routes.streamingHandler(method: .post, path: "/elsewhere") == nil)
-    }
-
-    @Test
-    func `Stream routes nest under a Scope prefix`() {
-        let routes = table { Scope("api") { Stream("upload") { _ in .plain(.ok, "ok") } } }
-        #expect(routes.streamingHandler(method: .post, path: "/api/upload") != nil)
-        #expect(routes.streamingHandler(method: .post, path: "/upload") == nil)
-    }
-}
-
 private func isNotFoundContent(_ content: ResponseContent?) -> Bool {
     if case .notFound? = content { return true }
     return false
@@ -741,95 +548,4 @@ private func isNotFoundContent(_ content: ResponseContent?) -> Bool {
 private func staticSubpath(_ content: ResponseContent?) -> String? {
     if case .file(_, let subpath, _, _)? = content { return subpath }
     return nil
-}
-
-/// `Channel(_:on:topic:)` — the WS endpoint that auto-subscribes a connection to a `WebSocketHub` topic for
-/// the socket's lifetime. Verified structurally (it resolves as a WS route) and behaviourally (subscribe on
-/// open, unsubscribe on close) with a controllable inbound stream — deterministic, no sleeps.
-@Suite struct ChannelDSLTests {
-    /// A connection whose inbound stream the test finishes on demand; send/ping/close are no-ops.
-    private struct StreamConn: WebSocketConnection {
-        let messages: AsyncStream<WebSocketMessage>
-        func send(_ message: WebSocketMessage) async throws {}
-        func ping(_ data: [UInt8]) async throws {}
-        func close(code: WebSocketCloseCode) async throws {}
-    }
-
-    private struct Ping: Codable, Equatable, Sendable { let n: Int }
-    private actor Sink {
-        private(set) var got: [Ping] = []
-        func add(_ ping: Ping) { got.append(ping) }
-    }
-
-    @Test func channelResolvesToAWebSocketRouteAtItsPath() {
-        let hub = WebSocketHub()
-        let routes = table { Channel("/ws/parts", on: hub, topic: "parts") }
-        #expect(routes.webSocketRoute(path: "/ws/parts") != nil)
-        #expect(routes.webSocketRoute(path: "/ws/other") == nil)
-    }
-
-    @Test func channelAutoSubscribesWhileOpenAndUnsubscribesOnClose() async {
-        let hub = WebSocketHub()
-        let routes = table { Channel("/ws/parts", on: hub, topic: "parts") }
-        guard let route = routes.webSocketRoute(path: "/ws/parts") else {
-            Issue.record("expected a WS route at /ws/parts")
-            return
-        }
-        var continuation: AsyncStream<WebSocketMessage>.Continuation!
-        let stream = AsyncStream<WebSocketMessage> { continuation = $0 }
-        let handlerTask = Task { await route.handler(StreamConn(messages: stream)) }
-
-        // The handler subscribes (await) then suspends on the stream; yield until that lands (no sleep).
-        while await hub.subscriberCount("parts") == 0 { await Task.yield() }
-        #expect(await hub.subscriberCount("parts") == 1)
-
-        continuation.finish()  // end the inbound stream → the handler loop exits → inline unsubscribe
-        await handlerTask.value
-        #expect(await hub.subscriberCount("parts") == 0)
-    }
-
-    @Test func typedChannelDecodesInboundFramesAndSkipsGarbage() async {
-        let hub = WebSocketHub()
-        let sink = Sink()
-        let routes = table {
-            Channel("/ws/ping", on: hub, topic: "ping", receiving: Ping.self) { ping, _ in
-                await sink.add(ping)
-            }
-        }
-        guard let route = routes.webSocketRoute(path: "/ws/ping") else {
-            Issue.record("expected a WS route at /ws/ping")
-            return
-        }
-        var continuation: AsyncStream<WebSocketMessage>.Continuation!
-        let stream = AsyncStream<WebSocketMessage> { continuation = $0 }
-        let handlerTask = Task { await route.handler(StreamConn(messages: stream)) }
-        continuation.yield(.text(#"{"n":1}"#))  // decodes → delivered
-        continuation.yield(.text("not json"))  // garbage → skipped, not thrown
-        continuation.yield(.binary([1, 2, 3]))  // non-text → skipped
-        continuation.yield(.text(#"{"n":2}"#))  // decodes → delivered
-        continuation.finish()
-        await handlerTask.value
-        #expect(await sink.got == [Ping(n: 1), Ping(n: 2)])  // only the two valid frames, in order
-    }
-}
-
-/// `App(cors:)` — the one-line, discoverable way to install a `CORS` middleware OUTERMOST (the cross-port
-/// `ctx.fetch` use case). Verified structurally: the sugar wires CORS as the first middleware, and it stays
-/// strictly opt-in.
-@Suite struct AppCORSSugarTests {
-    @Test func appCorsSugarInstallsCORSOutermostAndIsOptIn() {
-        let withCORS = Server {
-            App(pool: .none, cors: CORS(allowOrigin: "https://web.app")) {
-                GET("x", pool: .none) { _ in .plain(.ok, "ok") }
-            }
-        }
-        let middleware = withCORS[0].routes.first?.middleware
-        #expect(middleware?.first is CORS)  // present AND outermost — it owns the OPTIONS preflight
-        #expect((middleware?.first as? CORS)?.allowOrigin == "https://web.app")
-
-        let withoutCORS = Server {
-            App(pool: .none) { GET("x", pool: .none) { _ in .plain(.ok, "ok") } }
-        }
-        #expect(withoutCORS[0].routes.first?.middleware.contains { $0 is CORS } == false)  // opt-in only
-    }
 }

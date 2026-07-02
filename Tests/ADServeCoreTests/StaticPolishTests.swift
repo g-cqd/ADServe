@@ -2,33 +2,33 @@
 
 import ADTestKit
 import Foundation
-import HTTPTypes
+import HTTPCore
 import Testing
 
 @testable import ADServeCore
 
 @Suite struct HTTPDateTests {
     @Test func formatsKnownEpochs() {
-        #expect(HTTPDate.format(784_111_777) == "Sun, 06 Nov 1994 08:49:37 GMT")
-        #expect(HTTPDate.format(0) == "Thu, 01 Jan 1970 00:00:00 GMT")
-        #expect(HTTPDate.format(1_700_000_000) == "Tue, 14 Nov 2023 22:13:20 GMT")
+        #expect(ADServeCore.HTTPDate.format(784_111_777) == "Sun, 06 Nov 1994 08:49:37 GMT")
+        #expect(ADServeCore.HTTPDate.format(0) == "Thu, 01 Jan 1970 00:00:00 GMT")
+        #expect(ADServeCore.HTTPDate.format(1_700_000_000) == "Tue, 14 Nov 2023 22:13:20 GMT")
     }
 
     @Test func parsesKnownDates() {
-        #expect(HTTPDate.parse("Sun, 06 Nov 1994 08:49:37 GMT") == 784_111_777)
-        #expect(HTTPDate.parse("Thu, 01 Jan 1970 00:00:00 GMT") == 0)
+        #expect(ADServeCore.HTTPDate.parse("Sun, 06 Nov 1994 08:49:37 GMT") == 784_111_777)
+        #expect(ADServeCore.HTTPDate.parse("Thu, 01 Jan 1970 00:00:00 GMT") == 0)
     }
 
     @Test func roundTrips() {
         for epoch in [0, 1, 784_111_777, 1_700_000_000, 2_000_000_000] {
-            #expect(HTTPDate.parse(HTTPDate.format(epoch)) == epoch)
+            #expect(ADServeCore.HTTPDate.parse(ADServeCore.HTTPDate.format(epoch)) == epoch)
         }
     }
 
     @Test func rejectsMalformedInput() {
-        #expect(HTTPDate.parse("not a date") == nil)
-        #expect(HTTPDate.parse("") == nil)
-        #expect(HTTPDate.parse("Sun, 06 Foo 1994 08:49:37 GMT") == nil)  // bad month
+        #expect(ADServeCore.HTTPDate.parse("not a date") == nil)
+        #expect(ADServeCore.HTTPDate.parse("") == nil)
+        #expect(ADServeCore.HTTPDate.parse("Sun, 06 Foo 1994 08:49:37 GMT") == nil)  // bad month
     }
 }
 

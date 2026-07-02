@@ -1,17 +1,18 @@
 import Foundation
-import HTTPTypes
+import HTTPCore
 import Testing
 
 @testable import ADServeCore
 
 /// `.stream` / `.sse` / `.file` exercised over HTTP/2 + TLS via the `LoopbackTLS` harness — the secure,
 /// multiplexed counterpart to the h1 plaintext integration tests. One ALPN-negotiated `h2` stream per
-/// request, the client speaking the same swift-http-types parts the engine serves.
+/// request over URLSession's HTTP/2 client (ALPN-negotiated, asserted via transaction metrics).
 @Suite struct TLSHTTP2IntegrationTests {
     @Test func plainRawResponseRoundTripsOverHTTP2() async throws {
         let routes = StubRoutes { _ in .raw(body: Array("h2-ok".utf8), contentType: "text/plain", status: .ok) }
         let response = try await LoopbackTLS.runH2(path: "/", routes: routes)
         #expect(response.status == 200)
+        #expect(response.negotiatedProtocol == "h2")  // ALPN really settled on HTTP/2
         #expect(response.text == "h2-ok")
         #expect(response.headerEquals("content-type", "text/plain"))
         // HTTP/2 forbids the Connection header — the engine must not emit it on the h2 path.

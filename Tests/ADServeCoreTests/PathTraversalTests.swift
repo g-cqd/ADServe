@@ -20,7 +20,7 @@
 
 import ADTestKit
 import Foundation
-import HTTPTypes
+import HTTPCore
 import Testing
 
 @testable import ADServeCore

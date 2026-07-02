@@ -1,8 +1,6 @@
 import ADTestKit
-import HTTPTypes
+import HTTPCore
 import Logging
-import NIOCore
-import NIOPosix
 import Testing
 
 @testable import ADServeCore
@@ -80,80 +78,36 @@ import Testing
         #expect(response.contains("event: patch\nid: 2\ndata: {\"a\":1}\n\n"))
     }
 
-    /// The F-5 contract: when the client disconnects, the engine cancels the SSE source promptly (its
-    /// heartbeat sleep throws) so the body unwinds and the slot frees — without waiting for a failed
-    /// write. Drives an INFINITE SSE body, disconnects mid-stream, and asserts the body exits.
+    /// The F-5 contract: when the client disconnects, the SSE source unwinds promptly — its next
+    /// write to the dead peer throws, so the body exits and the slot frees. Drives an INFINITE SSE
+    /// body (writing every 20ms), disconnects mid-stream, and asserts the body exits within bounds.
     @Test func clientDisconnectCancelsTheSseSource() async throws {
-        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-        // Deterministic boundaries (ADTestKit): `wait(forAtLeast:)` throws on a missed signal instead of
-        // a silent poll-loop timeout, so a regression fails fast and points at the probe's creation site.
+        // Deterministic boundaries (ADTestKit): `wait(forAtLeast:)` throws on a missed signal instead
+        // of a silent poll-loop timeout, so a regression fails fast at the probe's creation site.
         let firstByte = AsyncEventProbe<Void>()
         let bodyExited = AsyncEventProbe<Void>()
         let routes = StubRoutes { _ in
             .sse { writer in
-                defer { bodyExited.record(()) }  // runs when the body unwinds (cancelled)
+                defer { bodyExited.record(()) }  // runs when the body unwinds (dead-peer write threw)
                 while true {
                     try await writer.comment("ping")
                     try await Task.sleep(for: .milliseconds(20))
                 }
             }
         }
-        do {
-            let probe = try await ServerBootstrap(group: group).bind(host: "127.0.0.1", port: 0).get()
-            let port = probe.localAddress?.port ?? 0
-            try await probe.close().get()
-            let readiness = ServerReadiness()
-            let server = HTTPServer(
-                listeners: [ListenerConfig(host: "127.0.0.1", port: port, routes: routes)], pool: nil,
-                envelope: HTTPFields(), logger: Logger(label: "sse-disconnect"), threadCount: 1,
-                loopCount: 1, readiness: readiness)
-            let serverTask = Task { try? await server.run() }
-            defer { serverTask.cancel() }
-            try await waitForReadiness(readiness)
-
+        let stillLoopingWhileConnected = try await Loopback.withServer(routes: routes) { port in
             // Connect WITHOUT `Connection: close` so the stream stays open until WE disconnect.
-            let client = try await ClientBootstrap(group: group)
-                .channelInitializer { channel in channel.pipeline.addHandler(FirstByteSignal(firstByte)) }
-                .connect(host: "127.0.0.1", port: port).get()
-            var request = client.allocator.buffer(capacity: 64)
-            request.writeString("GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
-            try await client.writeAndFlush(request).get()
-            _ = try await firstByte.wait(forAtLeast: 1, timeout: .seconds(3))  // the SSE is sending
-            #expect(bodyExited.count == 0)  // …and the body is still looping while connected
-
-            try await client.close().get()  // the client disconnects mid-stream
-            _ = try await bodyExited.wait(forAtLeast: 1, timeout: .seconds(3))  // source cancelled, unwound
-            serverTask.cancel()
-            try? await group.shutdownGracefully()
-        } catch {
-            try? await group.shutdownGracefully()
-            throw error
+            let client = try TestSocket.connect(host: "127.0.0.1", port: port)
+            try client.send("GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            if let chunk = client.readChunk(timeout: .seconds(3)), !chunk.isEmpty {
+                firstByte.record(())  // the SSE is sending
+            }
+            let stillLooping = bodyExited.count == 0  // …and the body loops while connected
+            client.close()  // the client disconnects mid-stream
+            return stillLooping
         }
-    }
-}
-
-/// Records into `probe` on the first inbound read — signals that the server's SSE stream has started.
-/// `@unchecked Sendable`: `probe` is `Sendable`; `fired` is touched only on the event loop.
-private final class FirstByteSignal: ChannelInboundHandler, @unchecked Sendable {
-    typealias InboundIn = ByteBuffer
-    private let probe: AsyncEventProbe<Void>
-    private var fired = false
-    init(_ probe: AsyncEventProbe<Void>) { self.probe = probe }
-    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-        if !fired {
-            fired = true
-            probe.record(())
-        }
-    }
-}
-
-/// Awaits server readiness (a synchronous flag, not a probe), throwing after ~3s so a bind failure
-/// fails the test fast instead of hanging CI.
-private func waitForReadiness(_ readiness: ServerReadiness) async throws {
-    var spins = 0
-    while !readiness.isReady {
-        if spins >= 300 { throw TLSHarnessError("server did not become ready within 3s") }
-        try await Task.sleep(for: .milliseconds(10))
-        spins += 1
+        _ = try await firstByte.wait(forAtLeast: 1, timeout: .seconds(3))
+        #expect(stillLoopingWhileConnected)
+        _ = try await bodyExited.wait(forAtLeast: 1, timeout: .seconds(3))  // source unwound
     }
 }

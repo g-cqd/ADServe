@@ -1,29 +1,16 @@
 // A TLS + HTTP/2 loopback client, the secure counterpart to `Loopback` (which is h1 plaintext). It
-// binds an `HTTPServer` on an ephemeral self-signed cert, connects over TLS negotiating `h2` by ALPN,
-// opens one HTTP/2 stream, sends a request, and collects the response — so the streaming / SSE / static
-// paths can be integration-tested over HTTP/2 + TLS, not only h1. The client speaks the SAME
-// swift-http-types parts the engine serves (via `HTTP2FramePayloadToHTTPClientCodec`), so the h2 path
-// is exercised end to end. Best-effort teardown + bounded waits, so it can never hang CI.
+// binds an `HTTPServer` on an ephemeral self-signed cert and drives real requests over TLS with
+// ALPN `h2` through URLSession (whose HTTP/2 client multiplexes streams over one connection and
+// respects the server SETTINGS), asserting the negotiated protocol via task transaction metrics —
+// so the streaming / SSE / static paths are integration-tested over HTTP/2 + TLS, not only h1.
+// Best-effort teardown + bounded waits, so it can never hang CI.
 
 import Foundation
-import HTTPTypes
+import HTTPCore
 import Logging
-import NIOCore
-import NIOHTTP2
-import NIOHTTPTypes
-import NIOHTTPTypesHTTP2
-import NIOPosix
-import NIOSSL
 import Synchronization
 
 @testable import ADServeCore
-
-/// An error from the TLS test harness (cert generation / missing mux).
-struct TLSHarnessError: Error, CustomStringConvertible {
-    let message: String
-    init(_ message: String) { self.message = message }
-    var description: String { message }
-}
 
 /// An ephemeral self-signed cert + key, generated once per test process via `openssl` into a temp dir
 /// (cached behind a `Mutex`, so a run with several TLS tests pays the ~50ms generation only once). The
@@ -62,7 +49,7 @@ enum EphemeralTLS {
         guard process.terminationStatus == 0, fileManager.fileExists(atPath: cert),
             fileManager.fileExists(atPath: key)
         else {
-            throw TLSHarnessError("openssl self-signed cert generation failed (is openssl on PATH?)")
+            throw TLSHarnessError(message: "openssl self-signed cert generation failed (openssl on PATH?)")
         }
         return .pem(certificate: cert, privateKey: key)
     }
@@ -71,218 +58,155 @@ enum EphemeralTLS {
 /// One HTTP/2 response collected by the loopback client.
 struct H2Response {
     let status: Int
-    let headers: HTTPFields
+    /// Response headers, lowercased names (URLSession preserves case variably; compare lowercased).
+    let headerValues: [String: String]
     let body: [UInt8]
+    /// The ALPN protocol the task actually used (`"h2"` expected) from the transaction metrics.
+    let negotiatedProtocol: String?
 
     /// The body decoded as UTF-8 text (the streaming/SSE/static bodies under test are text).
     var text: String { String(decoding: body, as: UTF8.self) }
     /// One response header value by (case-insensitive) name, or `nil`.
-    func header(_ name: String) -> String? { HTTPField.Name(name).flatMap { headers[$0] } }
+    func header(_ name: String) -> String? { headerValues[name.lowercased()] }
     /// True if a header named `name` carries `value` (case-insensitive compare on the value).
     func headerEquals(_ name: String, _ value: String) -> Bool {
         header(name)?.lowercased() == value.lowercased()
     }
 }
 
-/// Binds an `HTTPServer` (TLS, ALPN `h2`+`http/1.1`) on an OS-assigned loopback port and drives one
-/// HTTP/2 request over it, returning the collected response. The first secure/h2 coverage in the suite.
-enum LoopbackTLS {
-    private typealias H2Stream = NIOAsyncChannel<HTTPResponsePart, HTTPRequestPart>
-    private typealias H2Mux = NIOHTTP2Handler.AsyncStreamMultiplexer<H2Stream>
+/// Trusts the ephemeral self-signed server certificate (test only) and records per-task transaction
+/// metrics so a test can assert the negotiated protocol was h2.
+final class InsecureTrustDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    private let protocols = Mutex<[Int: String]>([:])
 
+    func urlSession(
+        _ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+            let trust = challenge.protectionSpace.serverTrust
+        {
+            completionHandler(.useCredential, URLCredential(trust: trust))
+        } else {
+            completionHandler(.performDefaultHandling, nil)
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession, task: URLSessionTask,
+        didFinishCollecting metrics: URLSessionTaskMetrics
+    ) {
+        if let name = metrics.transactionMetrics.last?.networkProtocolName {
+            protocols.withLock { $0[task.taskIdentifier] = name }
+        }
+    }
+
+    /// The most recently negotiated protocol across the session tasks (one host, one connection).
+    var lastProtocol: String? {
+        protocols.withLock { state in state.values.first }
+    }
+}
+
+/// Binds an `HTTPServer` (TLS, ALPN `h2`+`http/1.1`) on an OS-assigned loopback port and drives
+/// HTTP/2 requests over it, returning collected responses. The secure/h2 coverage in the suite.
+enum LoopbackTLS {
+    /// Serves `routes` over TLS+h2 and performs one request, returning the decoded response.
     static func runH2(
-        path: String, routes: any HTTPHandling, method: HTTPRequest.Method = .get,
+        path: String, routes: any HTTPHandling, method: String = "GET",
         headers: [(name: String, value: String)] = []
     ) async throws -> H2Response {
-        let tls = try EphemeralTLS.source()
-        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-        do {
-            let response = try await serve(
-                path: path, routes: routes, method: method, headers: headers, tls: tls, group: group)
-            try? await group.shutdownGracefully()
-            return response
-        } catch {
-            try? await group.shutdownGracefully()
-            throw error
+        let responses = try await withH2Server(routes: routes) { session, delegate, base in
+            [try await request(session, delegate: delegate, base: base, path: path, method: method, headers: headers)]
         }
+        guard let first = responses.first else { throw TLSHarnessError(message: "no h2 response") }
+        return first
     }
 
-    private static func serve(
-        path: String, routes: any HTTPHandling, method: HTTPRequest.Method,
-        headers: [(name: String, value: String)], tls: TLSSource, group: MultiThreadedEventLoopGroup
-    ) async throws -> H2Response {
-        let probe = try await ServerBootstrap(group: group).bind(host: "127.0.0.1", port: 0).get()
-        let port = probe.localAddress?.port ?? 0
-        try await probe.close().get()
-
-        let readiness = ServerReadiness()
-        let server = HTTPServer(
-            listeners: [
-                ListenerConfig(
-                    host: "127.0.0.1", port: port, wire: .https(tls, alpn: [.http2, .http1]),
-                    routes: routes)
-            ], pool: nil, envelope: HTTPFields(), logger: Logger(label: "loopback-tls"), threadCount: 1,
-            loopCount: 1, readiness: readiness)
-        let serverTask = Task { try? await server.run() }
-        defer { serverTask.cancel() }
-
-        var spins = 0
-        while !readiness.isReady && spins < 200 {
-            try await Task.sleep(for: .milliseconds(10))
-            spins += 1
-        }
-
-        let mux = try await connect(port: port, group: group)
-        let stream = try await mux.openStream { streamChannel in
-            streamChannel.eventLoop.makeCompletedFuture {
-                try streamChannel.pipeline.syncOperations.addHandler(HTTP2FramePayloadToHTTPClientCodec())
-                return try H2Stream(wrappingChannelSynchronously: streamChannel)
-            }
-        }
-
-        var requestFields = HTTPFields()
-        for header in headers {
-            if let name = HTTPField.Name(header.name) { requestFields[name] = header.value }
-        }
-        let request = HTTPRequest(
-            method: method, scheme: "https", authority: "127.0.0.1:\(port)", path: path,
-            headerFields: requestFields)
-
-        return try await stream.executeThenClose { inbound, outbound in
-            try await outbound.write(.head(request))
-            try await outbound.write(.end(nil))
-            var status = 0
-            var responseHeaders = HTTPFields()
-            var body: [UInt8] = []
-            for try await part in inbound {
-                switch part {
-                    case .head(let response):
-                        status = response.status.code
-                        responseHeaders = response.headerFields
-                    case .body(let buffer):
-                        body.append(contentsOf: buffer.readableBytesView)
-                    case .end:
-                        break
-                }
-            }
-            return H2Response(status: status, headers: responseHeaders, body: body)
-        }
-    }
-
-    /// One concurrent-stream result: which stream id, its status, and its body text.
+    /// One stream result of the concurrent fan-out.
     struct H2StreamResult: Sendable {
         let stream: Int
         let status: Int
         let body: String
     }
 
-    /// Opens `count` HTTP/2 streams CONCURRENTLY on ONE connection (each carrying a distinct `x-stream`
-    /// header the route echoes back), returning every result. With `count` above the server's advertised
-    /// `SETTINGS_MAX_CONCURRENT_STREAMS` (NIO's default 100) the client throttles the excess — they queue
-    /// and complete as slots free — so this proves multiplexing concurrency, per-stream isolation (no
-    /// crossed wires), AND that the stream cap throttles gracefully rather than dropping work.
-    static func runH2Concurrent(count: Int, path: String = "/", routes: any HTTPHandling) async throws
-        -> [H2StreamResult]
+    /// Opens `count` CONCURRENT requests through one URLSession pinned to one host connection —
+    /// URLSession multiplexes them as h2 streams and respects the server SETTINGS cap, so all
+    /// `count` complete even above `maxConcurrentStreams`.
+    static func runH2Concurrent(count: Int, path: String = "/", routes: any HTTPHandling)
+        async throws -> [H2StreamResult]
     {
-        let tls = try EphemeralTLS.source()
-        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-        do {
-            let probe = try await ServerBootstrap(group: group).bind(host: "127.0.0.1", port: 0).get()
-            let port = probe.localAddress?.port ?? 0
-            try await probe.close().get()
-            let readiness = ServerReadiness()
-            let server = HTTPServer(
-                listeners: [
-                    ListenerConfig(
-                        host: "127.0.0.1", port: port, wire: .https(tls, alpn: [.http2, .http1]),
-                        routes: routes)
-                ], pool: nil, envelope: HTTPFields(), logger: Logger(label: "loopback-tls-mux"),
-                threadCount: 1, loopCount: 1, readiness: readiness)
-            let serverTask = Task { try? await server.run() }
-            defer { serverTask.cancel() }
-            var spins = 0
-            while !readiness.isReady && spins < 200 {
-                try await Task.sleep(for: .milliseconds(10))
-                spins += 1
-            }
-
-            let mux = try await connect(port: port, group: group)
-            let results = try await withThrowingTaskGroup(of: H2StreamResult.self) { taskGroup in
-                for index in 0 ..< count {
-                    taskGroup.addTask {
-                        let stream = try await mux.openStream { streamChannel in
-                            streamChannel.eventLoop.makeCompletedFuture {
-                                try streamChannel.pipeline.syncOperations.addHandler(
-                                    HTTP2FramePayloadToHTTPClientCodec())
-                                return try H2Stream(wrappingChannelSynchronously: streamChannel)
-                            }
-                        }
-                        var fields = HTTPFields()
-                        fields[HTTPField.Name("x-stream")!] = String(index)
-                        let request = HTTPRequest(
-                            method: .get, scheme: "https", authority: "127.0.0.1:\(port)", path: path,
-                            headerFields: fields)
-                        return try await stream.executeThenClose { inbound, outbound in
-                            try await outbound.write(.head(request))
-                            try await outbound.write(.end(nil))
-                            var status = 0
-                            var body: [UInt8] = []
-                            for try await part in inbound {
-                                switch part {
-                                    case .head(let response): status = response.status.code
-                                    case .body(let buffer): body.append(contentsOf: buffer.readableBytesView)
-                                    case .end: break
-                                }
-                            }
-                            return H2StreamResult(
-                                stream: index, status: status, body: String(decoding: body, as: UTF8.self))
-                        }
+        try await withH2Server(routes: routes) { session, delegate, base in
+            try await withThrowingTaskGroup(of: H2StreamResult.self) { group in
+                for stream in 0 ..< count {
+                    group.addTask {
+                        let response = try await request(
+                            session, delegate: delegate, base: base, path: path, method: "GET",
+                            headers: [(name: "x-stream", value: "\(stream)")])
+                        return H2StreamResult(
+                            stream: stream, status: response.status, body: response.text)
                     }
                 }
-                var collected: [H2StreamResult] = []
-                for try await result in taskGroup { collected.append(result) }
-                return collected
+                var results: [H2StreamResult] = []
+                results.reserveCapacity(count)
+                for try await result in group { results.append(result) }
+                return results
             }
-            serverTask.cancel()
-            try? await group.shutdownGracefully()
-            return results
-        } catch {
-            try? await group.shutdownGracefully()
-            throw error
         }
     }
 
-    /// Connects over TLS (insecure verification — a test self-signed cert), negotiating `h2` by ALPN,
-    /// and returns the HTTP/2 stream multiplexer once the pipeline is configured.
-    private static func connect(port: Int, group: MultiThreadedEventLoopGroup) async throws -> H2Mux {
-        var clientConfig = TLSConfiguration.makeClientConfiguration()
-        clientConfig.certificateVerification = .none  // test-only: trust the ephemeral self-signed cert
-        clientConfig.applicationProtocols = ["h2"]
-        let clientContext = try NIOSSLContext(configuration: clientConfig)
+    /// Binds the TLS server, builds the trusting session, runs `body`, and tears everything down.
+    private static func withH2Server<R: Sendable>(
+        routes: any HTTPHandling,
+        _ body: @escaping @Sendable (URLSession, InsecureTrustDelegate, String) async throws -> R
+    ) async throws -> R {
+        let tls = try EphemeralTLS.source()
+        let port = try Loopback.freePort()
+        let readiness = ServerReadiness()
+        let server = HTTPServer(
+            listeners: [
+                ListenerConfig(
+                    host: "127.0.0.1", port: port,
+                    wire: .https(tls, alpn: [.http2, .http1]), routes: routes)
+            ],
+            pool: nil, envelope: HTTPFields(), logger: Logger(label: "loopback-tls"),
+            threadCount: 2, loopCount: 1, readiness: readiness)
+        let serverTask = Task { try? await server.run() }
+        defer { serverTask.cancel() }
+        try await Loopback.awaitReadiness(readiness)
 
-        let muxPromise = group.next().makePromise(of: H2Mux.self)
-        _ = try await ClientBootstrap(group: group)
-            .channelInitializer { channel in
-                do {
-                    let sslHandler = try NIOSSLClientHandler(context: clientContext, serverHostname: nil)
-                    try channel.pipeline.syncOperations.addHandler(sslHandler)
-                    let mux = try channel.pipeline.syncOperations.configureAsyncHTTP2Pipeline(
-                        mode: .client
-                    ) { streamChannel in
-                        streamChannel.eventLoop.makeCompletedFuture {
-                            try streamChannel.pipeline.syncOperations.addHandler(
-                                HTTP2FramePayloadToHTTPClientCodec())
-                            return try H2Stream(wrappingChannelSynchronously: streamChannel)
-                        }
-                    }
-                    muxPromise.succeed(mux)
-                    return channel.eventLoop.makeSucceededVoidFuture()
-                } catch {
-                    muxPromise.fail(error)
-                    return channel.eventLoop.makeFailedFuture(error)
-                }
+        let delegate = InsecureTrustDelegate()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpMaximumConnectionsPerHost = 1  // force h2 multiplexing over ONE connection
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
+        defer { session.invalidateAndCancel() }
+        return try await body(session, delegate, "https://127.0.0.1:\(port)")
+    }
+
+    /// One request through the trusting session, decoded into an `H2Response`.
+    private static func request(
+        _ session: URLSession, delegate: InsecureTrustDelegate, base: String, path: String,
+        method: String, headers: [(name: String, value: String)]
+    ) async throws -> H2Response {
+        guard let url = URL(string: base + path) else {
+            throw TLSHarnessError(message: "bad URL \(base + path)")
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        for header in headers { request.setValue(header.value, forHTTPHeaderField: header.name) }
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw TLSHarnessError(message: "non-HTTP response")
+        }
+        var headerValues: [String: String] = [:]
+        for (name, value) in http.allHeaderFields {
+            if let name = name as? String, let value = value as? String {
+                headerValues[name.lowercased()] = value
             }
-            .connect(host: "127.0.0.1", port: port).get()
-        return try await muxPromise.futureResult.get()
+        }
+        // The metrics delegate fires before the task completes, so the protocol is recorded by now.
+        return H2Response(
+            status: http.statusCode, headerValues: headerValues, body: [UInt8](data),
+            negotiatedProtocol: delegate.lastProtocol)
     }
 }

@@ -345,7 +345,11 @@ public struct HTTPServer: Sendable {
     /// a 503 instead of the engine's silent close).
     private func makeLimits() -> HTTPLimits {
         var limits = HTTPLimits.default
-        limits.maxBodySize = maxBodyBytes
+        // The engine's h1 parser enforces this GLOBAL cap at parse time, BEFORE the per-route
+        // resolver can RAISE it (recorded upstream gap) — so it is set to a coarse transport
+        // ceiling and `EngineResponder.resolve` supplies the effective cap (the server default, or
+        // a route's raise) for every request head. It also bounds a WebSocket message reassembly.
+        limits.maxBodySize = max(maxBodyBytes, 64 << 20)
         let idle: Duration = idleTimeout > .zero ? idleTimeout : .seconds(1 << 24)
         limits.idleTimeout = idle
         limits.keepAliveTimeout = idle

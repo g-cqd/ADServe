@@ -1,4 +1,4 @@
-import HTTPTypes
+import HTTPCore
 import Synchronization
 import Testing
 
@@ -66,7 +66,7 @@ final class CollectingBodyWriter: ResponseBodyWriter {
 
     @Test func withHeadersMergesIntoStreamWithoutLosingTheBody() async throws {
         var extra = HTTPFields()
-        extra[HTTPField.Name("x-test")!] = "1"
+        extra.setValue("1", for: HTTPFieldName("x-test")!)
         let decorated =
             ResponseContent.stream(contentType: "text/html") { writer in
                 try await writer.write(Array("hi".utf8))
@@ -78,7 +78,7 @@ final class CollectingBodyWriter: ResponseBodyWriter {
             return
         }
         #expect(contentType == "text/html")
-        #expect(headers[HTTPField.Name("x-test")!] == "1")
+        #expect(headers[HTTPFieldName("x-test")!] == "1")
         let collector = CollectingBodyWriter()
         try await body(collector)
         #expect(collector.bytes == Array("hi".utf8))  // the body closure survived decoration

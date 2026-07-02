@@ -1,5 +1,5 @@
 import ADJSON
-import HTTPTypes
+import HTTPCore
 import Testing
 
 @testable import ADServeCore
@@ -51,11 +51,11 @@ import Testing
 
     @Test func requestIdEchoedWhenValidElseMinted() {
         var valid = HTTPFields()
-        valid[requestIDName] = "valid.id-123"
+        valid.setValue("valid.id-123", for: requestIDName)
         #expect(resolveRequestID(valid) == "valid.id-123")
 
         var invalid = HTTPFields()
-        invalid[requestIDName] = "has spaces"
+        invalid.setValue("has spaces", for: requestIDName)
         let minted = resolveRequestID(invalid)
         #expect(minted != "has spaces")
         #expect(minted.count == 36)

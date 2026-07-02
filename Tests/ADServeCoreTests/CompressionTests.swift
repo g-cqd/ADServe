@@ -3,7 +3,7 @@
 
 import ADTestKit
 import Foundation
-import HTTPTypes
+import HTTPCore
 import Testing
 
 @testable import ADServeCore
@@ -148,22 +148,25 @@ import Testing
     /// bytes that never come (the page/preview hangs until the idle timeout). The fix flushes the head
     /// WITH the first body chunk, so the compressor switches the response to chunked. Assert it is gzipped
     /// AND self-framed (chunked, terminated) — a client does NOT hang.
-    @Test func compressedStaticFileOverKeepAliveDoesNotHang() async throws {
+    @Test func staticFileWithGzipAcceptOverKeepAliveIsExactlyFramedAndNeverHangs() async throws {
+        // A compressible static file requested WITH Accept-Encoding over a KEPT-ALIVE connection.
+        // The engine serves static bodies identity with an exact Content-Length (on-the-fly
+        // compression applies to buffered dynamic responses only; compressed static assets ride
+        // precompressed `.br`/`.gz` sidecars) — so the framing is exact and the response completes
+        // without the stale-Content-Length hang the NIO compressor path was prone to.
         let dir = TemporaryDirectory(prefix: "adserve-static-gzip")
         defer { dir.cleanup() }
         let routes = try staticHTMLRoutes(dir)
         let response = try await Loopback.runKeepAlive(
-            path: "/index.html", routes: routes, headers: [("Accept-Encoding", "gzip")])
+            path: "/index.html", routes: routes, headers: [("Accept-Encoding", "gzip")],
+            backstop: .seconds(2))
         let lower = response.lowercased()
-        #expect(lower.contains("content-encoding: gzip"))  // compression engaged
-        #expect(lower.contains("transfer-encoding: chunked"))  // → chunked, no stale Content-Length
-        #expect(!lower.contains("content-length:"))  // the bug header is gone
-        #expect(response.hasSuffix("0\r\n\r\n"))  // last-chunk terminator → self-framed, no hang
+        #expect(response.hasPrefix("HTTP/1.1 200"))
+        #expect(lower.contains("content-length:"))  // identity, exactly framed
+        #expect(!lower.contains("content-encoding: gzip"))  // sidecars own compressed static
+        #expect(HTTP1ResponseFraming.isComplete(Array(response.utf8)))  // complete — no hang
     }
 
-    /// Without `Accept-Encoding` the same file is identity with an EXACT `Content-Length`: the head still
-    /// rides with the first chunk (one batched flush), so the length is correct and the client reads
-    /// exactly that many bytes (length-delimited, not chunked).
     @Test func uncompressedStaticFileOverKeepAliveHasExactContentLength() async throws {
         let dir = TemporaryDirectory(prefix: "adserve-static-plain")
         defer { dir.cleanup() }

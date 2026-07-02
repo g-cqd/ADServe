@@ -1,4 +1,4 @@
-import HTTPTypes
+import HTTPCore
 import Testing
 
 @testable import ADServeCore
@@ -17,7 +17,7 @@ private func sampleTable() -> any HTTPHandling {
     return listeners(apps, defaultPort: 8080)[0].routes
 }
 
-private func match(_ t: any HTTPHandling, _ method: HTTPRequest.Method, _ path: String) -> RouteMatch {
+private func match(_ t: any HTTPHandling, _ method: HTTPMethod, _ path: String) -> RouteMatch {
     t.match(method: method, path: path[...])
 }
 

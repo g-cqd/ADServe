@@ -3,7 +3,7 @@
 // load and a morphable fragment on a client action.
 
 import ADServeCore
-import HTTPTypes
+import HTTPCore
 import Logging
 import Testing
 
@@ -14,7 +14,7 @@ private func table(@RouteGroupBuilder _ routes: () -> [RouteNode]) -> any HTTPHa
 }
 
 private func run(
-    _ table: any HTTPHandling, _ method: HTTPRequest.Method, _ path: String, headers: HTTPFields = HTTPFields()
+    _ table: any HTTPHandling, _ method: HTTPMethod, _ path: String, headers: HTTPFields = HTTPFields()
 ) -> ResponseContent? {
     guard case .matched(let route) = table.match(method: method, path: path[...]) else { return nil }
     let request = ServerRequest(method: method, target: path, headers: headers, body: [])
@@ -42,7 +42,7 @@ private func raw(_ content: ResponseContent?) -> (body: String, contentType: Str
         #expect(raw(run(routes, .get, "/parts"))?.body == "<!doctype html><html>page</html>")
         // An ADHTML action fetch (`ADH-Request: 1`) → the fragment.
         var headers = HTTPFields()
-        headers[HTTPField.Name("ADH-Request")!] = "1"
+        headers.setValue("1", for: HTTPFieldName("ADH-Request")!)
         let fragment = raw(run(routes, .get, "/parts", headers: headers))
         #expect(fragment?.body == "<tr>row</tr>")
         #expect(fragment?.contentType == MediaType.html.value)  // text/html; charset=utf-8 (C2)

@@ -1,7 +1,7 @@
 // M3 in-house form parsing: application/x-www-form-urlencoded + multipart/form-data (RFC 7578).
 
 import Foundation
-import HTTPTypes
+import HTTPCore
 import Testing
 
 @testable import ADServeCore

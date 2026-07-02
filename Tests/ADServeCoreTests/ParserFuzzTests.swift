@@ -13,7 +13,7 @@
 import ADFCore
 import ADTestKit
 import Foundation
-import HTTPTypes
+import HTTPCore
 import Testing
 
 @testable import ADServeCore
@@ -112,7 +112,7 @@ struct ParserFuzzTests {
             corpus: { valid },
             exercise: { mutated in
                 // Returns whole epoch seconds or nil; a malformed date (bad day/month/time) is just nil.
-                _ = HTTPDate.parse(String(decoding: mutated, as: UTF8.self))
+                _ = ADServeCore.HTTPDate.parse(String(decoding: mutated, as: UTF8.self))
             })
         #expect(report.iterations == Self.iterations)
     }
@@ -130,7 +130,7 @@ struct ParserFuzzTests {
         try Data(repeating: 0x41, count: totalSize).write(to: root.appendingPathComponent("d.txt"))
         let request = StaticFileRequest(
             root: root.path, subpath: "d.txt", contentType: "text/plain", headers: HTTPFields())
-        guard let rangeName = HTTPField.Name("range") else {
+        guard let rangeName = HTTPFieldName("range") else {
             Issue.record("could not build the Range header name")
             return
         }
@@ -140,10 +140,11 @@ struct ParserFuzzTests {
             seed: Self.seed, iterations: Self.iterations, edits: Self.edits,
             corpus: { valid },
             exercise: { mutated in
-                // `HTTPField` legalizes invalid bytes to spaces (never traps), so the mutated bytes still
-                // arrive at `parseByteRange` as a hostile Range spec — exercising every branch.
+                // HTTPCore validates field values (a control byte makes construction fail — never a
+                // trap); every legal mutation still arrives at `parseByteRange` as a hostile Range
+                // spec, exercising every branch.
                 var headers = HTTPFields()
-                headers.append(HTTPField(name: rangeName, value: String(decoding: mutated, as: UTF8.self)))
+                headers.append(String(decoding: mutated, as: UTF8.self), for: rangeName)
                 _ = HTTPServer.planStaticFile(file: request, headers: headers)
             })
         #expect(report.iterations == Self.iterations)

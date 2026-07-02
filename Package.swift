@@ -277,6 +277,7 @@ let package = Package(
                 "ADServeDSL", "ADServeCore",
                 .product(name: "HTTPTypes", package: "swift-http-types"),
                 .product(name: "HTTPCore", package: "HTTP"),
+                .product(name: "HTTPServer", package: "HTTP"),
                 .product(name: "WebSocket", package: "HTTP"),
                 .product(name: "ADJSON", package: "ADJSON")
             ],

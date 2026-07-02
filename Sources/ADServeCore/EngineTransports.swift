@@ -118,12 +118,33 @@ private final class LimitedConnection: TransportConnection {
     var tlsPeerSubject: String? { inner.tlsPeerSubject }
     var preferredTaskExecutor: (any TaskExecutor)? { inner.preferredTaskExecutor }
 
+    // The reads are wrapped in per-op cancellation handlers: the socket backbones park `receive`
+    // in a continuation that does NOT honor task cancellation (they rely on the serve-task-level
+    // `cancel()` handler — which the idle watchdog's child-task cancellation never reaches), so an
+    // idle deadline would otherwise never actually close the connection. Recorded upstream; the
+    // wrapper restores the documented `TransportConnection` contract at a task-status record per
+    // read.
     func receive(maxLength: Int) async throws -> [UInt8]? {
-        try await inner.receive(maxLength: maxLength)
+        let inner = inner
+        return try await withTaskCancellationHandler {
+            try await inner.receive(maxLength: maxLength)
+        } onCancel: {
+            inner.cancel()
+        }
     }
 
     func receive(into buffer: inout [UInt8], maxLength: Int) async throws -> Int {
-        try await inner.receive(into: &buffer, maxLength: maxLength)
+        // `buffer` is `inout` and cannot cross into the cancellation-handler closure pair; read into
+        // a fresh chunk (the wrapper is not on the zero-copy path) and append.
+        let inner = inner
+        let chunk = try await withTaskCancellationHandler {
+            try await inner.receive(maxLength: maxLength)
+        } onCancel: {
+            inner.cancel()
+        }
+        guard let chunk, !chunk.isEmpty else { return 0 }
+        buffer.append(contentsOf: chunk)
+        return chunk.count
     }
 
     func send(_ bytes: [UInt8]) async throws { try await inner.send(bytes) }
@@ -166,6 +187,7 @@ final class UnixDomainSocketTransport: ServerTransport {
                 while true {
                     let accepted = accept(descriptor, nil, nil)
                     guard accepted >= 0 else { break }  // listener closed → stop accepting
+                    Self.disableSigpipe(accepted)
                     continuation.yield(
                         UnixDomainSocketConnection(
                             descriptor: accepted, id: TransportConnectionID(nextID)))
@@ -187,6 +209,17 @@ final class UnixDomainSocketTransport: ServerTransport {
             _ = close(descriptor)
             _ = unsafe unlink(path)
         }
+    }
+
+    /// A write to a peer that already closed must fail with EPIPE, not raise SIGPIPE (which would
+    /// kill the process). Darwin has no `MSG_NOSIGNAL`, so the option is set per accepted socket;
+    /// on Linux the readiness backbones use `MSG_NOSIGNAL` and `SO_NOSIGPIPE` does not exist.
+    private static func disableSigpipe(_ descriptor: Int32) {
+        #if canImport(Darwin)
+            var flag: Int32 = 1
+            _ = unsafe setsockopt(
+                descriptor, SOL_SOCKET, SO_NOSIGPIPE, &flag, socklen_t(MemoryLayout<Int32>.size))
+        #endif
     }
 
     /// Creates, binds (replacing any stale socket file), and listens on the `AF_UNIX` socket.
