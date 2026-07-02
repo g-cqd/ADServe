@@ -57,15 +57,15 @@ let adfoundationDependency: Package.Dependency = {
     return .package(url: "https://github.com/g-cqd/ADFoundation.git", branch: "main")
 }()
 // HTTP — the from-scratch, SwiftNIO-free HTTP/1.1·2·3 stack ADServe is re-basing onto (the engine,
-// transport backbones, sans-I/O protocol engines, and the commodity middleware). Resolved from a
-// sibling checkout (../HTTP) by default; override with HTTP_PATH. Not yet published — a clean checkout
-// needs the sibling present (or HTTP_PATH set). Wired in alongside NIO during the strangler migration;
-// NIO is removed once the engine swap + currency-type migration land.
+// transport backbones, sans-I/O protocol engines, and the commodity middleware). Same env→URL shape
+// as the other first-party deps: override with HTTP_PATH for a local checkout, else resolve the
+// published repo. Wired in alongside NIO during the strangler migration; NIO is removed once the
+// engine swap + currency-type migration land.
 let httpDependency: Package.Dependency = {
     if let path = Context.environment["HTTP_PATH"], !path.isEmpty {
         return .package(path: path)
     }
-    return .package(path: "../HTTP")
+    return .package(url: "https://github.com/g-cqd/HTTP.git", branch: "main")
 }()
 // ADMCP (the transport-agnostic MCP JSON-RPC core + `Tool` DSL) was a standalone package; it is now a
 // target in THIS package (folded in), so there is no longer an ADMCP package dependency to resolve.
