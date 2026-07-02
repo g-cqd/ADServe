@@ -7,12 +7,13 @@
 
 public import ADConcurrency
 public import ADServeCore
-public import HTTPTypes
+public import HTTPCore
 public import Logging
+public import WebSocket
 
 /// RFC-0019 C1: the header the ADHTML runtime sets on every client-action fetch (`ADH-Request: 1`), so a
 /// handler can detect it and return a fragment. A valid HTTP token, so the force-unwrap is total.
-private let adhRequestFieldName = HTTPField.Name("ADH-Request")!
+private let adhRequestFieldName = HTTPFieldName("ADH-Request")!
 
 // MARK: - Handler contexts
 
@@ -48,10 +49,11 @@ extension HandlerContext {
     /// The connection's peer IP (the engine-seeded remote address); `nil` for a UDS/unknown peer. Behind
     /// a proxy this is the proxy — read `X-Forwarded-For` for the true client there.
     public var remoteAddress: String? { storage[RemoteAddressKey.self] }
-    /// The verified mTLS client certificate (DER bytes), present only on a mutual-TLS HTTP/1 connection
-    /// (`nil` otherwise). Its presence already implies NIOSSL verified the chain; parse it with your X.509
-    /// library for the subject/claims.
-    public var peerCertificateDER: [UInt8]? { storage[PeerCertificateKey.self] }
+    /// The verified mTLS client certificate's subject, present only on a mutual-TLS connection
+    /// (`nil` otherwise). Server-asserted from the verified handshake — a peer cannot spoof it. (The
+    /// full DER chain the pre-migration `peerCertificateDER` carried awaits an upstream transport
+    /// seam — the HTTP package's G3 follow-up.)
+    public var tlsPeerSubject: String? { storage[TLSPeerSubjectKey.self] }
     /// True when the ADHTML runtime issued this request — it carries the `ADH-Request` header (RFC-0019
     /// C1) — so the handler should return a `.fragment` (partial the client morphs) instead of a full
     /// page. Serves one route two ways: `ctx.isFragment ? .fragment(rowsHTML) : try .html(page)`.
@@ -64,7 +66,7 @@ extension HandlerContext {
         try codec.decoder.decode(type, from: request.body, contentType: request.headers[.contentType])
     }
     /// Encode `value` into a response via the configured codec (status defaults to `200`).
-    public func json<T: Encodable>(_ value: T, status: HTTPResponse.Status = .ok) throws
+    public func json<T: Encodable>(_ value: T, status: HTTPStatus = .ok) throws
         -> ResponseContent
     {
         let (bytes, contentType) = try codec.encoder.encode(value)
@@ -129,7 +131,7 @@ public struct StorageContext: HandlerContext {
 /// A fully-built route. `bind` returns a captures-applied handler when the path
 /// matches, else nil; `exactPath` (when non-nil) lets the table index it O(1).
 public struct CompiledRoute: Sendable {
-    let method: HTTPRequest.Method
+    let method: HTTPMethod
     let needsStorage: Bool
     let cache: CachePolicy
     let exactPath: String?
@@ -143,15 +145,20 @@ public struct CompiledRoute: Sendable {
     /// OpenAPI metadata supplied by `.summary`/`.tags`/`.body`/`.responds` (nil = undocumented).
     let doc: RouteDoc?
     /// A WebSocket handler for a `WS` route (the engine upgrades the matching request), else `nil`.
-    let webSocketHandler: WebSocketHandler?
+    let webSocketHandler: (any WebSocketHandler)?
+    /// The broadcast hub + topic a `Channel` route binds its connections to, else `nil`.
+    let webSocketHub: WebSocketHub?
+    let webSocketTopic: String?
     /// An async streaming-body handler for a `Stream` route (the engine feeds the body in), else `nil`.
     let streamingRun: StreamingRequestHandler?
     let bind: @Sendable (Substring) -> (@Sendable (HandlerInput) throws -> ResponseContent)?
 
     init(
-        method: HTTPRequest.Method, needsStorage: Bool, cache: CachePolicy, exactPath: String?,
+        method: HTTPMethod, needsStorage: Bool, cache: CachePolicy, exactPath: String?,
         middleware: [any HTTPMiddleware] = [], maxBodyBytes: Int? = nil,
-        pathTemplate: String? = nil, doc: RouteDoc? = nil, webSocketHandler: WebSocketHandler? = nil,
+        pathTemplate: String? = nil, doc: RouteDoc? = nil,
+        webSocketHandler: (any WebSocketHandler)? = nil,
+        webSocketHub: WebSocketHub? = nil, webSocketTopic: String? = nil,
         streamingRun: StreamingRequestHandler? = nil,
         bind: @escaping @Sendable (Substring) -> (@Sendable (HandlerInput) throws -> ResponseContent)?
     ) {
@@ -164,6 +171,8 @@ public struct CompiledRoute: Sendable {
         self.pathTemplate = pathTemplate
         self.doc = doc
         self.webSocketHandler = webSocketHandler
+        self.webSocketHub = webSocketHub
+        self.webSocketTopic = webSocketTopic
         self.streamingRun = streamingRun
         self.bind = bind
     }
@@ -174,7 +183,8 @@ public struct CompiledRoute: Sendable {
         CompiledRoute(
             method: method, needsStorage: needsStorage, cache: cache, exactPath: exactPath,
             middleware: middleware, maxBodyBytes: bytes, pathTemplate: pathTemplate, doc: doc,
-            webSocketHandler: webSocketHandler, streamingRun: streamingRun, bind: bind)
+            webSocketHandler: webSocketHandler, webSocketHub: webSocketHub,
+            webSocketTopic: webSocketTopic, streamingRun: streamingRun, bind: bind)
     }
 
     /// A copy carrying OpenAPI metadata — used by `RouteNode.build` to stamp `.summary`/`.body`/… onto
@@ -183,7 +193,8 @@ public struct CompiledRoute: Sendable {
         CompiledRoute(
             method: method, needsStorage: needsStorage, cache: cache, exactPath: exactPath,
             middleware: middleware, maxBodyBytes: maxBodyBytes, pathTemplate: pathTemplate, doc: doc,
-            webSocketHandler: webSocketHandler, streamingRun: streamingRun, bind: bind)
+            webSocketHandler: webSocketHandler, webSocketHub: webSocketHub,
+            webSocketTopic: webSocketTopic, streamingRun: streamingRun, bind: bind)
     }
 }
 
@@ -203,9 +214,9 @@ private final class TrieNode: @unchecked Sendable {
     /// The single `{param}` child (at most one slot per position) + its declared name.
     var param: (name: String, node: TrieNode)?
     /// A terminal `{catchAll*}` consuming the remainder, with its routes by method.
-    var catchAll: (name: String, routes: [HTTPRequest.Method: RoutePayload])?
+    var catchAll: (name: String, routes: [HTTPMethod: RoutePayload])?
     /// Routes terminating exactly at this node, by method (last writer wins per method).
-    var routes: [HTTPRequest.Method: RoutePayload] = [:]
+    var routes: [HTTPMethod: RoutePayload] = [:]
 }
 
 /// One frame of the iterative trie descent in `RouteTable.match`: the node under exploration, the
@@ -228,7 +239,9 @@ private struct RoutePayload: Sendable {
     let cache: CachePolicy
     let middleware: [any HTTPMiddleware]
     let maxBodyBytes: Int?
-    let webSocketHandler: WebSocketHandler?
+    let webSocketHandler: (any WebSocketHandler)?
+    let webSocketHub: WebSocketHub?
+    let webSocketTopic: String?
     let streamingRun: StreamingRequestHandler?
     let bind: @Sendable (Substring) -> (@Sendable (HandlerInput) throws -> ResponseContent)?
 
@@ -238,6 +251,8 @@ private struct RoutePayload: Sendable {
         middleware = route.middleware
         maxBodyBytes = route.maxBodyBytes
         webSocketHandler = route.webSocketHandler
+        webSocketHub = route.webSocketHub
+        webSocketTopic = route.webSocketTopic
         streamingRun = route.streamingRun
         bind = route.bind
     }
@@ -245,7 +260,8 @@ private struct RoutePayload: Sendable {
     func matched(_ run: @escaping @Sendable (HandlerInput) throws -> ResponseContent) -> MatchedRoute {
         MatchedRoute(
             needsStorage: needsStorage, cache: cache, middleware: middleware, maxBodyBytes: maxBodyBytes,
-            webSocketHandler: webSocketHandler, streamingRun: streamingRun, run: run)
+            webSocketHandler: webSocketHandler, webSocketHub: webSocketHub,
+            webSocketTopic: webSocketTopic, streamingRun: streamingRun, run: run)
     }
 }
 
@@ -260,6 +276,9 @@ public struct RouteTable: HTTPHandling {
     private let root: TrieNode
     /// Opaque `GET(match:)` routes in declaration order — consulted only after the trie misses.
     private let opaque: [CompiledRoute]
+    /// Whether any route declares a WebSocket handler, precomputed once — drives the engine's
+    /// HTTP/2 / HTTP/3 Extended CONNECT advertisement (RFC 8441 / RFC 9220).
+    public let hasWebSocketRoutes: Bool
 
     public init(routes: [CompiledRoute]) {
         let root = TrieNode()
@@ -273,6 +292,7 @@ public struct RouteTable: HTTPHandling {
         }
         self.root = root
         self.opaque = opaque
+        self.hasWebSocketRoutes = routes.contains { route in route.webSocketHandler != nil }
     }
 
     /// Insert one route's decomposed segments into the trie (build time only).
@@ -308,19 +328,19 @@ public struct RouteTable: HTTPHandling {
         node.routes[route.method] = RoutePayload(route)  // last writer wins per (node, method)
     }
 
-    public func match(method: HTTPRequest.Method, path: Substring) -> RouteMatch {
+    public func match(method: HTTPMethod, path: Substring) -> RouteMatch {
         let parts = path.split(separator: "/", omittingEmptySubsequences: true)
         // Insertion-ordered, de-duplicated 405 set: methods that WOULD serve this exact path were they
         // the request method. `bind`-guarded so a template that rejects the concrete path (e.g. encoded
         // traversal) never inflates `Allow`.
-        var allowed: [HTTPRequest.Method] = []
-        func remember(_ candidate: HTTPRequest.Method) {
+        var allowed: [HTTPMethod] = []
+        func remember(_ candidate: HTTPMethod) {
             if !allowed.contains(candidate) { allowed.append(candidate) }
         }
 
         // Serve `method` from a terminal's route map via its authoritative `bind`; otherwise record the
         // terminal's other bind-accepting methods for a possible 405.
-        func accept(_ map: [HTTPRequest.Method: RoutePayload]) -> MatchedRoute? {
+        func accept(_ map: [HTTPMethod: RoutePayload]) -> MatchedRoute? {
             if let payload = map[method], let run = payload.bind(path) {
                 return payload.matched(run)
             }
@@ -383,7 +403,7 @@ public struct RouteTable: HTTPHandling {
 
     /// The matched route's per-route body ceiling (`.maxBody`), or `nil`. The engine peeks this at the
     /// request head so an upload route can accept a body larger than the server default.
-    public func bodyLimit(method: HTTPRequest.Method, path: Substring) -> Int? {
+    public func bodyLimit(method: HTTPMethod, path: Substring) -> Int? {
         guard case .matched(let route) = match(method: method, path: path) else { return nil }
         return route.maxBodyBytes
     }

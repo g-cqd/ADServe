@@ -10,7 +10,7 @@
 
 public import ADServeCore
 import Dispatch
-import HTTPTypes
+import HTTPCore
 import Metrics
 
 /// A server-wide middleware that records a swift-metrics counter + latency timer for every request,

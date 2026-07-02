@@ -4,7 +4,7 @@
 // key exceeds `limit` requests in the window.
 
 import Foundation
-import HTTPTypes
+import HTTPCore
 import Synchronization
 
 /// One rate-limit decision for a request.
@@ -81,22 +81,22 @@ public struct RateLimit: HTTPMiddleware {
     ) async -> ResponseContent {
         let decision = store.admit(key: key(request, context), limit: limit, windowSeconds: windowSeconds)
         var headers = HTTPFields()
-        headers[rateLimitName] = String(limit)
-        headers[rateRemainingName] = String(decision.remaining)
-        headers[rateResetName] = String(decision.resetSeconds)
+        headers.setValue(String(limit), for: rateLimitName)
+        headers.setValue(String(decision.remaining), for: rateRemainingName)
+        headers.setValue(String(decision.resetSeconds), for: rateResetName)
         guard decision.allowed else {
-            headers[retryAfterFieldName] = String(decision.resetSeconds)
+            headers.setValue(String(decision.resetSeconds), for: retryAfterFieldName)
             return .full(
                 body: Array("rate limit exceeded\n".utf8), contentType: "text/plain; charset=utf-8",
-                status: HTTPResponse.Status(code: 429), headers: headers)
+                status: .tooManyRequests, headers: headers)
         }
         return (await next(request)).withHeaders(headers)
     }
 }
 
-// Header names not provided as `HTTPField.Name` statics by swift-http-types.
-private let forwardedForName = HTTPField.Name("x-forwarded-for")!
-private let rateLimitName = HTTPField.Name("ratelimit-limit")!
-private let rateRemainingName = HTTPField.Name("ratelimit-remaining")!
-private let rateResetName = HTTPField.Name("ratelimit-reset")!
-private let retryAfterFieldName = HTTPField.Name("retry-after")!
+// Header names not provided as `HTTPFieldName` statics by swift-http-types.
+private let forwardedForName = HTTPFieldName("x-forwarded-for")!
+private let rateLimitName = HTTPFieldName("ratelimit-limit")!
+private let rateRemainingName = HTTPFieldName("ratelimit-remaining")!
+private let rateResetName = HTTPFieldName("ratelimit-reset")!
+private let retryAfterFieldName = HTTPFieldName("retry-after")!

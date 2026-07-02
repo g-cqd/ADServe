@@ -5,18 +5,18 @@
 // keep handlers from hand-rolling `.full(...)` for common REST shapes.
 
 import ADJSON
-public import HTTPTypes
+public import HTTPCore
 
 // MARK: - Typed error
 
 /// An error a handler throws to produce a specific HTTP status. Carries an optional human `detail`
 /// and extra response headers (e.g. `WWW-Authenticate` on a 401, `Retry-After` on a 429).
 public struct HTTPError: Error, Sendable, CustomStringConvertible {
-    public var status: HTTPResponse.Status
+    public var status: HTTPStatus
     public var detail: String?
     public var headers: HTTPFields
 
-    public init(_ status: HTTPResponse.Status, _ detail: String? = nil, headers: HTTPFields = [:]) {
+    public init(_ status: HTTPStatus, _ detail: String? = nil, headers: HTTPFields = HTTPFields()) {
         self.status = status
         self.detail = detail
         self.headers = headers
@@ -32,16 +32,16 @@ public struct HTTPError: Error, Sendable, CustomStringConvertible {
     public static func notFound(_ detail: String? = nil) -> HTTPError { .init(.notFound, detail) }
     public static func conflict(_ detail: String? = nil) -> HTTPError { .init(.conflict, detail) }
     public static func unsupportedMediaType(_ detail: String? = nil) -> HTTPError {
-        .init(HTTPResponse.Status(code: 415), detail)
+        .init(.unsupportedMediaType, detail)
     }
     public static func contentTooLarge(_ detail: String? = nil) -> HTTPError {
-        .init(HTTPResponse.Status(code: 413), detail)
+        .init(.contentTooLarge, detail)
     }
     public static func unprocessableContent(_ detail: String? = nil) -> HTTPError {
-        .init(HTTPResponse.Status(code: 422), detail)
+        .init(.unprocessableContent, detail)
     }
     public static func tooManyRequests(_ detail: String? = nil) -> HTTPError {
-        .init(HTTPResponse.Status(code: 429), detail)
+        .init(.tooManyRequests, detail)
     }
     public static func internalServerError(_ detail: String? = nil) -> HTTPError {
         .init(.internalServerError, detail)
@@ -74,20 +74,20 @@ public struct ProblemDetails: Encodable, Sendable {
 
 extension ResponseContent {
     /// An `application/problem+json` (RFC 9457) response.
-    public static func problem(_ problem: ProblemDetails, headers: HTTPFields = [:]) -> ResponseContent {
+    public static func problem(_ problem: ProblemDetails, headers: HTTPFields = HTTPFields()) -> ResponseContent {
         let bytes =
             (try? ADJSON.JSONEncoder().encodeToBytes(problem))
             ?? Array(#"{"title":"Internal Server Error","status":500}"#.utf8)
         return .full(
             body: bytes, contentType: "application/problem+json",
-            status: HTTPResponse.Status(code: problem.status), headers: headers)
+            status: HTTPStatus(code: problem.status) ?? .internalServerError, headers: headers)
     }
 
     /// The problem response for a thrown `HTTPError` (used by the engine's error boundary).
     public static func problem(_ error: HTTPError, instance: String? = nil) -> ResponseContent {
         problem(
             ProblemDetails(
-                title: error.status.reasonPhrase, status: error.status.code, detail: error.detail,
+                title: error.status.reasonPhrase, status: Int(error.status.code), detail: error.detail,
                 instance: instance), headers: error.headers)
     }
 
@@ -97,7 +97,7 @@ extension ResponseContent {
         location: String? = nil
     ) -> ResponseContent {
         var headers = HTTPFields()
-        if let location { headers[.location] = location }
+        if let location { headers.setValue(location, for: .location) }
         return .full(body: bytes, contentType: contentType, status: .created, headers: headers)
     }
 
@@ -116,14 +116,29 @@ extension ResponseContent {
     /// A redirect to `location` — `303 See Other` by default, `308 Permanent Redirect` when `permanent`.
     public static func redirect(to location: String, permanent: Bool = false) -> ResponseContent {
         var headers = HTTPFields()
-        headers[.location] = location
+        headers.setValue(location, for: .location)
         return .full(
             body: [], contentType: "text/plain; charset=utf-8",
-            status: HTTPResponse.Status(code: permanent ? 308 : 303), headers: headers)
+            status: permanent ? .permanentRedirect : .seeOther, headers: headers)
     }
 
     /// A bare status with an empty body (e.g. `.status(.notModified)`).
-    public static func status(_ status: HTTPResponse.Status) -> ResponseContent {
+    public static func status(_ status: HTTPStatus) -> ResponseContent {
         .full(body: [], contentType: "text/plain; charset=utf-8", status: status, headers: HTTPFields())
     }
+}
+
+// MARK: - Registered statuses HTTPCore does not name (defined once for the factories above)
+
+extension HTTPStatus {
+    /// `303 See Other` (RFC 9110 §15.4.4).
+    public static let seeOther = HTTPStatus(code: 303)!
+    /// `308 Permanent Redirect` (RFC 9110 §15.4.9).
+    public static let permanentRedirect = HTTPStatus(code: 308)!
+    /// `409 Conflict` (RFC 9110 §15.5.10).
+    public static let conflict = HTTPStatus(code: 409)!
+    /// `415 Unsupported Media Type` (RFC 9110 §15.5.16).
+    public static let unsupportedMediaType = HTTPStatus(code: 415)!
+    /// `422 Unprocessable Content` (RFC 9110 §15.5.21).
+    public static let unprocessableContent = HTTPStatus(code: 422)!
 }

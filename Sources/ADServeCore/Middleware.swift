@@ -1,7 +1,7 @@
 // Request-scoped storage + built-in middleware (CORS, security headers) + the response-header merge
 // they decorate `next`'s response with. All compose through the `HTTPMiddleware` onion.
 
-public import HTTPTypes
+public import HTTPCore
 private import Synchronization
 
 // MARK: - Request-scoped storage
@@ -59,12 +59,14 @@ public enum RemoteAddressKey: StorageKey {
     public typealias Value = String
 }
 
-/// The `RequestStorage` key carrying the mTLS client certificate as DER bytes — seeded by the engine on
-/// an HTTP/1 connection that presented one (mutual TLS). Absent on plaintext, one-way TLS, or HTTP/2
-/// streams. Read via `ctx.peerCertificateDER`; parse it with swift-certificates / your X.509 lib of
-/// choice. Its mere presence means NIOSSL already verified the chain against the configured trust roots.
-public enum PeerCertificateKey: StorageKey {
-    public typealias Value = [UInt8]
+/// The `RequestStorage` key carrying the verified mTLS client certificate's SUBJECT — seeded by the
+/// engine on a connection whose handshake presented one (mutual TLS). Absent on plaintext or one-way
+/// TLS. Read via `ctx.tlsPeerSubject`. Server-asserted: captured from the verified TLS handshake,
+/// never from a client-supplied header, so a peer cannot spoof it. (The transport seam surfaces the
+/// leaf subject only; the full DER chain — the pre-migration `PeerCertificateKey` — is a recorded
+/// upstream gap, tracked as the HTTP package's G3 follow-up.)
+public enum TLSPeerSubjectKey: StorageKey {
+    public typealias Value = String
 }
 
 // MARK: - Response header decoration
@@ -110,7 +112,7 @@ extension ResponseContent {
 /// is outermost and sees the preflight before routing).
 public struct CORS: HTTPMiddleware {
     public var allowOrigin: String
-    public var allowMethods: [HTTPRequest.Method]
+    public var allowMethods: [HTTPMethod]
     public var allowHeaders: [String]
     public var exposeHeaders: [String]
     public var allowCredentials: Bool
@@ -118,7 +120,7 @@ public struct CORS: HTTPMiddleware {
 
     public init(
         allowOrigin: String = "*",
-        allowMethods: [HTTPRequest.Method] = [.get, .post, .put, .patch, .delete, .options],
+        allowMethods: [HTTPMethod] = [.get, .post, .put, .patch, .delete, .options],
         allowHeaders: [String] = ["Content-Type", "Authorization"], exposeHeaders: [String] = [],
         allowCredentials: Bool = false, maxAgeSeconds: Int = 600
     ) {
@@ -137,15 +139,16 @@ public struct CORS: HTTPMiddleware {
         let isPreflight =
             request.method == .options && request.headers[name("access-control-request-method")] != nil
         var cors = HTTPFields()
-        cors[name("access-control-allow-origin")] = allowOrigin
-        if allowCredentials { cors[name("access-control-allow-credentials")] = "true" }
+        cors.setValue(allowOrigin, for: name("access-control-allow-origin"))
+        if allowCredentials { cors.setValue("true", for: name("access-control-allow-credentials")) }
         if !exposeHeaders.isEmpty {
-            cors[name("access-control-expose-headers")] = exposeHeaders.joined(separator: ", ")
+            cors.setValue(exposeHeaders.joined(separator: ", "), for: name("access-control-expose-headers"))
         }
         if isPreflight {
-            cors[name("access-control-allow-methods")] = allowMethods.map(\.rawValue).joined(separator: ", ")
-            cors[name("access-control-allow-headers")] = allowHeaders.joined(separator: ", ")
-            cors[name("access-control-max-age")] = String(maxAgeSeconds)
+            cors.setValue(
+                allowMethods.map(\.rawValue).joined(separator: ", "), for: name("access-control-allow-methods"))
+            cors.setValue(allowHeaders.joined(separator: ", "), for: name("access-control-allow-headers"))
+            cors.setValue(String(maxAgeSeconds), for: name("access-control-max-age"))
             return .full(body: [], contentType: "text/plain; charset=utf-8", status: .noContent, headers: cors)
         }
         return (await next(request)).withHeaders(cors)
@@ -191,19 +194,20 @@ public struct SecurityHeaders: HTTPMiddleware {
             self.headers = headers
         } else {
             var defaults = HTTPFields()
-            defaults[name("x-content-type-options")] = "nosniff"
-            defaults[name("x-frame-options")] = "DENY"
-            defaults[name("referrer-policy")] = "strict-origin-when-cross-origin"
-            defaults[name("cross-origin-opener-policy")] = "same-origin"
-            defaults[name("cross-origin-resource-policy")] = "same-origin"
+            defaults.setValue("nosniff", for: name("x-content-type-options"))
+            defaults.setValue("DENY", for: name("x-frame-options"))
+            defaults.setValue("strict-origin-when-cross-origin", for: name("referrer-policy"))
+            defaults.setValue("same-origin", for: name("cross-origin-opener-policy"))
+            defaults.setValue("same-origin", for: name("cross-origin-resource-policy"))
             // Deny the powerful features a typical API/site never needs, so an injected script can't
             // reach them. Override by passing your own `HTTPFields` if a feature IS needed.
-            defaults[name("permissions-policy")] =
+            defaults.setValue(
                 "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), "
-                + "microphone=(), payment=(), usb=()"
+                    + "microphone=(), payment=(), usb=()",
+                for: name("permissions-policy"))
             self.headers = defaults
         }
-        if let hsts { self.headers[name("strict-transport-security")] = hsts.headerValue }
+        if let hsts { self.headers.setValue(hsts.headerValue, for: name("strict-transport-security")) }
     }
 
     public func intercept(
@@ -255,7 +259,7 @@ public struct CSPNonce: HTTPMiddleware {
         context.storage[CSPNonceKey.self] = nonce
         let response = await next(request)
         var headers = HTTPFields()
-        headers[name("content-security-policy")] = policy(nonce)
+        headers.setValue(policy(nonce), for: name("content-security-policy"))
         return response.withHeaders(headers)
     }
 
@@ -277,4 +281,4 @@ public struct CSPNonce: HTTPMiddleware {
 
 /// A lowercase HTTP field name (the swift-http-types canonical form). Traps on an invalid token —
 /// these are compile-time-constant literals.
-private func name(_ token: String) -> HTTPField.Name { HTTPField.Name(token)! }
+private func name(_ token: String) -> HTTPFieldName { HTTPFieldName(token)! }

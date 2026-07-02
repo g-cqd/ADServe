@@ -4,7 +4,7 @@
 // middleware persists changes and sets/rotates/expires the cookie after the handler returns.
 
 import Foundation
-import HTTPTypes
+import HTTPCore
 import Synchronization
 
 // MARK: - Store

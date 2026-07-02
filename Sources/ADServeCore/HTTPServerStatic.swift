@@ -1,20 +1,21 @@
 // Guarded static-asset serving (adserve-requirements #4 + the hardening round). The blocking
-// jail/stat/range/encoding decision runs on the engine's NIOThreadPool (off the event loop) and returns
-// a PLAN; the engine then streams the chosen file (or byte range) back in bounded chunks — also off the
-// loop — writing each on the loop (implicit back-pressure). The path is canonicalized with
-// `standardizedFileURL` + `resolvingSymlinksInPath`, so `..` (already rejected upstream by PathTemplate)
-// AND symlink escape are caught — every served path (identity or `.br`/`.gz` sibling) must stay inside
-// the resolved root.
+// jail/stat/range/encoding decision runs on the engine's blocking-offload pool (never the
+// cooperative pool) and returns a PLAN; the response half then streams the chosen file (or byte
+// range) back in bounded chunks through the engine's `ResponseStream` — each chunk read off-pool
+// and written with implicit transport back-pressure. The path is canonicalized with
+// `standardizedFileURL` + `resolvingSymlinksInPath`, so `..` (already rejected upstream by
+// PathTemplate) AND symlink escape are caught — every served path (identity or `.br`/`.gz`
+// sibling) must stay inside the resolved root.
 //
-// Hardening: a strong size+mtime ETag (B1); precompressed `.br`/`.gz` negotiation by `Accept-Encoding`
-// for compressible types (B2); HTTP `Range`/206 + 416 (B3); and chunked streaming so even a large file
-// never materializes whole (B4).
+// Hardening: a strong size+mtime ETag (B1); precompressed `.br`/`.gz` negotiation by
+// `Accept-Encoding` for compressible types (B2); HTTP `Range`/206 + 416 (B3); and chunked
+// streaming so even a large file never materializes whole (B4).
 
+import ADConcurrency
 import Foundation
-import HTTPTypes
-import NIOCore
-import NIOHTTPTypes
-import NIOPosix
+import HTTPCore
+import HTTPServer
+import Synchronization
 
 #if canImport(Darwin)
     import Darwin
@@ -64,168 +65,193 @@ enum ResolvedStaticPlanKey: StorageKey {
     typealias Value = StaticPlan
 }
 
-// Header names not provided as `HTTPField.Name` statics by swift-http-types.
-private let rangeName = HTTPField.Name("range")!
-private let acceptRangesName = HTTPField.Name("accept-ranges")!
-private let contentRangeName = HTTPField.Name("content-range")!
-private let contentEncodingName = HTTPField.Name("content-encoding")!
-private let varyName = HTTPField.Name("vary")!
+// Header names not provided as `HTTPFieldName` statics by swift-http-types.
+private let rangeName = HTTPFieldName("range")!
+private let acceptRangesName = HTTPFieldName("accept-ranges")!
+private let contentRangeName = HTTPFieldName("content-range")!
+private let contentEncodingName = HTTPFieldName("content-encoding")!
+private let varyName = HTTPFieldName("vary")!
 
-extension HTTPServer {
-    /// Resolve a `.file` response off the event loop into a `StaticPlan`, BEFORE the middleware chain
-    /// unwinds: stash it on `storage` (`ResolvedStaticPlanKey`) so `writeFile` reuses it (one stat per
-    /// request, not two) and record its real status in the `ResponseStatusBox` so observing middleware
-    /// (`RequestLogging`/metrics) log the true 200/206/304/404/416. A no-op for non-`.file` content.
+/// Owns one read-only file descriptor for a streamed static response: closed exactly once —
+/// explicitly when the stream producer finishes, or via ARC if the response is dropped without the
+/// producer ever running (e.g. a failed head write) — so a descriptor can never leak.
+final class FileDescriptorBox: Sendable {
+    private let closed = Atomic<Bool>(false)
+    let descriptor: Int32
+
+    init(descriptor: Int32) { self.descriptor = descriptor }
+
+    func close() {
+        if closed.exchange(true, ordering: .acquiringAndReleasing) == false {
+            HTTPServer.closeDescriptor(descriptor)
+        }
+    }
+
+    deinit { close() }
+}
+
+extension EngineResponder {
+    /// Resolve a `.file` response off the cooperative pool into a `StaticPlan`, BEFORE the middleware
+    /// chain unwinds: stash it on `storage` (`ResolvedStaticPlanKey`) so `fileResponse` reuses it (one
+    /// stat per request, not two) and record its real status in the `ResponseStatusBox` so observing
+    /// middleware (`RequestLogging`/metrics) log the true 200/206/304/404/416. A no-op otherwise.
     func recordStaticStatus(
-        _ content: ResponseContent, request: ServerRequest, storage: RequestStorage,
-        threadPool: NIOThreadPool
+        _ content: ResponseContent, request: ServerRequest, storage: RequestStorage
     ) async {
         guard case .file(let root, let subpath, let contentType, let headers) = content else { return }
         let file = StaticFileRequest(
             root: root, subpath: subpath, contentType: contentType, headers: headers)
+        let requestHeaders = request.headers
         let plan =
-            (try? await threadPool.runIfActive {
-                Self.planStaticFile(file: file, headers: request.headers)
+            (try? await offload.run {
+                HTTPServer.planStaticFile(file: file, headers: requestHeaders)
             }) ?? .notFound
         storage[ResolvedStaticPlanKey.self] = plan
         storage[ResponseStatusKey.self]?.record(plan.statusCode)
     }
 
-    func writeFile(
-        _ file: StaticFileRequest, cache: CachePolicy, requestID: String, exchange: RequestExchange
-    ) async throws {
-        let head = exchange.head
-        let keepAlive = isKeepAlive(head)
-        let suppressBody = head.method == .head
-
+    /// Lowers a `.file` onto the engine response: 404 / 304 / 416 directly, or a 200/206 whose body
+    /// is a `ResponseStream` reading bounded chunks from ONE held descriptor (TOCTOU-safe) off-pool.
+    func fileResponse(
+        _ file: StaticFileRequest, cache: CachePolicy, environment: ResponseEnvironment
+    ) async -> ServerResponse {
         // Reuse the plan the route terminal already resolved (single stat); fall back to a fresh
-        // resolution for direct `write` callers that bypass the terminal (e.g. unit tests).
+        // resolution for direct callers that bypass the terminal (e.g. unit tests).
         let plan: StaticPlan
-        if let cached = exchange.storage[ResolvedStaticPlanKey.self] {
+        if let cached = environment.storage[ResolvedStaticPlanKey.self] {
             plan = cached
         } else {
             plan =
-                (try? await exchange.threadPool.runIfActive {
-                    Self.planStaticFile(file: file, headers: head.headerFields)
+                (try? await offload.run {
+                    HTTPServer.planStaticFile(file: file, headers: HTTPFields())
                 }) ?? .notFound
         }
 
         switch plan {
             case .notFound:
-                try await write(
-                    .plain(.notFound, "not found\n"), cache: .noStore, requestID: requestID,
-                    keepAlive: keepAlive, suppressBody: suppressBody, exchange: exchange)
+                return await finalize(
+                    .plain(.notFound, "not found\n"), cache: .noStore, environment: environment)
 
             case .notModified(let etag, let lastModified):
-                var headers = staticHeaders(
-                    cache: cache, requestID: requestID, keepAlive: keepAlive, exchange: exchange)
-                headers[.eTag] = etag
-                headers[.lastModified] = lastModified
+                var headers = staticHeaders(cache: cache, environment: environment)
+                headers.setValue(etag, for: .etag)
+                headers.setValue(lastModified, for: .lastModified)
                 mergeResponseHeaders(file.headers, into: &headers)
-                try await exchange.outbound.write(
-                    contentsOf: [.head(HTTPResponse(status: .notModified, headerFields: headers)), .end(nil)])
+                return ServerResponse(HTTPResponse(status: .notModified, headerFields: headers))
 
             case .rangeNotSatisfiable(let totalSize):
-                var headers = staticHeaders(
-                    cache: cache, requestID: requestID, keepAlive: keepAlive, exchange: exchange)
-                headers[contentRangeName] = "bytes */\(totalSize)"
+                var headers = staticHeaders(cache: cache, environment: environment)
+                headers.setValue("bytes */\(totalSize)", for: contentRangeName)
                 mergeResponseHeaders(file.headers, into: &headers)
-                let responseHead = HTTPResponse(status: HTTPResponse.Status(code: 416), headerFields: headers)
-                try await exchange.outbound.write(contentsOf: [.head(responseHead), .end(nil)])
+                return ServerResponse(
+                    HTTPResponse(status: .rangeNotSatisfiable, headerFields: headers))
 
-            case .serve(let path, let partial, let etag, let lastModified, let encoding, let totalSize, let range):
-                // Open the file ONCE and stream every chunk from this single descriptor: a mid-flight
-                // unlink/replace can no longer swap the bytes served (the open fd pins the original inode),
-                // and the prior re-open-per-chunk (a fresh TOCTOU window each chunk) is gone. A file that
-                // vanished between the plan's stat and this open collapses to 404.
-                guard let fd = Self.openForReading(path) else {
-                    try await write(
-                        .plain(.notFound, "not found\n"), cache: .noStore, requestID: requestID,
-                        keepAlive: keepAlive, suppressBody: suppressBody, exchange: exchange)
-                    return
-                }
-                defer { Self.closeDescriptor(fd) }
-                let start = range?.lowerBound ?? 0
-                let length = range.map { $0.upperBound - $0.lowerBound + 1 } ?? totalSize
-                var headers = staticHeaders(
-                    cache: cache, requestID: requestID, keepAlive: keepAlive, exchange: exchange)
-                headers[.contentType] = file.contentType
-                headers[.contentLength] = String(length)
-                headers[.eTag] = etag
-                headers[.lastModified] = lastModified
-                if let encoding {
-                    headers[contentEncodingName] = encoding
-                    headers[varyName] = "Accept-Encoding"
-                }
-                if let range {
-                    headers[contentRangeName] = "bytes \(range.lowerBound)-\(range.upperBound)/\(totalSize)"
-                }
-                mergeResponseHeaders(file.headers, into: &headers)
-                let status = partial ? HTTPResponse.Status(code: 206) : .ok
-                let responseHead = HTTPResponse(status: status, headerFields: headers)
-                if suppressBody || length == 0 {
-                    // No body (HEAD / empty file / 0-length range): head + end in ONE flush.
-                    try await exchange.outbound.write(contentsOf: [.head(responseHead), .end(nil)])
-                } else {
-                    try await streamFileBody(
-                        head: responseHead, fd: fd, start: start, length: length, exchange: exchange)
-                }
+            case .serve(
+                let path, let partial, let etag, let lastModified, let encoding, let totalSize,
+                let range):
+                let serve = ResolvedServe(
+                    path: path, partial: partial, etag: etag, lastModified: lastModified,
+                    contentEncoding: encoding, totalSize: totalSize, range: range)
+                return await serveResponse(serve, file: file, cache: cache, environment: environment)
         }
+    }
+
+    /// The `.serve` arm of ``fileResponse``: opens the ONE descriptor the whole response streams
+    /// from (a mid-flight unlink/replace cannot swap the served bytes — the fd pins the inode), so a
+    /// file that vanished between the plan's stat and this open collapses to 404.
+    private func serveResponse(
+        _ serve: ResolvedServe, file: StaticFileRequest, cache: CachePolicy,
+        environment: ResponseEnvironment
+    ) async -> ServerResponse {
+        guard let descriptor = await openDescriptor(serve.path) else {
+            return await finalize(
+                .plain(.notFound, "not found\n"), cache: .noStore, environment: environment)
+        }
+        let start = serve.range?.lowerBound ?? 0
+        let length = serve.range.map { $0.upperBound - $0.lowerBound + 1 } ?? serve.totalSize
+        var headers = staticHeaders(cache: cache, environment: environment)
+        headers.setValue(file.contentType, for: .contentType)
+        headers.setValue(String(length), for: .contentLength)
+        headers.setValue(serve.etag, for: .etag)
+        headers.setValue(serve.lastModified, for: .lastModified)
+        if let encoding = serve.contentEncoding {
+            headers.setValue(encoding, for: contentEncodingName)
+            headers.setValue("Accept-Encoding", for: varyName)
+        }
+        if let range = serve.range {
+            headers.setValue(
+                "bytes \(range.lowerBound)-\(range.upperBound)/\(serve.totalSize)",
+                for: contentRangeName)
+        }
+        mergeResponseHeaders(file.headers, into: &headers)
+        let status: HTTPStatus = serve.partial ? .partialContent : .ok
+        let head = HTTPResponse(status: status, headerFields: headers)
+        if environment.isHead || length == 0 {
+            // No body (HEAD / empty file / 0-length range): the preset Content-Length stands.
+            descriptor.close()
+            return ServerResponse(head)
+        }
+        let offload = offload
+        return ServerResponse(
+            head,
+            stream: ResponseStream(contentLength: length) { writer in
+                defer { descriptor.close() }
+                let chunkSize = 256 * 1024
+                var sent = 0
+                while sent < length {
+                    let offset = start + sent
+                    let count = min(chunkSize, length - sent)
+                    let chunk = try await offload.run {
+                        HTTPServer.readChunk(fd: descriptor.descriptor, offset: offset, count: count)
+                    }
+                    guard let chunk, !chunk.isEmpty else {
+                        // Truncated / changed underneath us: end the stream short — the engine
+                        // closes the connection rather than under-deliver the Content-Length.
+                        throw StaticStreamError.truncated
+                    }
+                    try await writer.write(chunk)
+                    sent += chunk.count
+                }
+            })
+    }
+
+    /// The `.serve` case's payload, regrouped as one value so the serving arm stays within the
+    /// parameter budget.
+    private struct ResolvedServe {
+        let path: String
+        let partial: Bool
+        let etag: String
+        let lastModified: String
+        let contentEncoding: String?
+        let totalSize: Int
+        let range: ClosedRange<Int>?
+    }
+
+    /// Opens `path` read-only on the offload pool, boxed for exactly-once close; `nil` on failure.
+    private func openDescriptor(_ path: String) async -> FileDescriptorBox? {
+        let opened = try? await offload.run { HTTPServer.openForReading(path) }
+        guard let descriptor = opened ?? nil else { return nil }
+        return FileDescriptorBox(descriptor: descriptor)
     }
 
     /// The headers every static response shares: the common envelope (cache-control, security set,
-    /// request-id, connection) plus `Accept-Ranges: bytes` (range support is advertised on all of them).
+    /// request-id, connection) plus `Accept-Ranges: bytes` (range support is advertised on all).
     private func staticHeaders(
-        cache: CachePolicy, requestID: String, keepAlive: Bool, exchange: RequestExchange
+        cache: CachePolicy, environment: ResponseEnvironment
     ) -> HTTPFields {
-        var headers = commonHeaders(
-            cache: cache, requestID: requestID, keepAlive: keepAlive, isHTTP2: exchange.isHTTP2)
-        headers[acceptRangesName] = "bytes"
+        var headers = commonHeaders(cache: cache, environment: environment)
+        headers.setValue("bytes", for: acceptRangesName)
         return headers
     }
+}
 
-    /// Streams `[start, start+length)` of the file in bounded chunks: each chunk is read off the event
-    /// loop (NIOThreadPool) and written on it (back-pressure implicit) — so even a large file never
-    /// materializes whole. The response HEAD rides along with the first body chunk in one batched write,
-    /// NEVER flushed on its own: a lone head reaches `HTTPResponseCompressor` before any body, so the
-    /// compressor cannot recompute `Content-Length` for the compressed bytes and emits the original
-    /// (identity) length — a gzip-accepting client (every browser) then blocks waiting for bytes that
-    /// never arrive, and the response hangs until the idle timeout fires. Batching lets the compressor
-    /// switch the response to chunked (when it compresses) or pass the head through with its identity
-    /// `Content-Length` intact (when it does not). A short/failed read ends the body (the connection
-    /// drops without a clean end).
-    private func streamFileBody(
-        head: HTTPResponse, fd: Int32, start: Int, length: Int, exchange: RequestExchange
-    ) async throws {
-        let chunkSize = 256 * 1024
-        var sent = 0
-        var headPending = true
-        while sent < length {
-            let offset = start + sent
-            let count = min(chunkSize, length - sent)
-            let chunk = try await exchange.threadPool.runIfActive {
-                Self.readChunk(fd: fd, offset: offset, count: count)
-            }
-            guard let chunk, !chunk.isEmpty else { break }  // truncated / changed underneath us
-            var buffer = exchange.allocator.buffer(capacity: chunk.count)
-            buffer.writeBytes(chunk)
-            if headPending {
-                try await exchange.outbound.write(contentsOf: [.head(head), .body(buffer)])
-                headPending = false
-            } else {
-                try await exchange.outbound.write(.body(buffer))
-            }
-            sent += chunk.count
-        }
-        if headPending {
-            // The first read yielded nothing (file truncated/vanished mid-flight): still emit the head,
-            // batched with the end, so the exchange terminates rather than dangling.
-            try await exchange.outbound.write(contentsOf: [.head(head), .end(nil)])
-        } else {
-            try await exchange.outbound.write(.end(nil))
-        }
-    }
+/// A static stream that could not deliver its full advertised length (the file was truncated or
+/// replaced mid-flight) — thrown so the engine tears the connection down instead of under-delivering.
+enum StaticStreamError: Error {
+    case truncated
+}
 
+extension HTTPServer {
     /// BLOCKING — runs on the offload pool. Canonicalizes + jails the path, requires a regular file,
     /// negotiates a precompressed `.br`/`.gz` sibling (compressible types, no `Range`), derives a strong
     /// size+mtime ETag, and decides 200 / 206 / 304 / 416 / 404 — WITHOUT reading the body (that streams
@@ -261,7 +287,7 @@ extension HTTPServer {
         if compressible, rangeHeader == nil {
             let accept = headers[.acceptEncoding] ?? ""
             for (token, suffix) in [("br", ".br"), ("gzip", ".gz")] where contentEncoding == nil {
-                if acceptsEncoding(accept, token),
+                if AcceptEncoding.allows(accept, token),
                     let (path, attrs) = precompressedSibling(fileManager, identityReal, suffix, root: rootReal)
                 {
                     servePath = path
@@ -379,21 +405,6 @@ extension HTTPServer {
         guard read >= 0 else { return nil }
         if read < count { buffer.removeLast(count - read) }
         return read == 0 ? [] : buffer
-    }
-
-    /// True if `acceptEncoding` permits `token` (present and not explicitly `;q=0`).
-    private static func acceptsEncoding(_ acceptEncoding: String, _ token: String) -> Bool {
-        for part in acceptEncoding.lowercased().split(separator: ",") {
-            let fields = part.split(separator: ";")
-            guard let name = fields.first?.trimmingCharacters(in: .whitespaces), name == token || name == "*"
-            else { continue }
-            let zeroQ = fields.dropFirst()
-                .contains {
-                    $0.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: " ", with: "") == "q=0"
-                }
-            if !zeroQ { return true }
-        }
-        return false
     }
 
     private enum RangeOutcome {

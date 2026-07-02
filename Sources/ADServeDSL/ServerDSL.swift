@@ -22,7 +22,8 @@
 
 import ADJSON
 public import ADServeCore
-import HTTPTypes
+import HTTPCore
+public import WebSocket
 
 // MARK: - Pool (type-safe storage)
 
@@ -286,12 +287,78 @@ public func OPTIONS<P: PoolScope>(
     _ handler: @escaping @Sendable (P.Context, PathParameters) throws -> ResponseContent
 ) -> RouteNode { templateRoute(.options, template, pool: pool, handler) }
 
-/// A WebSocket endpoint: a `GET` at `subpath` that the engine UPGRADES (HTTP/1 `Upgrade: websocket`) and
-/// runs `handler` over the live `WebSocketConnection`. A non-upgrade `GET` to the same path gets `426
-/// Upgrade Required`. WebSocket-over-TLS (wss direct) is not wired; terminate TLS at the proxy.
+/// A WebSocket endpoint: a `GET` at `subpath` the engine UPGRADES (HTTP/1 `Upgrade: websocket`, or
+/// an HTTP/2/3 Extended CONNECT) and drives through `handler` — the sans-I/O event → actions seam
+/// (fragmented frames are reassembled and pings auto-ponged by the engine before your handler sees
+/// them). A non-upgrade `GET` to the same path gets `426 Upgrade Required`. Cross-site handshakes
+/// are rejected by ADServe's CSWSH gate (same-origin or origin-less only).
 ///
-///   WS("chat") { conn in for await message in conn.messages { try? await conn.send(message) } }
-public func WS(_ subpath: String = "/", _ handler: @escaping WebSocketHandler) -> RouteNode {
+///   WS("chat", handler: EchoHandler())
+public func WS(_ subpath: String = "/", handler: any WebSocketHandler) -> RouteNode {
+    webSocketRoute(subpath, handler: handler, hub: nil, topic: nil)
+}
+
+/// The closure form of ``WS(_:handler:)``: `handle` receives each connection event (`.message`,
+/// `.ping`, `.pong`, `.close`) and returns the frames to send back.
+///
+///   WS("chat") { event in
+///     guard case .message(let opcode, let payload) = event, opcode == .text else { return [] }
+///     return [.sendText(String(decoding: payload, as: UTF8.self))]   // echo
+///   }
+public func WS(
+    _ subpath: String = "/",
+    _ handle: @escaping @Sendable (WebSocketEvent) async -> [WebSocketAction]
+) -> RouteNode {
+    WS(subpath, handler: ClosureWebSocketHandler(isOriginAllowed: { _ in true }, handle: handle))
+}
+
+/// A `WS` endpoint bound to a ``WebSocketHub`` topic: the engine AUTO-subscribes each connection
+/// when the socket opens and unsubscribes it when it closes (or drops, or the server quiesces),
+/// collapsing the subscribe / hold-open / unsubscribe lifecycle into one line. The server pushes to
+/// every subscriber with `hub.broadcast(_:to:)` / `hub.publish(_:to:)` (typically fired from a
+/// mutation route). This is the server-push ("live updates") shape; inbound frames are ignored —
+/// use the `receiving:` overload to react to them.
+///
+///     let hub = WebSocketHub()
+///     Channel("/ws/parts", on: hub, topic: "parts")            // clients subscribe to receive pushes
+///     // …from the mutation route:  Task { await hub.broadcast(partJSON, to: "parts") }
+public func Channel(_ subpath: String = "/", on hub: WebSocketHub, topic: String) -> RouteNode {
+    webSocketRoute(
+        subpath,
+        handler: ClosureWebSocketHandler(isOriginAllowed: { _ in true }, handle: { _ in [] }),
+        hub: hub, topic: topic)
+}
+
+/// The bidirectional ``Channel``: as the subscribe-only form, plus inbound text frames are decoded
+/// as `Inbound` (JSON, via ADJSON) and delivered to `onMessage`. Failure-safe — a non-text or
+/// undecodable frame is skipped, never thrown (a hostile peer can't tear the connection down). The
+/// handler typically re-publishes through the hub it captured.
+///
+///     Channel("/ws/room", on: hub, topic: "room", receiving: ChatLine.self) { line in
+///       await hub.broadcast(render(line), to: "room")          // re-broadcast to everyone
+///     }
+public func Channel<Inbound: Decodable & Sendable>(
+    _ subpath: String = "/", on hub: WebSocketHub, topic: String,
+    receiving: Inbound.Type = Inbound.self,
+    _ onMessage: @escaping @Sendable (Inbound) async -> Void
+) -> RouteNode {
+    let handler = ClosureWebSocketHandler(
+        isOriginAllowed: { _ in true },
+        handle: { event in
+            guard case .message(let opcode, let payload) = event, opcode == .text,
+                let value = try? ADJSON.JSONDecoder().decode(Inbound.self, from: payload)
+            else { return [] }  // skip a non-text / undecodable frame (failure-safe)
+            await onMessage(value)
+            return []
+        })
+    return webSocketRoute(subpath, handler: handler, hub: hub, topic: topic)
+}
+
+/// The shared lowering behind ``WS`` and ``Channel``: one `GET` route carrying the WebSocket
+/// handler (+ optional hub binding) whose plain-request fallback answers `426 Upgrade Required`.
+private func webSocketRoute(
+    _ subpath: String, handler: any WebSocketHandler, hub: WebSocketHub?, topic: String?
+) -> RouteNode {
     precondition(
         !subpath.contains("{"), "ADServe: a WS route path '\(subpath)' cannot contain a path parameter")
     return RouteNode(cache: .unset) { prefix, cache, middleware in
@@ -302,61 +369,9 @@ public func WS(_ subpath: String = "/", _ handler: @escaping WebSocketHandler) -
         return [
             CompiledRoute(
                 method: .get, needsStorage: false, cache: cache, exactPath: full, middleware: middleware,
-                pathTemplate: full, webSocketHandler: handler, bind: bind)
+                pathTemplate: full, webSocketHandler: handler, webSocketHub: hub,
+                webSocketTopic: topic, bind: bind)
         ]
-    }
-}
-
-/// Run `serve` with `connection` subscribed to `hub`'s `topic` for the call's duration, then unsubscribe —
-/// awaited inline after `serve` returns (deterministic cleanup on close/drop/quiesce), never a fire-and-
-/// forget `defer`. The shared lifecycle behind both `Channel` overloads.
-private func serveSubscribed(
-    _ connection: any WebSocketConnection, on hub: WebSocketHub, topic: String,
-    _ serve: (any WebSocketConnection) async -> Void
-) async {
-    let token = await hub.subscribe(topic, connection)
-    await serve(connection)
-    await hub.unsubscribe(token, from: topic)
-}
-
-/// A `WS` endpoint bound to a ``WebSocketHub`` topic: the connection AUTO-subscribes when the socket opens
-/// and AUTO-unsubscribes when it closes (or drops, or the server quiesces), collapsing the
-/// subscribe / hold-open / unsubscribe lifecycle into one line. The server pushes to every subscriber with
-/// `hub.broadcast(_:to:)` (typically fired from a mutation route). This is the server-push ("live updates")
-/// shape; inbound frames are ignored — use the typed overload to react to them.
-///
-///     let hub = WebSocketHub()
-///     Channel("/ws/parts", on: hub, topic: "parts")            // clients subscribe to receive pushes
-///     // …from the mutation route:  Task { await hub.broadcast(partJSON, to: "parts") }
-public func Channel(_ subpath: String = "/", on hub: WebSocketHub, topic: String) -> RouteNode {
-    WS(subpath) { connection in
-        await serveSubscribed(connection, on: hub, topic: topic) { conn in
-            for await _ in conn.messages {}  // hold the socket open until the peer closes / drops / quiesces
-        }
-    }
-}
-
-/// The bidirectional ``Channel``: as the subscribe-only form, plus inbound text frames are decoded as
-/// `Inbound` (JSON, via ADJSON) and delivered to `onMessage` with the connection. Failure-safe — a non-text
-/// or undecodable frame is skipped, never thrown (a hostile peer can't tear the serve loop down). The server
-/// still pushes with `hub.broadcast(_:to:)`.
-///
-///     Channel("/ws/room", on: hub, topic: "room", receiving: ChatLine.self) { line, conn in
-///       await hub.broadcast(render(line), to: "room")          // re-broadcast to everyone
-///     }
-public func Channel<Inbound: Decodable & Sendable>(
-    _ subpath: String = "/", on hub: WebSocketHub, topic: String, receiving: Inbound.Type = Inbound.self,
-    _ onMessage: @escaping @Sendable (Inbound, any WebSocketConnection) async -> Void
-) -> RouteNode {
-    WS(subpath) { connection in
-        await serveSubscribed(connection, on: hub, topic: topic) { conn in
-            for await message in conn.messages {
-                guard case .text(let text) = message,
-                    let value = try? ADJSON.JSONDecoder().decode(Inbound.self, from: Array(text.utf8))
-                else { continue }  // skip a non-text / undecodable frame (failure-safe)
-                await onMessage(value, conn)
-            }
-        }
     }
 }
 
@@ -394,11 +409,11 @@ public func Stream(_ subpath: String, _ handler: @escaping StreamingRequestHandl
 /// endpoint (RFC 6455 §4.2.1 / RFC 7231 §6.5.15).
 private func webSocketUpgradeRequired() -> ResponseContent {
     var headers = HTTPFields()
-    headers[HTTPField.Name("upgrade")!] = "websocket"
-    headers[HTTPField.Name("connection")!] = "Upgrade"
+    headers.setValue("websocket", for: HTTPFieldName("upgrade")!)
+    headers.setValue("Upgrade", for: HTTPFieldName("connection")!)
     return .full(
         body: Array("upgrade required\n".utf8), contentType: "text/plain; charset=utf-8",
-        status: HTTPResponse.Status(code: 426), headers: headers)
+        status: .upgradeRequired, headers: headers)
 }
 
 /// `GET` with an opaque typed-capture matcher — for irregular path grammars. Matched against the
@@ -413,7 +428,7 @@ public func GET<P: PoolScope, Captures: Sendable>(
 // MARK: - Route builders (exact path / typed template / opaque matcher)
 
 private func exactRoute<P: PoolScope>(
-    _ method: HTTPRequest.Method, _ subpath: String, pool: P,
+    _ method: HTTPMethod, _ subpath: String, pool: P,
     _ handler: @escaping @Sendable (P.Context) throws -> ResponseContent
 ) -> RouteNode {
     precondition(
@@ -436,7 +451,7 @@ private func exactRoute<P: PoolScope>(
 }
 
 private func templateRoute<P: PoolScope>(
-    _ method: HTTPRequest.Method, _ template: String, pool: P,
+    _ method: HTTPMethod, _ template: String, pool: P,
     _ handler: @escaping @Sendable (P.Context, PathParameters) throws -> ResponseContent
 ) -> RouteNode {
     let needsStorage = pool.needsStorage
@@ -456,7 +471,7 @@ private func templateRoute<P: PoolScope>(
 }
 
 private func matchRoute<P: PoolScope, Captures: Sendable>(
-    _ method: HTTPRequest.Method, match: @escaping @Sendable (Substring) -> Captures?, pool: P,
+    _ method: HTTPMethod, match: @escaping @Sendable (Substring) -> Captures?, pool: P,
     _ handler: @escaping @Sendable (P.Context, Captures) throws -> ResponseContent
 ) -> RouteNode {
     let needsStorage = pool.needsStorage

@@ -6,7 +6,7 @@
 // late result is discarded). The losing task is also `cancel()`ed so a cancellation-aware handler unwinds.
 
 import Foundation
-import HTTPTypes
+import HTTPCore
 import Synchronization
 
 /// Answers `504 Gateway Timeout` when a request takes longer than `seconds` to produce a response.

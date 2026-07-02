@@ -6,7 +6,7 @@
 // header line — so `settingCookie` APPENDS a field and the engine's response-header merge appends
 // `set-cookie` (overwriting every other name). See `mergeResponseHeaders`.
 
-import HTTPTypes
+import HTTPCore
 
 // MARK: - Request cookies
 
@@ -133,7 +133,8 @@ extension ResponseContent {
     /// promoted so the header rides the engine envelope.
     public func settingCookie(_ cookie: SetCookie) -> ResponseContent {
         var extra = HTTPFields()
-        extra.append(HTTPField(name: .setCookie, value: cookie.headerValue))
+        // `headerValue` is sanitized (no control bytes), so the field-value validation always passes.
+        extra.append(cookie.headerValue, for: .setCookie)
         return withHeaders(extra)
     }
 
@@ -141,7 +142,7 @@ extension ResponseContent {
     public func settingCookies(_ cookies: [SetCookie]) -> ResponseContent {
         guard !cookies.isEmpty else { return self }
         var extra = HTTPFields()
-        for cookie in cookies { extra.append(HTTPField(name: .setCookie, value: cookie.headerValue)) }
+        for cookie in cookies { extra.append(cookie.headerValue, for: .setCookie) }
         return withHeaders(extra)
     }
 }
@@ -156,7 +157,7 @@ func mergeResponseHeaders(_ extra: HTTPFields, into base: inout HTTPFields) {
         if field.name == .setCookie {
             base.append(field)
         } else {
-            base[field.name] = field.value
+            base.setValue(field.value, for: field.name)
         }
     }
 }

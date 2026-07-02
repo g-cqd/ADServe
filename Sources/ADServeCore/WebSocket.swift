@@ -1,153 +1,59 @@
-// WebSockets (RFC 6455) over apple/swift-nio's `NIOWebSocket`: the HTTP/1 Upgrade is wired into the
-// bootstrap (see HTTPServerBootstrap), a matched `WebSocketRoute`'s handler runs the upgraded channel,
-// and the handler talks to the peer through `WebSocketConnection` — send text/binary/ping/close + an
-// `AsyncStream` of inbound messages (control frames are handled by the engine: ping → auto-pong, close →
-// clean shutdown). Fragmented frames are reassembled by `NIOWebSocketFrameAggregator`. permessage-deflate
-// is deferred (no apple/swift-server library; in-house later). The DSL adds `WS("/path") { conn in … }`.
+// WebSockets (RFC 6455) over the HTTP package's route-scoped seam: a matched route's
+// `WebSocketHandler` (the sans-I/O event → actions protocol from the `WebSocket` module) is
+// resolved at the request head via `EngineResponder.resolveWebSocket`, the engine completes the
+// Upgrade (h1) or Extended CONNECT (h2/h3, RFC 8441/9220) and drives the handler; fragmented
+// frames are reassembled and pings auto-ponged by the engine. Server push rides the engine's
+// `WebSocketHub`: a hub-bound route auto-subscribes each connection to its topic, and
+// `hub.publish(_:to:)` fans a message out to every subscriber. ADServe adds its cross-site
+// WebSocket hijacking gate (same-origin or origin-less handshakes only) around every handler.
+//
+// This replaced the pre-migration connection-owning API (`{ conn in for await message in
+// conn.messages … } `): the HTTP package's handler seam is event/action-shaped and its hub is the
+// push channel, so ADServe's WS surface follows it (the `WS`/`Channel` DSL keeps its names).
 
-import HTTPTypes
-import NIOConcurrencyHelpers
-import NIOCore
-import NIOWebSocket
+public import ADServeEngineNames
+import HTTPCore
+public import HTTPServer
+public import WebSocket
 
-// MARK: - Public surface
+/// The broadcast hub for WebSocket fan-out — the engine's topic-keyed publish/subscribe actor.
+/// A hub-bound route (`Channel(_:on:topic:)`) auto-subscribes each connection on upgrade and
+/// unsubscribes it on disconnect; publish with ``WebSocketHub/publish(_:to:)`` or the
+/// ``broadcast(_:to:)`` convenience.
+public typealias WebSocketHub = HTTPEngineWebSocketHub
 
-/// One WebSocket message — a complete (reassembled) text or binary payload. Control frames never appear.
-public enum WebSocketMessage: Sendable, Equatable {
-    case text(String)
-    case binary([UInt8])
-}
+/// A complete WebSocket data message — UTF-8 `text` or `binary` bytes (RFC 6455 §5.6).
+public typealias WebSocketMessage = WebSocket.WebSocketMessage
 
-/// A WebSocket close code (RFC 6455 §7.4). Maps to the wire `uint16`; the common presets are provided.
-public struct WebSocketCloseCode: Sendable, Equatable {
-    public let code: UInt16
-    public init(_ code: UInt16) { self.code = code }
-    public static let normalClosure = WebSocketCloseCode(1000)
-    public static let goingAway = WebSocketCloseCode(1001)
-    public static let protocolError = WebSocketCloseCode(1002)
-    public static let unsupportedData = WebSocketCloseCode(1003)
-    public static let policyViolation = WebSocketCloseCode(1008)
-    public static let messageTooBig = WebSocketCloseCode(1009)
-    public static let internalServerError = WebSocketCloseCode(1011)
-}
+/// A WebSocket close code (RFC 6455 §7.4).
+public typealias WebSocketCloseCode = WebSocket.WebSocketCloseCode
 
-/// The handler's view of an upgraded WebSocket: an `AsyncStream` of inbound messages plus send/close. All
-/// methods are safe to call from any task; sends are serialized so the engine heartbeat-pong and the
-/// handler never write a frame concurrently.
-public protocol WebSocketConnection: Sendable {
-    /// Inbound text/binary messages; the stream ENDS when the peer closes, the connection drops, or the
-    /// server quiesces — so `for await message in conn.messages { … }` is the natural serve loop.
-    var messages: AsyncStream<WebSocketMessage> { get }
-    func send(_ message: WebSocketMessage) async throws
-    func sendText(_ text: String) async throws
-    func sendBinary(_ bytes: [UInt8]) async throws
-    /// Send a ping (the peer should pong; the engine auto-pongs the peer's pings).
-    func ping(_ data: [UInt8]) async throws
-    /// Send a close frame with `code`, then let the connection wind down.
-    func close(code: WebSocketCloseCode) async throws
-}
+/// A frame the handler asks the connection to send in response to an event (RFC 6455 §5).
+public typealias WebSocketAction = WebSocket.WebSocketAction
 
-extension WebSocketConnection {
-    public func sendText(_ text: String) async throws { try await send(.text(text)) }
-    public func sendBinary(_ bytes: [UInt8]) async throws { try await send(.binary(bytes)) }
-}
+/// A connection event surfaced to the handler: `.message`, `.ping`, `.pong`, or `.close`.
+public typealias WebSocketEvent = WebSocket.WebSocketConnection.Event
 
-/// The handler for an upgraded WebSocket route: it owns the connection until it returns (or the peer
-/// closes). A typical body is `for await message in conn.messages { try await conn.send(...) }`.
-public typealias WebSocketHandler = @Sendable (any WebSocketConnection) async -> Void
-
-/// A topic-keyed broadcast hub for live WebSocket fan-out — the server-push half of "an edit on one client
-/// appears on the others" (RFC-0008 Phase 2). A mutation route calls ``broadcast(_:to:)`` and every
-/// connection subscribed to that topic receives the frame. An `actor`, so concurrent
-/// subscribe/unsubscribe/broadcast can't race; each send is failure-isolated (a peer that just dropped never
-/// blocks the rest) and the sends run concurrently (no head-of-line blocking on a slow peer).
-///
-/// The author owns the lifecycle: ``subscribe(_:_:)`` when the socket opens, ``unsubscribe(_:from:)`` in a
-/// `defer` when the serve loop ends. (A handler that forgets to unsubscribe holds the reference until the
-/// next failed send; auto-pruning a connection on send failure is a planned refinement.)
-///
-///     let hub = WebSocketHub()
-///     WS("/ws/parts") { conn in
-///       let token = await hub.subscribe("parts", conn)
-///       defer { Task { await hub.unsubscribe(token, from: "parts") } }
-///       for await _ in conn.messages {}                 // hold the socket open
-///     }
-///     // …from the mutation route:  await hub.broadcast(partJSON, to: "parts")
-public actor WebSocketHub {
-    public init() {}
-
-    /// `topic` → (`token` → subscribed connection). Actor-isolated; mutated only on this executor.
-    private var topics: [String: [Int: any WebSocketConnection]] = [:]
-    /// Monotonic subscription token (wrapping; 2⁶³ subscriptions is unreachable, but `&+` never traps).
-    private var nextToken = 0
-
-    /// Subscribe `connection` to `topic`; returns the token to pass to ``unsubscribe(_:from:)`` on disconnect.
-    public func subscribe(_ topic: String, _ connection: any WebSocketConnection) -> Int {
-        let token = nextToken
-        nextToken &+= 1
-        topics[topic, default: [:]][token] = connection
-        return token
-    }
-
-    /// Remove a subscription (idempotent); drops the topic entry when its last subscriber leaves.
-    public func unsubscribe(_ token: Int, from topic: String) {
-        topics[topic]?.removeValue(forKey: token)
-        if topics[topic]?.isEmpty == true { topics.removeValue(forKey: topic) }
-    }
-
-    /// The live subscriber count on `topic` (for metrics/tests).
-    public func subscriberCount(_ topic: String) -> Int { topics[topic]?.count ?? 0 }
-
-    /// Broadcast `text` to every connection on `topic`, concurrently and failure-isolated — then PRUNE any
-    /// subscriber whose send threw. That reclaims a half-open / dropped peer whose inbound stream hasn't
-    /// ended yet (so its `Channel` serve loop hasn't unsubscribed it), instead of re-attempting a doomed send
-    /// on every future broadcast. The subscriber set is snapshotted before the sends, so a concurrent
-    /// (un)subscribe can't invalidate the in-flight fan-out; the post-send prune is actor-isolated and
-    /// removes only the snapshot's failed tokens — monotonic tokens guarantee that can't drop a subscriber
-    /// that (re)joined during the await.
-    public func broadcast(_ text: String, to topic: String) async {
-        let subscribers = topics[topic, default: [:]]  // snapshot of (token → connection)
-        guard !subscribers.isEmpty else { return }
-        let failedTokens = await withTaskGroup(of: Int?.self) { group -> [Int] in
-            for (token, connection) in subscribers {
-                group.addTask {
-                    do {
-                        try await connection.sendText(text)
-                        return nil
-                    } catch {
-                        return token  // this peer is gone — mark it for pruning
-                    }
-                }
-            }
-            var dead: [Int] = []
-            for await failed in group where failed != nil { dead.append(failed!) }
-            return dead
-        }
-        guard !failedTokens.isEmpty else { return }
-        for token in failedTokens { topics[topic]?.removeValue(forKey: token) }
-        if topics[topic]?.isEmpty == true { topics.removeValue(forKey: topic) }
+extension WebSocketHub {
+    /// Broadcast `text` to every connection subscribed to `topic` — the pre-migration spelling of
+    /// ``WebSocketHub/publish(_:to:)``.
+    public func broadcast(_ text: String, to topic: String) {
+        publish(.text(text), to: topic)
     }
 }
 
-/// A matched WebSocket route — the engine upgrades the request and runs `handler`. The DSL's `WS(_:)`
-/// lowers to this; `HTTPHandling.webSocketRoute(path:)` resolves it for the upgrade decision.
-public struct WebSocketRoute: Sendable {
-    public let handler: WebSocketHandler
-    public init(handler: @escaping WebSocketHandler) { self.handler = handler }
-}
-
-/// The Cross-Site WebSocket Hijacking (CSWSH) gate, applied in the upgrader's `shouldUpgrade` before any
-/// socket opens. A browser ALWAYS sends `Origin` on a WebSocket handshake along with the target site's
-/// ambient cookies, so a cross-origin `Origin` means another site is opening an authenticated socket on the
-/// victim's behalf — the WebSocket analogue of CSRF, which CORS does NOT protect (the upgrade is not a
+/// The Cross-Site WebSocket Hijacking (CSWSH) gate, applied before any socket opens. A browser
+/// ALWAYS sends `Origin` on a WebSocket handshake along with the target site's ambient cookies, so
+/// a cross-origin `Origin` means another site is opening an authenticated socket on the victim's
+/// behalf — the WebSocket analogue of CSRF, which CORS does NOT protect (the upgrade is not a
 /// CORS-gated request). Allow the upgrade only when:
-///   • `Origin` is ABSENT — a non-browser client (CLI, native, server-to-server): no ambient cookies, no
-///     CSWSH risk; or
+///   • `Origin` is ABSENT — a non-browser client (CLI, native, server-to-server): no ambient cookies,
+///     no CSWSH risk; or
 ///   • `Origin`'s authority (host[:port]) equals the request `Host` — a same-origin page.
-/// A present-but-cross-origin or malformed/`null` Origin, or a missing `Host`, is rejected (no upgrade → the
-/// route's plain-GET path answers `426`). Pure + framework-agnostic so it unit-tests without a live socket.
-/// Secure-by-default and zero-config; a future per-route allowlist can widen it for legitimate cross-origin
-/// sockets. No recursion; O(origin length).
+/// A present-but-cross-origin or malformed/`null` Origin, or a missing `Host`, is rejected (no
+/// upgrade → the route's plain-GET path answers `426`). Pure + framework-agnostic so it unit-tests
+/// without a live socket. Secure-by-default and zero-config; a future per-route allowlist can widen
+/// it for legitimate cross-origin sockets. No recursion; O(origin length).
 func webSocketOriginAllowed(origin: String?, host: String?) -> Bool {
     guard let origin, !origin.isEmpty else { return true }  // no Origin → non-browser client, no CSWSH risk
     // A malformed/`null` Origin (no "://" authority) or a missing `Host` header is rejected.
@@ -155,138 +61,50 @@ func webSocketOriginAllowed(origin: String?, host: String?) -> Bool {
     return origin[schemeEnd.upperBound...].lowercased() == host.lowercased()
 }
 
+/// Wraps a route's WebSocket handler in ADServe's CSWSH gate: the origin/host comparison runs in
+/// `shouldUpgrade` (which sees the full request — the engine's `isOriginAllowed(_:)` seam receives
+/// only the origin, not the `Host` it must be compared against), so `isOriginAllowed` then admits
+/// what the gate already vetted.
+struct OriginGatedWebSocketHandler: WebSocketHandler {
+    let inner: any WebSocketHandler
+
+    func shouldUpgrade(_ request: HTTPRequest) -> Bool {
+        webSocketOriginAllowed(
+            origin: request.headerFields[.origin], host: request.effectiveAuthority)
+            && inner.shouldUpgrade(request)
+    }
+
+    func isOriginAllowed(_ origin: String?) -> Bool { true }
+
+    func handle(_ event: WebSocketEvent) async -> [WebSocketAction] {
+        await inner.handle(event)
+    }
+}
+
+/// A matched WebSocket endpoint: the handler plus its optional hub binding — what
+/// `EngineResponder.resolveWebSocket` hands the engine.
+public struct WebSocketEndpoint: Sendable {
+    public let handler: any WebSocketHandler
+    public let hub: WebSocketHub?
+    public let topic: String?
+
+    public init(handler: any WebSocketHandler, hub: WebSocketHub? = nil, topic: String? = nil) {
+        self.handler = handler
+        self.hub = hub
+        self.topic = topic
+    }
+}
+
 extension HTTPHandling {
-    /// The WebSocket route for `path` (a `GET` carrying the `Upgrade: websocket` headers), or `nil` if the
-    /// path is not a WebSocket endpoint. The engine calls this in the upgrader's `shouldUpgrade`. Resolves
-    /// generically: a `GET` match whose `MatchedRoute` carries a `webSocketHandler`.
-    public func webSocketRoute(path: Substring) -> WebSocketRoute? {
+    /// The WebSocket endpoint for `path` (a `GET` route carrying a WebSocket handler), or `nil` if
+    /// the path is not a WebSocket endpoint. The engine resolves this at the request head to decide
+    /// an Upgrade (h1) or Extended CONNECT accept (h2/h3). Resolves generically: a `GET` match whose
+    /// `MatchedRoute` carries a `webSocketHandler`.
+    public func webSocketEndpoint(path: Substring) -> WebSocketEndpoint? {
         guard case .matched(let route) = match(method: .get, path: path),
             let handler = route.webSocketHandler
         else { return nil }
-        return WebSocketRoute(handler: handler)
-    }
-}
-
-// MARK: - Engine implementation
-
-/// The NIOAsyncChannel of an upgraded WebSocket: inbound reassembled frames, outbound frames.
-typealias WebSocketChannel = NIOAsyncChannel<WebSocketFrame, WebSocketFrame>
-
-/// The engine's `WebSocketConnection`: frames out through a FIFO-gated writer (so the inbound auto-pong
-/// and the handler's sends never race the NIO outbound writer), messages in via the `AsyncStream` the
-/// driver feeds. A `final class` so it is shared by reference between the handler task and the reader.
-final class EngineWebSocketConnection: WebSocketConnection {
-    let messages: AsyncStream<WebSocketMessage>
-    private let writer: WebSocketFrameWriter
-
-    init(messages: AsyncStream<WebSocketMessage>, writer: WebSocketFrameWriter) {
-        self.messages = messages
-        self.writer = writer
-    }
-
-    func send(_ message: WebSocketMessage) async throws {
-        switch message {
-            case .text(let text): try await writer.write(opcode: .text, bytes: Array(text.utf8))
-            case .binary(let bytes): try await writer.write(opcode: .binary, bytes: bytes)
-        }
-    }
-
-    func ping(_ data: [UInt8]) async throws { try await writer.write(opcode: .ping, bytes: data) }
-
-    func close(code: WebSocketCloseCode) async throws { try await writer.writeClose(code: code) }
-}
-
-/// Serializes frame writes to the WS outbound through a FIFO gate (the same non-reentrant async mutex the
-/// SSE path uses), so concurrent senders never interleave a `outbound.write`. Back-pressure is preserved:
-/// the gate is held across the suspending write.
-struct WebSocketFrameWriter: Sendable {
-    let outbound: NIOAsyncChannelOutboundWriter<WebSocketFrame>
-    let allocator: ByteBufferAllocator
-    let gate: FIFOAsyncGate
-
-    func write(opcode: WebSocketOpcode, bytes: [UInt8]) async throws {
-        var buffer = allocator.buffer(capacity: bytes.count)
-        buffer.writeBytes(bytes)
-        try await guarded(WebSocketFrame(fin: true, opcode: opcode, data: buffer))
-    }
-
-    /// Echo a control-frame payload (used to auto-pong an inbound ping).
-    func writeControl(opcode: WebSocketOpcode, data: ByteBuffer) async throws {
-        try await guarded(WebSocketFrame(fin: true, opcode: opcode, data: data))
-    }
-
-    func writeClose(code: WebSocketCloseCode) async throws {
-        var buffer = allocator.buffer(capacity: 2)
-        buffer.writeInteger(code.code)
-        try await guarded(WebSocketFrame(fin: true, opcode: .connectionClose, data: buffer))
-    }
-
-    private func guarded(_ frame: WebSocketFrame) async throws {
-        await gate.acquire()
-        do {
-            try await outbound.write(frame)
-        } catch {
-            await gate.release()
-            throw error
-        }
-        await gate.release()
-    }
-}
-
-/// The negotiated outcome of an accepted h1 connection: a normal HTTP connection, or one upgraded to a
-/// WebSocket (carrying the channel + the matched route's handler).
-enum EngineH1Result: Sendable {
-    case http(EngineConnection)
-    case webSocket(WebSocketChannel, WebSocketRoute)
-}
-
-extension HTTPServer {
-    /// Runs an upgraded WebSocket: feeds inbound text/binary into the connection's message stream
-    /// (auto-ponging pings, ending cleanly on a close frame), runs the route `handler` concurrently, and
-    /// closes when either side finishes. Cancelling the serve task (graceful drain) cancels the inbound
-    /// read, which finishes the stream so the handler's `for await` ends — the slot frees promptly.
-    func driveWebSocket(_ channel: WebSocketChannel, handler: @escaping WebSocketHandler) async {
-        let allocator = channel.channel.allocator
-        do {
-            try await channel.executeThenClose { inbound, outbound in
-                let (stream, continuation) = AsyncStream<WebSocketMessage>.makeStream()
-                let writer = WebSocketFrameWriter(
-                    outbound: outbound, allocator: allocator, gate: FIFOAsyncGate())
-                let connection = EngineWebSocketConnection(messages: stream, writer: writer)
-                await withTaskGroup(of: Void.self) { group in
-                    group.addTask {
-                        await handler(connection)
-                        continuation.finish()  // handler returned → stop the message stream
-                    }
-                    group.addTask {
-                        defer { continuation.finish() }  // peer closed / drained → end the stream
-                        do {
-                            for try await frame in inbound {
-                                switch frame.opcode {
-                                    case .text:
-                                        continuation.yield(.text(String(buffer: frame.unmaskedData)))
-                                    case .binary:
-                                        var data = frame.unmaskedData
-                                        continuation.yield(.binary(data.readBytes(length: data.readableBytes) ?? []))
-                                    case .ping:
-                                        try? await writer.writeControl(opcode: .pong, data: frame.unmaskedData)
-                                    case .connectionClose:
-                                        return
-                                    default:
-                                        break  // pong / continuation / reserved — ignore
-                                }
-                            }
-                        } catch {
-                            // Read error (reset / drain cancellation) — finish via `defer`.
-                        }
-                    }
-                    await group.next()  // whichever ends first (handler done OR peer closed)
-                    group.cancelAll()
-                }
-                try? await writer.writeClose(code: .normalClosure)  // best-effort clean close
-            }
-        } catch {
-            // Connection-level error — drop it.
-        }
+        return WebSocketEndpoint(
+            handler: handler, hub: route.webSocketHub, topic: route.webSocketTopic)
     }
 }

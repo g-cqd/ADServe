@@ -1,17 +1,19 @@
 // ADServeCore — the ad-server ENGINE. The optimizable server layer:
 // the value types a request/response flows through, the connection pool, the
-// hashing/request-id helpers, and the routing contract the DSL satisfies. The NIO
-// bootstrap + the response-writing envelope live in HTTPServer.swift. Headers and
-// status are swift-http-types value types throughout — no stringly tuples.
-// The engine knows nothing route-specific.
+// hashing/request-id helpers, and the routing contract the DSL satisfies. The engine
+// bootstrap + the response-writing envelope live in HTTPServer.swift. Headers, method,
+// and status are the HTTP package's `HTTPCore` value types throughout — no stringly
+// tuples. The engine knows nothing route-specific.
 
 public import ADConcurrency
 import ADJSON
 import Crypto
 import Foundation
-public import HTTPTypes
+public import HTTPCore
+public import HTTPServer
 public import Logging
 import Synchronization
+public import WebSocket
 
 #if canImport(UniformTypeIdentifiers)
     public import UniformTypeIdentifiers
@@ -24,21 +26,24 @@ import Synchronization
 public enum ALPN: String, Sendable {
     case http1 = "http/1.1"
     case http2 = "h2"
-    /// HTTP/3 (QUIC) — realized only in an `AD_HTTP3` build (which raises the floor to macOS 26
-    /// and pulls swift-nio-http3); a harmless ALPN id otherwise. See `#if AD_HTTP3` in HTTPServer.
+    /// HTTP/3 (QUIC) — the HTTP package serves it via its QUIC transport (Darwin-only today);
+    /// not yet wired through the ADServe listener surface. A harmless ALPN id otherwise.
     case http3 = "h3"
 }
 
 /// Whether the server requires (and verifies) a client certificate — the mTLS toggle. `.none` is the
-/// default one-way TLS; `.required` makes NIOSSL reject the handshake unless the client presents a
-/// certificate that chains to `trustRoots` (mutual TLS).
+/// default one-way TLS; `.required` makes the transport reject the handshake unless the client
+/// presents a certificate (mutual TLS). See `verifyPeer` on the transport seam for chain policy.
 public enum ClientCertificateVerification: Sendable {
     case none
     case required
 }
 
-/// TLS material: a PEM certificate chain + private key on disk (NIOSSL-native), plus optional mutual-TLS
-/// settings (require + verify a client certificate against a trust root).
+/// TLS material: a PEM certificate chain + private key on disk, plus optional mutual-TLS
+/// settings (require a client certificate). The engine converts the PEM pair into the PKCS#12
+/// identity the HTTP transport consumes at bind time (via the system `openssl`, the same
+/// pragmatic path the HTTP package's own `DevTLSIdentity` uses — native PEM intake in
+/// `TransportTLS` is a recorded upstream gap).
 public struct TLSSource: Sendable {
     public let certificatePath: String
     public let privateKeyPath: String
@@ -141,11 +146,18 @@ public final class ServerReadiness: Sendable {
     public func set(_ value: Bool) { ready.store(value, ordering: .releasing) }
 }
 
-/// The network transport the engine binds on. `.nio` = NIOPosix (BSD sockets) + NIOSSL TLS —
-/// cross-platform, the proven default. `.network` = NIOTransportServices (Network.framework,
-/// Apple-native), where TLS + the future HTTP/3 path live; available only where
-/// `canImport(Network)` (Apple platforms), else the engine falls back to `.nio`.
-public enum EngineTransport: String, Sendable { case nio, network }
+/// The network transport the engine binds on. `.posix` = the HTTP package's event-driven BSD-socket
+/// backbone (kqueue on Darwin, epoll on Linux) — cross-platform, the plaintext default. `.network` =
+/// Network.framework (Apple-native), where TLS + ALPN + the QUIC/HTTP-3 path live; a TLS listener
+/// always binds `.network` regardless of this setting (the POSIX backbones are cleartext).
+public enum EngineTransport: String, Sendable {
+    case posix
+    case network
+    /// The pre-migration name for the cross-platform BSD-socket transport — now the HTTP package's
+    /// kqueue/epoll backbone, not SwiftNIO.
+    @available(*, deprecated, renamed: "posix")
+    public static var nio: EngineTransport { .posix }
+}
 
 // MARK: - Connection pool (type-erased)
 
@@ -186,16 +198,16 @@ public struct AnyConnectionPool: Sendable {
 
 // MARK: - Request / response value types
 
-/// The request as the DSL/app see it — pure swift-http-types, no NIO leakage.
+/// The request as the DSL/app see it — pure `HTTPCore` value types, no transport leakage.
 public struct ServerRequest: Sendable {
-    public let method: HTTPRequest.Method
+    public let method: HTTPMethod
     /// The request target (path + optional `?query`), i.e. the `:path` pseudo-header.
     public let target: String
     public let headers: HTTPFields
     /// The accumulated request body (empty for GET; capped by the engine). Reach via `ctx.body`.
     public let body: [UInt8]
 
-    public init(method: HTTPRequest.Method, target: String, headers: HTTPFields, body: [UInt8] = []) {
+    public init(method: HTTPMethod, target: String, headers: HTTPFields, body: [UInt8] = []) {
         self.method = method
         self.target = target
         self.headers = headers
@@ -258,23 +270,23 @@ extension SSEWriter {
 /// request-id) + cache-control/ETag are applied by the engine, not here.
 public enum ResponseContent: Sendable {
     /// A body with an explicit content-type + status.
-    case raw(body: [UInt8], contentType: String, status: HTTPResponse.Status)
+    case raw(body: [UInt8], contentType: String, status: HTTPStatus)
     /// 404 with the body `Not Found` (a route-level miss — distinct from the engine's
     /// own unmatched-path 404, which is `not found\n`).
     case notFound
     /// A `text/plain` status response (405, the engine's 404, a 503 fallback, …).
-    case plain(HTTPResponse.Status, String)
+    case plain(HTTPStatus, String)
     /// A body + explicit status + EXTRA response headers, applied OVER the envelope (they
     /// can override an envelope header). For routes that need their own header set — the
     /// CORS + MCP header set on `POST /mcp` / `OPTIONS /mcp`.
-    case full(body: [UInt8], contentType: String, status: HTTPResponse.Status, headers: HTTPFields)
+    case full(body: [UInt8], contentType: String, status: HTTPStatus, headers: HTTPFields)
     /// A streamed response: an early head (NO `Content-Length`/ETag — the length is unknown, so h1 is
     /// chunked and h2 is length-less) followed by writer-driven body chunks. The engine drives `body`
     /// AFTER the head is on the wire, so `<head>` flushes before the body completes (TTFB); back-pressure
     /// is implicit in each `writer.write`. A mid-stream throw tears the connection — the client sees a
     /// truncated, unterminated body, never a clean `end` implying success.
     case stream(
-        contentType: String, status: HTTPResponse.Status = .ok, headers: HTTPFields = [:],
+        contentType: String, status: HTTPStatus = .ok, headers: HTTPFields = HTTPFields(),
         body: @Sendable (any ResponseBodyWriter) async throws -> Void)
     /// A long-lived Server-Sent Events stream (`text/event-stream`, `Cache-Control: no-store`, status
     /// 200). The engine frames events, caps concurrency (503 past the limit), heartbeat-friendly
@@ -284,14 +296,14 @@ public enum ResponseContent: Sendable {
     /// against the body's writes), so an idle stream stays alive without the app heartbeating itself;
     /// the default (`nil`) keeps the app-driven heartbeat valid and adds zero overhead.
     case sse(
-        headers: HTTPFields = [:], heartbeat: Duration? = nil,
+        headers: HTTPFields = HTTPFields(), heartbeat: Duration? = nil,
         body: @Sendable (any SSEWriter) async throws -> Void)
     /// A guarded static file served from `root` + `subpath`. The engine resolves it OFF the event loop
     /// (NIOFileSystem): 404 if missing / not a regular file / a symlink / outside the canonicalized root
     /// jail; otherwise a strong size+mtime `ETag` with `If-None-Match` → 304, and the body streamed in
     /// chunks. The DSL `Static(_:root:)` validates the subpath (no dotfiles; an allow-listed extension →
     /// `contentType`) and produces this; `headers` carries any response-middleware decoration.
-    case file(root: String, subpath: String, contentType: String, headers: HTTPFields = [:])
+    case file(root: String, subpath: String, contentType: String, headers: HTTPFields = HTTPFields())
 
     /// JSON body. Defaults to Bun's `Response.json` content-type; pass `contentType`
     /// to override (e.g. `/search` emits `application/json` with no charset).
@@ -319,7 +331,7 @@ public enum ResponseContent: Sendable {
     /// An HTML body (`text/html; charset=utf-8`) — the typed path for server-rendered pages and
     /// fragments. `status` defaults to `200` but is overridable (a `404` fragment, a `422` form
     /// re-render). The host transports the bytes; it stays view-agnostic (ADR-0012).
-    public static func html(_ bytes: [UInt8], status: HTTPResponse.Status = .ok) -> ResponseContent {
+    public static func html(_ bytes: [UInt8], status: HTTPStatus = .ok) -> ResponseContent {
         .raw(body: bytes, contentType: MediaType.html.value, status: status)
     }
 
@@ -328,7 +340,7 @@ public enum ResponseContent: Sendable {
     /// intent (the caller renders a partial, not a whole document) — so the engine's ETag/304 + envelope
     /// apply unchanged. Pair with `ctx.isFragment` to serve one route two ways: full page on first load,
     /// fragment on a client action.
-    public static func fragment(_ bytes: [UInt8], status: HTTPResponse.Status = .ok) -> ResponseContent {
+    public static func fragment(_ bytes: [UInt8], status: HTTPStatus = .ok) -> ResponseContent {
         .raw(body: bytes, contentType: MediaType.html.value, status: status)
     }
 }
@@ -545,9 +557,9 @@ public struct RequestLogging: HTTPMiddleware {
 /// The numeric status of a response (for logging/metrics).
 public func statusCode(of content: ResponseContent) -> Int {
     switch content {
-        case .raw(_, _, let status), .full(_, _, let status, _): return status.code
-        case .plain(let status, _): return status.code
-        case .stream(_, let status, _, _): return status.code
+        case .raw(_, _, let status), .full(_, _, let status, _): return Int(status.code)
+        case .plain(let status, _): return Int(status.code)
+        case .stream(_, let status, _, _): return Int(status.code)
         case .sse: return 200  // SSE is always 200 text/event-stream
         // The nominal status; the engine resolves the real 200/304/404 off-loop in `writeFile`.
         case .file: return 200
@@ -607,16 +619,23 @@ public struct MatchedRoute: Sendable {
     /// size accumulation) or lower (a tighter bound, enforced post-match as a problem+json 413).
     public let maxBodyBytes: Int?
     public let run: @Sendable (HandlerInput) throws -> ResponseContent
-    /// A WebSocket handler if this route is a `WS` endpoint, else `nil`. The engine reads it (via
-    /// `webSocketRoute(path:)`) to decide an HTTP/1 Upgrade; a normal `GET` to the path still runs `run`.
-    public let webSocketHandler: WebSocketHandler?
+    /// A WebSocket handler if this route is a `WS` endpoint, else `nil` — the sans-I/O event/action
+    /// seam from the HTTP package's `WebSocket` module. The engine reads it (via
+    /// `webSocketHandler(path:)`) to decide an Upgrade; a plain `GET` to the path still runs `run`.
+    public let webSocketHandler: (any WebSocketHandler)?
+    /// The broadcast hub a WebSocket route is bound to, or `nil` for a plain WebSocket — the engine
+    /// registers each upgraded connection with it and auto-subscribes it to `webSocketTopic`.
+    public let webSocketHub: WebSocketHub?
+    /// The topic a hub-backed WebSocket connection is auto-subscribed to.
+    public let webSocketTopic: String?
     /// An async streaming-body handler if this route consumes its body incrementally, else `nil`. When
     /// present the engine takes the streaming path (`run` is a placeholder, never invoked).
     public let streamingRun: StreamingRequestHandler?
 
     public init(
         needsStorage: Bool, cache: CachePolicy, middleware: [any HTTPMiddleware] = [],
-        maxBodyBytes: Int? = nil, webSocketHandler: WebSocketHandler? = nil,
+        maxBodyBytes: Int? = nil, webSocketHandler: (any WebSocketHandler)? = nil,
+        webSocketHub: WebSocketHub? = nil, webSocketTopic: String? = nil,
         streamingRun: StreamingRequestHandler? = nil,
         run: @escaping @Sendable (HandlerInput) throws -> ResponseContent
     ) {
@@ -625,6 +644,8 @@ public struct MatchedRoute: Sendable {
         self.middleware = middleware
         self.maxBodyBytes = maxBodyBytes
         self.webSocketHandler = webSocketHandler
+        self.webSocketHub = webSocketHub
+        self.webSocketTopic = webSocketTopic
         self.streamingRun = streamingRun
         self.run = run
     }
@@ -633,21 +654,25 @@ public struct MatchedRoute: Sendable {
 public enum RouteMatch: Sendable {
     case matched(MatchedRoute)
     /// The path exists but not for this method; carries the methods that ARE allowed (for `Allow:`).
-    case methodNotAllowed(allowed: [HTTPRequest.Method])
+    case methodNotAllowed(allowed: [HTTPMethod])
     case notFound
 }
 
 /// The route table the engine dispatches against. The DSL's `RouteTable` conforms.
 public protocol HTTPHandling: Sendable {
-    func match(method: HTTPRequest.Method, path: Substring) -> RouteMatch
+    func match(method: HTTPMethod, path: Substring) -> RouteMatch
     /// The matched route's per-route body ceiling (`.maxBody`), or `nil` for the server default. The
     /// engine peeks this at the request head — *before* draining the body — so an upload route can
     /// raise its limit ABOVE the server default. Default `nil` (the server-wide cap applies).
-    func bodyLimit(method: HTTPRequest.Method, path: Substring) -> Int?
+    func bodyLimit(method: HTTPMethod, path: Substring) -> Int?
+    /// Whether any route declares a WebSocket handler — drives the HTTP/2 / HTTP/3 Extended CONNECT
+    /// advertisement (RFC 8441 / RFC 9220). Default `false` (no WebSocket routes).
+    var hasWebSocketRoutes: Bool { get }
 }
 
 extension HTTPHandling {
-    public func bodyLimit(method: HTTPRequest.Method, path: Substring) -> Int? { nil }
+    public func bodyLimit(method: HTTPMethod, path: Substring) -> Int? { nil }
+    public var hasWebSocketRoutes: Bool { false }
 }
 
 // MARK: - Hashing / conditional / request-id (engine-generic HTTP)
@@ -692,7 +717,7 @@ public func resolveRequestID(_ headers: HTTPFields) -> String {
 }
 
 /// `x-request-id` — lowercase token name, defined once.
-public let requestIDName = HTTPField.Name("x-request-id")!
+public let requestIDName = HTTPFieldName("x-request-id")!
 
 private func isValidRequestID(_ s: String) -> Bool {
     let utf8 = s.utf8

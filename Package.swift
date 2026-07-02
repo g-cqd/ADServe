@@ -150,6 +150,17 @@ let package = Package(
             ],
             swiftSettings: strictSettings,
             plugins: libraryBuildPlugins),
+        // The engine-name shim: ADServeCore's public engine type is `HTTPServer`, and a local type
+        // shadows the same-named module for qualification — so the HTTP package's server class (and
+        // the handful of other names ADServeCore cannot reach) are re-exported here under
+        // `HTTPEngine*` typealiases from a module with no clash.
+        .target(
+            name: "ADServeEngineNames",
+            dependencies: [
+                .product(name: "HTTPServer", package: "HTTP")
+            ],
+            swiftSettings: strictSettings,
+            plugins: libraryBuildPlugins),
         .target(
             name: "ADServeCore",
             dependencies: [
@@ -177,17 +188,16 @@ let package = Package(
                 .product(name: "ADFCore", package: "ADFoundation"),
                 // ../HTTP — the from-scratch engine ADServe is re-basing onto (strangler: wired in
                 // alongside NIO; the NIO products above are removed once the engine swap lands).
-                // The HTTPServer MODULE is aliased to `HTTPServing`: ADServeCore's own public engine
-                // type is named `HTTPServer`, and a same-named type shadows the module for
-                // qualification, so the import must carry a distinct name (SE-0339).
                 .product(name: "HTTPCore", package: "HTTP"),
-                .product(
-                    name: "HTTPServer", package: "HTTP",
-                    moduleAliases: ["HTTPServer": "HTTPServing"]),
+                .product(name: "HTTPServer", package: "HTTP"),
                 .product(name: "HTTPTransport", package: "HTTP"),
                 // The sans-I/O WebSocket engine types (handler/action/event/close-code) — ADServe's
                 // route-scoped WS surface re-exports them.
                 .product(name: "WebSocket", package: "HTTP"),
+                // The name shim: ADServeCore's own public engine type is named `HTTPServer`, which
+                // shadows the same-named module for qualification — this tiny target (no local
+                // clash) re-exports the engine names ADServeCore cannot spell.
+                "ADServeEngineNames",
                 "ADMCP"
             ],
             swiftSettings: kernelSettings,
@@ -238,11 +248,10 @@ let package = Package(
                 // drive the server through `FakeTransport`/`FakeConnection` and the public
                 // `HTTPServing` (module-aliased HTTPServer) surface.
                 .product(name: "HTTPCore", package: "HTTP"),
-                .product(
-                    name: "HTTPServer", package: "HTTP",
-                    moduleAliases: ["HTTPServer": "HTTPServing"]),
+                .product(name: "HTTPServer", package: "HTTP"),
                 .product(name: "HTTPTransport", package: "HTTP"),
                 .product(name: "WebSocket", package: "HTTP"),
+                "ADServeEngineNames",
                 // Loopback integration tests bind a real listener + drive a raw NIO client.
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOPosix", package: "swift-nio"),

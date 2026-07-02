@@ -1,5 +1,5 @@
 public import ADServeCore
-import HTTPTypes
+import HTTPCore
 import Instrumentation
 import ServiceContextModule
 import Tracing
@@ -8,7 +8,7 @@ import Tracing
 /// the instrument can rebuild an upstream `ServiceContext`.
 struct HTTPFieldsExtractor: Extractor {
     func extract(key: String, from carrier: HTTPFields) -> String? {
-        guard let name = HTTPField.Name(key) else { return nil }
+        guard let name = HTTPFieldName(key) else { return nil }
         return carrier[name]
     }
 }

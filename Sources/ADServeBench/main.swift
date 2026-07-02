@@ -1,7 +1,7 @@
 import ADServeCore
 import ADServeDSL
 import Foundation
-import HTTPTypes
+import HTTPCore
 import Logging
 
 // A minimal, runnable ADServe server for LIVE load benchmarking — ADSERVE_DEV-gated, never shipped in a
@@ -58,13 +58,13 @@ let apps = Server {
 // envelope-merge path).
 var envelope = HTTPFields()
 if ProcessInfo.processInfo.environment["ADSERVE_BENCH_ENVELOPE"] != nil {
-    envelope[HTTPField.Name("Strict-Transport-Security")!] = "max-age=63072000; includeSubDomains"
-    envelope[HTTPField.Name("X-Content-Type-Options")!] = "nosniff"
-    envelope[HTTPField.Name("X-Frame-Options")!] = "DENY"
-    envelope[HTTPField.Name("Referrer-Policy")!] = "no-referrer"
-    envelope[HTTPField.Name("Content-Security-Policy")!] = "default-src 'self'"
-    envelope[HTTPField.Name("Permissions-Policy")!] = "geolocation=(), microphone=()"
-    envelope[HTTPField.Name("Vary")!] = "Accept-Encoding"
+    envelope.setValue("max-age=63072000; includeSubDomains", for: HTTPFieldName("Strict-Transport-Security")!)
+    envelope.setValue("nosniff", for: HTTPFieldName("X-Content-Type-Options")!)
+    envelope.setValue("DENY", for: HTTPFieldName("X-Frame-Options")!)
+    envelope.setValue("no-referrer", for: HTTPFieldName("Referrer-Policy")!)
+    envelope.setValue("default-src 'self'", for: HTTPFieldName("Content-Security-Policy")!)
+    envelope.setValue("geolocation=(), microphone=()", for: HTTPFieldName("Permissions-Policy")!)
+    envelope.setValue("Accept-Encoding", for: HTTPFieldName("Vary")!)
 }
 
 let server = HTTPServer(

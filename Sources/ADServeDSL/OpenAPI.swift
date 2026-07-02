@@ -6,7 +6,8 @@
 // (OpenAPI 3.1 schemas ARE JSON Schema, so no translation is needed).
 
 public import ADJSON
-import HTTPTypes
+import ADServeCore
+import HTTPCore
 
 // MARK: - Document metadata
 
@@ -169,7 +170,7 @@ public func openAPIDocument(info: OpenAPIInfo, from apps: [Application]) -> Stri
 
     // Group by path, preserving first-seen path order; within a path, keep first-seen verb.
     var pathOrder: [String] = []
-    var byPath: [String: [(method: HTTPRequest.Method, doc: RouteDoc?)]] = [:]
+    var byPath: [String: [(method: HTTPMethod, doc: RouteDoc?)]] = [:]
     for route in routes {
         guard let path = route.pathTemplate else { continue }
         if byPath[path] == nil { pathOrder.append(path) }
@@ -212,7 +213,7 @@ private func openAPIInfoObject(_ info: OpenAPIInfo) -> DocJSON {
 private let methodOrder = ["GET", "PUT", "POST", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE", "CONNECT"]
 
 private func pathItemObject(
-    _ operations: [(method: HTTPRequest.Method, doc: RouteDoc?)], path: String
+    _ operations: [(method: HTTPMethod, doc: RouteDoc?)], path: String
 ) -> DocJSON {
     let parameters = pathParameterObjects(of: path)
     let sorted = operations.sorted {
@@ -281,7 +282,7 @@ private func responsesObject(_ responses: [Int: SchemaRef]) -> DocJSON {
         .map { status -> (String, DocJSON) in
             let ref = responses[status]
             var fields: [(String, DocJSON)] = [
-                ("description", .string(HTTPResponse.Status(code: status).reasonPhrase))
+                ("description", .string(HTTPStatus(code: status)?.reasonPhrase ?? "Status \(status)"))
             ]
             if let ref { fields.append(contentsOf: objectFields(mediaObject(ref))) }
             return (String(status), .object(fields))

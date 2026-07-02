@@ -5,7 +5,7 @@
 
 import ADFCore
 import Foundation
-import HTTPTypes
+import HTTPCore
 
 // MARK: - x-www-form-urlencoded
 
