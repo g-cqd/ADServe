@@ -58,13 +58,19 @@ let apps = Server {
 // envelope-merge path).
 var envelope = HTTPFields()
 if ProcessInfo.processInfo.environment["ADSERVE_BENCH_ENVELOPE"] != nil {
-    envelope.setValue("max-age=63072000; includeSubDomains", for: HTTPFieldName("Strict-Transport-Security")!)
-    envelope.setValue("nosniff", for: HTTPFieldName("X-Content-Type-Options")!)
-    envelope.setValue("DENY", for: HTTPFieldName("X-Frame-Options")!)
-    envelope.setValue("no-referrer", for: HTTPFieldName("Referrer-Policy")!)
-    envelope.setValue("default-src 'self'", for: HTTPFieldName("Content-Security-Policy")!)
-    envelope.setValue("geolocation=(), microphone=()", for: HTTPFieldName("Permissions-Policy")!)
-    envelope.setValue("Accept-Encoding", for: HTTPFieldName("Vary")!)
+    // HTTPCore's registered constants (canonical lowercase wire form — field names are
+    // case-insensitive, and h2/h3 send lowercase anyway). `Permissions-Policy` is not registered;
+    // its compile-time token is always valid, so the bind never fails — the `if let` just keeps
+    // the harness force-unwrap-free.
+    envelope.setValue("max-age=63072000; includeSubDomains", for: .strictTransportSecurity)
+    envelope.setValue("nosniff", for: .xContentTypeOptions)
+    envelope.setValue("DENY", for: .xFrameOptions)
+    envelope.setValue("no-referrer", for: .referrerPolicy)
+    envelope.setValue("default-src 'self'", for: .contentSecurityPolicy)
+    if let permissionsPolicy = HTTPFieldName("Permissions-Policy") {
+        envelope.setValue("geolocation=(), microphone=()", for: permissionsPolicy)
+    }
+    envelope.setValue("Accept-Encoding", for: .vary)
 }
 
 let server = HTTPServer(

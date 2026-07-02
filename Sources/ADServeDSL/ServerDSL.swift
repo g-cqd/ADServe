@@ -409,8 +409,8 @@ public func Stream(_ subpath: String, _ handler: @escaping StreamingRequestHandl
 /// endpoint (RFC 6455 §4.2.1 / RFC 7231 §6.5.15).
 private func webSocketUpgradeRequired() -> ResponseContent {
     var headers = HTTPFields()
-    headers.setValue("websocket", for: HTTPFieldName("upgrade")!)
-    headers.setValue("Upgrade", for: HTTPFieldName("connection")!)
+    headers.setValue("websocket", for: .upgrade)
+    headers.setValue("Upgrade", for: .connection)
     return .full(
         body: Array("upgrade required\n".utf8), contentType: "text/plain; charset=utf-8",
         status: .upgradeRequired, headers: headers)

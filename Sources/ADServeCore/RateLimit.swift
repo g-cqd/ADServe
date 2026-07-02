@@ -67,7 +67,7 @@ public struct RateLimit: HTTPMiddleware {
     /// engine-seeded peer IP, else a single shared `"global"` bucket.
     public static let clientKey: @Sendable (ServerRequest, MiddlewareContext) -> String = {
         request, context in
-        if let forwarded = request.headers[forwardedForName],
+        if let forwarded = forwardedForName.flatMap({ request.headers[$0] }),
             let first = forwarded.split(separator: ",").first
         {
             return first.trimmingCharacters(in: .whitespaces)
@@ -85,7 +85,7 @@ public struct RateLimit: HTTPMiddleware {
         headers.setValue(String(decision.remaining), for: rateRemainingName)
         headers.setValue(String(decision.resetSeconds), for: rateResetName)
         guard decision.allowed else {
-            headers.setValue(String(decision.resetSeconds), for: retryAfterFieldName)
+            headers.setValue(String(decision.resetSeconds), for: .retryAfter)
             return .full(
                 body: Array("rate limit exceeded\n".utf8), contentType: "text/plain; charset=utf-8",
                 status: .tooManyRequests, headers: headers)
@@ -94,9 +94,12 @@ public struct RateLimit: HTTPMiddleware {
     }
 }
 
-// Header names not provided as `HTTPFieldName` statics by swift-http-types.
-private let forwardedForName = HTTPFieldName("x-forwarded-for")!
-private let rateLimitName = HTTPFieldName("ratelimit-limit")!
-private let rateRemainingName = HTTPFieldName("ratelimit-remaining")!
-private let rateResetName = HTTPFieldName("ratelimit-reset")!
-private let retryAfterFieldName = HTTPFieldName("retry-after")!
+// Field names HTTPCore does not register (`retry-after` IS registered and used as `.retryAfter`
+// above). Compile-time-constant valid HTTP tokens, so the optionals always bind; they are never
+// unwrapped — writes route through the module's skip-on-nil `setValue(_:for:)` overload and the
+// read through `flatMap` — so an impossible failure degrades (header absent / forwarded hop
+// unread) instead of trapping the server.
+private let forwardedForName = HTTPFieldName("x-forwarded-for")
+private let rateLimitName = HTTPFieldName("ratelimit-limit")
+private let rateRemainingName = HTTPFieldName("ratelimit-remaining")
+private let rateResetName = HTTPFieldName("ratelimit-reset")

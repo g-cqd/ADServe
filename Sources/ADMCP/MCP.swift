@@ -213,7 +213,8 @@ public struct MCPDispatcher: Sendable {
 
     private func initializeResult(_ params: JSONValue) -> JSONValue {
         let requested = jsonString(jsonMember(params, "protocolVersion"))
-        let version = (requested.map(Self.supportedVersions.contains) == true) ? requested! : "2025-11-25"
+        let version: String =
+            if let requested, Self.supportedVersions.contains(requested) { requested } else { "2025-11-25" }
         var result: OrderedDictionary<String, JSONValue> = [
             "protocolVersion": .string(version),
             "capabilities": .object([

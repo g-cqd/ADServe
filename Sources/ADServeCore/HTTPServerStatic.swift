@@ -65,13 +65,6 @@ enum ResolvedStaticPlanKey: StorageKey {
     typealias Value = StaticPlan
 }
 
-// Header names not provided as `HTTPFieldName` statics by swift-http-types.
-private let rangeName = HTTPFieldName("range")!
-private let acceptRangesName = HTTPFieldName("accept-ranges")!
-private let contentRangeName = HTTPFieldName("content-range")!
-private let contentEncodingName = HTTPFieldName("content-encoding")!
-private let varyName = HTTPFieldName("vary")!
-
 /// Owns one read-only file descriptor for a streamed static response: closed exactly once —
 /// explicitly when the stream producer finishes, or via ARC if the response is dropped without the
 /// producer ever running (e.g. a failed head write) — so a descriptor can never leak.
@@ -141,7 +134,7 @@ extension EngineResponder {
 
             case .rangeNotSatisfiable(let totalSize):
                 var headers = staticHeaders(cache: cache, environment: environment)
-                headers.setValue("bytes */\(totalSize)", for: contentRangeName)
+                headers.setValue("bytes */\(totalSize)", for: .contentRange)
                 mergeResponseHeaders(file.headers, into: &headers)
                 return ServerResponse(
                     HTTPResponse(status: .rangeNotSatisfiable, headerFields: headers))
@@ -175,13 +168,13 @@ extension EngineResponder {
         headers.setValue(serve.etag, for: .etag)
         headers.setValue(serve.lastModified, for: .lastModified)
         if let encoding = serve.contentEncoding {
-            headers.setValue(encoding, for: contentEncodingName)
-            headers.setValue("Accept-Encoding", for: varyName)
+            headers.setValue(encoding, for: .contentEncoding)
+            headers.setValue("Accept-Encoding", for: .vary)
         }
         if let range = serve.range {
             headers.setValue(
                 "bytes \(range.lowerBound)-\(range.upperBound)/\(serve.totalSize)",
-                for: contentRangeName)
+                for: .contentRange)
         }
         mergeResponseHeaders(file.headers, into: &headers)
         let status: HTTPStatus = serve.partial ? .partialContent : .ok
@@ -240,7 +233,7 @@ extension EngineResponder {
         cache: CachePolicy, environment: ResponseEnvironment
     ) -> HTTPFields {
         var headers = commonHeaders(cache: cache, environment: environment)
-        headers.setValue("bytes", for: acceptRangesName)
+        headers.setValue("bytes", for: .acceptRanges)
         return headers
     }
 }
@@ -275,7 +268,7 @@ extension HTTPServer {
             return .notFound
         }
 
-        let rangeHeader = headers[rangeName]
+        let rangeHeader = headers[.range]
 
         // Precompressed negotiation: only for compressible types and only without a Range (a range
         // request serves the identity bytes — ranges over the compressed stream are not offered).

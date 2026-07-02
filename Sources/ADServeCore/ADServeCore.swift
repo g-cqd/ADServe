@@ -716,8 +716,8 @@ public func resolveRequestID(_ headers: HTTPFields) -> String {
     return UUID().uuidString.lowercased()
 }
 
-/// `x-request-id` — lowercase token name, defined once.
-public let requestIDName = HTTPFieldName("x-request-id")!
+/// `x-request-id` — lowercase token name, defined once (HTTPCore's registered constant).
+public let requestIDName: HTTPFieldName = .xRequestID
 
 private func isValidRequestID(_ s: String) -> Bool {
     let utf8 = s.utf8

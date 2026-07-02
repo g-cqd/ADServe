@@ -130,15 +130,19 @@ extension ResponseContent {
 
 // MARK: - Registered statuses HTTPCore does not name (defined once for the factories above)
 
+// `HTTPStatus(code:)` validates only the 100...599 range, so every literal below always constructs;
+// HTTPCore's non-failable `init(unchecked:)` is not public, so each coalesces onto the nearest
+// registered same-class status — an unreachable fallback that keeps the shipped tree free of
+// force-unwraps without trapping.
 extension HTTPStatus {
     /// `303 See Other` (RFC 9110 §15.4.4).
-    public static let seeOther = HTTPStatus(code: 303)!
+    public static let seeOther = HTTPStatus(code: 303) ?? .found
     /// `308 Permanent Redirect` (RFC 9110 §15.4.9).
-    public static let permanentRedirect = HTTPStatus(code: 308)!
+    public static let permanentRedirect = HTTPStatus(code: 308) ?? .movedPermanently
     /// `409 Conflict` (RFC 9110 §15.5.10).
-    public static let conflict = HTTPStatus(code: 409)!
+    public static let conflict = HTTPStatus(code: 409) ?? .badRequest
     /// `415 Unsupported Media Type` (RFC 9110 §15.5.16).
-    public static let unsupportedMediaType = HTTPStatus(code: 415)!
+    public static let unsupportedMediaType = HTTPStatus(code: 415) ?? .badRequest
     /// `422 Unprocessable Content` (RFC 9110 §15.5.21).
-    public static let unprocessableContent = HTTPStatus(code: 422)!
+    public static let unprocessableContent = HTTPStatus(code: 422) ?? .badRequest
 }

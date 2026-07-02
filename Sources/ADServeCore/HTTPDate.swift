@@ -19,7 +19,7 @@ enum HTTPDate {
     ]
     private static let utc: Calendar = {
         var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(identifier: "GMT")!
+        calendar.timeZone = .gmt
         return calendar
     }()
 

@@ -137,18 +137,18 @@ public struct CORS: HTTPMiddleware {
         next: @Sendable (ServerRequest) async -> ResponseContent
     ) async -> ResponseContent {
         let isPreflight =
-            request.method == .options && request.headers[name("access-control-request-method")] != nil
+            request.method == .options && request.headers[.accessControlRequestMethod] != nil
         var cors = HTTPFields()
-        cors.setValue(allowOrigin, for: name("access-control-allow-origin"))
-        if allowCredentials { cors.setValue("true", for: name("access-control-allow-credentials")) }
+        cors.setValue(allowOrigin, for: .accessControlAllowOrigin)
+        if allowCredentials { cors.setValue("true", for: .accessControlAllowCredentials) }
         if !exposeHeaders.isEmpty {
-            cors.setValue(exposeHeaders.joined(separator: ", "), for: name("access-control-expose-headers"))
+            cors.setValue(exposeHeaders.joined(separator: ", "), for: accessControlExposeHeadersName)
         }
         if isPreflight {
             cors.setValue(
-                allowMethods.map(\.rawValue).joined(separator: ", "), for: name("access-control-allow-methods"))
-            cors.setValue(allowHeaders.joined(separator: ", "), for: name("access-control-allow-headers"))
-            cors.setValue(String(maxAgeSeconds), for: name("access-control-max-age"))
+                allowMethods.map(\.rawValue).joined(separator: ", "), for: .accessControlAllowMethods)
+            cors.setValue(allowHeaders.joined(separator: ", "), for: .accessControlAllowHeaders)
+            cors.setValue(String(maxAgeSeconds), for: .accessControlMaxAge)
             return .full(body: [], contentType: "text/plain; charset=utf-8", status: .noContent, headers: cors)
         }
         return (await next(request)).withHeaders(cors)
@@ -194,20 +194,20 @@ public struct SecurityHeaders: HTTPMiddleware {
             self.headers = headers
         } else {
             var defaults = HTTPFields()
-            defaults.setValue("nosniff", for: name("x-content-type-options"))
-            defaults.setValue("DENY", for: name("x-frame-options"))
-            defaults.setValue("strict-origin-when-cross-origin", for: name("referrer-policy"))
-            defaults.setValue("same-origin", for: name("cross-origin-opener-policy"))
-            defaults.setValue("same-origin", for: name("cross-origin-resource-policy"))
+            defaults.setValue("nosniff", for: .xContentTypeOptions)
+            defaults.setValue("DENY", for: .xFrameOptions)
+            defaults.setValue("strict-origin-when-cross-origin", for: .referrerPolicy)
+            defaults.setValue("same-origin", for: crossOriginOpenerPolicyName)
+            defaults.setValue("same-origin", for: crossOriginResourcePolicyName)
             // Deny the powerful features a typical API/site never needs, so an injected script can't
             // reach them. Override by passing your own `HTTPFields` if a feature IS needed.
             defaults.setValue(
                 "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), "
                     + "microphone=(), payment=(), usb=()",
-                for: name("permissions-policy"))
+                for: permissionsPolicyName)
             self.headers = defaults
         }
-        if let hsts { self.headers.setValue(hsts.headerValue, for: name("strict-transport-security")) }
+        if let hsts { self.headers.setValue(hsts.headerValue, for: .strictTransportSecurity) }
     }
 
     public func intercept(
@@ -259,7 +259,7 @@ public struct CSPNonce: HTTPMiddleware {
         context.storage[CSPNonceKey.self] = nonce
         let response = await next(request)
         var headers = HTTPFields()
-        headers.setValue(policy(nonce), for: name("content-security-policy"))
+        headers.setValue(policy(nonce), for: .contentSecurityPolicy)
         return response.withHeaders(headers)
     }
 
@@ -279,6 +279,23 @@ public struct CSPNonce: HTTPMiddleware {
     }
 }
 
-/// A lowercase HTTP field name (the swift-http-types canonical form). Traps on an invalid token —
-/// these are compile-time-constant literals.
-private func name(_ token: String) -> HTTPFieldName { HTTPFieldName(token)! }
+// Field names HTTPCore does not register. The tokens are compile-time-constant valid HTTP tokens,
+// so construction always succeeds; they stay optional (never unwrapped) and route through the
+// skip-on-nil `setValue` overload below, so an impossible failure drops the one header instead of
+// trapping the server. The registered names (`.xFrameOptions`, …) are used directly above.
+private let accessControlExposeHeadersName = HTTPFieldName("access-control-expose-headers")
+private let crossOriginOpenerPolicyName = HTTPFieldName("cross-origin-opener-policy")
+private let crossOriginResourcePolicyName = HTTPFieldName("cross-origin-resource-policy")
+private let permissionsPolicyName = HTTPFieldName("permissions-policy")
+
+extension HTTPFields {
+    /// Sets `value` for an optionally-constructed field name; `nil` (unreachable for the module's
+    /// compile-time-constant tokens — see the doc comments at their declarations) skips the header
+    /// instead of trapping. Any dropped header would be caught by the middleware test suite, which
+    /// asserts the full header sets. Internal so the module's other unregistered-name sites
+    /// (`RateLimit`) share the one skip-on-nil path.
+    mutating func setValue(_ value: String, for fieldName: HTTPFieldName?) {
+        guard let fieldName else { return }
+        setValue(value, for: fieldName)
+    }
+}

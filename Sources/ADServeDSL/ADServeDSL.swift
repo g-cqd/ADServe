@@ -12,15 +12,21 @@ public import Logging
 public import WebSocket
 
 /// RFC-0019 C1: the header the ADHTML runtime sets on every client-action fetch (`ADH-Request: 1`), so a
-/// handler can detect it and return a fragment. A valid HTTP token, so the force-unwrap is total.
-private let adhRequestFieldName = HTTPFieldName("ADH-Request")!
+/// handler can detect it and return a fragment. A valid HTTP token, so construction always succeeds; the
+/// optional is threaded through `isFragment` (never unwrapped) so an impossible failure would degrade to
+/// "never a fragment" rather than trapping at module load.
+private let adhRequestFieldName = HTTPFieldName("ADH-Request")
 
 // MARK: - Handler contexts
 
 /// A handler context, buildable from the engine's per-request input. The `request` + `codec`
 /// requirements power the shared `query`/`decode`/`json`/`body` helpers below — free on every context.
+/// The initializer is `throws` so a context with a structural precondition (``StorageContext``'s
+/// checked-out connection) can refuse an invalid input as a typed `HTTPError` — rendered as a 500
+/// problem by the engine's error mapping — instead of trapping; contexts without preconditions
+/// satisfy it with a plain non-throwing `init`.
 public protocol HandlerContext: Sendable {
-    init(_ input: HandlerInput)
+    init(_ input: HandlerInput) throws
     var request: ServerRequest { get }
     var codec: ContentCodec { get }
     var storage: RequestStorage { get }
@@ -57,7 +63,7 @@ extension HandlerContext {
     /// True when the ADHTML runtime issued this request — it carries the `ADH-Request` header (RFC-0019
     /// C1) — so the handler should return a `.fragment` (partial the client morphs) instead of a full
     /// page. Serves one route two ways: `ctx.isFragment ? .fragment(rowsHTML) : try .html(page)`.
-    public var isFragment: Bool { request.headers[adhRequestFieldName] != nil }
+    public var isFragment: Bool { adhRequestFieldName.map { request.headers[$0] != nil } ?? false }
     /// The raw request body bytes.
     public var body: [UInt8] { request.body }
     /// Decode the request body into `T` via the configured codec (default: JSON over ADJSON). Throws
@@ -110,13 +116,18 @@ public struct StorageContext: HandlerContext {
     public let logger: Logger
     public let requestID: String
 
-    public init(_ input: HandlerInput) {
+    public init(_ input: HandlerInput) throws {
         request = input.request
         codec = input.codec
         storage = input.storage
-        // Safe: the engine only builds a StorageContext for a `needsStorage` route, and
-        // only after a successful checkout.
-        connection = input.connection!
+        // The engine builds a StorageContext only for a `needsStorage` route, and only after a
+        // successful checkout — a missing connection is an engine-wiring defect. Refuse the one
+        // request as a typed 500 (the engine's error mapping renders it) instead of trapping the
+        // whole server.
+        guard let connection = input.connection else {
+            throw HTTPError.internalServerError("storage route dispatched without a checked-out connection")
+        }
+        self.connection = connection
         logger = input.logger
         requestID = input.requestID
     }
