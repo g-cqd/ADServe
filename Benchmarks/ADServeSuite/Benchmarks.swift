@@ -2,7 +2,7 @@ import ADFCore
 import ADServeCore
 import ADServeDSL
 import Benchmark
-import HTTPTypes
+import HTTPCore
 
 // ADServe's benchmark suite on ordo-one's framework, matching the sibling ADFoundation / ADJSON / ADDB
 // suites. Run with `ADSERVE_DEV=1 swift package benchmark`. The guards track `.mallocCountTotal` (CI

@@ -286,6 +286,7 @@ if isDev {
                 // hot paths, not just the cookie pair the original two cases tracked.
                 "ADServeDSL",
                 .product(name: "ADFCore", package: "ADFoundation"),
+                .product(name: "HTTPCore", package: "HTTP"),
                 .product(name: "Benchmark", package: "benchmark")
             ],
             path: "Benchmarks/ADServeSuite",

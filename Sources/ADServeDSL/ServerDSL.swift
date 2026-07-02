@@ -534,7 +534,7 @@ public enum ServerBuilder {
     public static func buildEither(second: [Application]) -> [Application] { second }
 }
 
-/// The server definition → its applications (one NIO listener each). `protocol:` is the
+/// The server definition → its applications (one engine listener each). `protocol:` is the
 /// default `Wire` applied to every `App` that didn't set its own. Lower to engine
 /// `ListenerConfig`s with `listeners(_:defaultPort:)`.
 public func Server(

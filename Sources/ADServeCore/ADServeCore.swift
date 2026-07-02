@@ -299,7 +299,7 @@ public enum ResponseContent: Sendable {
         headers: HTTPFields = HTTPFields(), heartbeat: Duration? = nil,
         body: @Sendable (any SSEWriter) async throws -> Void)
     /// A guarded static file served from `root` + `subpath`. The engine resolves it OFF the event loop
-    /// (NIOFileSystem): 404 if missing / not a regular file / a symlink / outside the canonicalized root
+    /// (the blocking-offload pool): 404 if missing / not a regular file / a symlink / outside the canonicalized root
     /// jail; otherwise a strong size+mtime `ETag` with `If-None-Match` → 304, and the body streamed in
     /// chunks. The DSL `Static(_:root:)` validates the subpath (no dotfiles; an allow-listed extension →
     /// `contentType`) and produces this; `headers` carries any response-middleware decoration.
