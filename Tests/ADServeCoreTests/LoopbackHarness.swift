@@ -21,6 +21,14 @@ private nonisolated(unsafe) let posixConnect: (Int32, UnsafePointer<sockaddr>?, 
     connect
 private nonisolated(unsafe) let posixSend: (Int32, UnsafeRawPointer?, Int, Int32) -> Int = send
 
+// SIGPIPE suppression differs by platform: Darwin sets `SO_NOSIGPIPE` per-socket (below); Glibc has
+// no such option, so Linux passes `MSG_NOSIGNAL` per `send` instead.
+#if canImport(Darwin)
+    private let posixSendFlags: Int32 = 0
+#else
+    private let posixSendFlags = Int32(MSG_NOSIGNAL)
+#endif
+
 /// A minimal `HTTPHandling` for integration tests: every `GET` (any path) runs `respond`; other
 /// methods 404. Lets a loopback test serve a chosen `ResponseContent` (e.g. a `.stream`/`.sse`)
 /// straight through the engine without pulling in the DSL.
@@ -122,9 +130,11 @@ final class TestSocket: @unchecked Sendable {
         var flag: Int32 = 1
         _ = setsockopt(descriptor, IPPROTO_TCP, TCP_NODELAY, &flag, socklen_t(MemoryLayout<Int32>.size))
         // A send to a peer that already closed must fail with EPIPE, not kill the test process.
-        var noSigpipe: Int32 = 1
-        _ = setsockopt(
-            descriptor, SOL_SOCKET, SO_NOSIGPIPE, &noSigpipe, socklen_t(MemoryLayout<Int32>.size))
+        #if canImport(Darwin)
+            var noSigpipe: Int32 = 1
+            _ = setsockopt(
+                descriptor, SOL_SOCKET, SO_NOSIGPIPE, &noSigpipe, socklen_t(MemoryLayout<Int32>.size))
+        #endif
         return TestSocket(descriptor: descriptor)
     }
 
@@ -147,9 +157,11 @@ final class TestSocket: @unchecked Sendable {
             _ = posixClose(descriptor)
             throw TLSHarnessError(message: "connect(\(path)) failed: errno \(errno)")
         }
-        var noSigpipe: Int32 = 1
-        _ = setsockopt(
-            descriptor, SOL_SOCKET, SO_NOSIGPIPE, &noSigpipe, socklen_t(MemoryLayout<Int32>.size))
+        #if canImport(Darwin)
+            var noSigpipe: Int32 = 1
+            _ = setsockopt(
+                descriptor, SOL_SOCKET, SO_NOSIGPIPE, &noSigpipe, socklen_t(MemoryLayout<Int32>.size))
+        #endif
         return TestSocket(descriptor: descriptor)
     }
 
@@ -157,7 +169,7 @@ final class TestSocket: @unchecked Sendable {
         var offset = 0
         while offset < bytes.count {
             let written = bytes.withUnsafeBytes { raw in
-                posixSend(descriptor, raw.baseAddress.map { $0 + offset }, bytes.count - offset, 0)
+                posixSend(descriptor, raw.baseAddress.map { $0 + offset }, bytes.count - offset, posixSendFlags)
             }
             guard written > 0 else { throw TLSHarnessError(message: "send failed: errno \(errno)") }
             offset += written
