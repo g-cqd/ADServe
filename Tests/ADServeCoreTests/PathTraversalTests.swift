@@ -180,13 +180,24 @@ import Testing
 
         try Data("CAFE-IDENTITY".utf8).write(to: URL(fileURLWithPath: root.file(nfc)))
 
+        // Whether the NFD spelling resolves to the NFC file is a property of THIS filesystem: APFS (macOS
+        // dev) is normalization-insensitive and folds them together; ext4 (Linux CI) is byte-exact and
+        // does not. Probe it so the test asserts the real behavior on either — a normalization-insensitive
+        // FS serves the NFD request (200), a sensitive one 404s. Neither escapes root.
+        let normalizationInsensitiveFS = FileManager.default.fileExists(atPath: root.file(nfd))
+
         // Request via the NFD form.
         let nfdRoutes = StubRoutes { _ in
             .file(root: root.path, subpath: nfd, contentType: "text/css; charset=utf-8")
         }
         let nfdResponse = try await Loopback.run(path: "/cafe.css", routes: nfdRoutes)
-        #expect(nfdResponse.hasPrefix("HTTP/1.1 200"))  // dev FS resolves NFD→NFC inode
-        #expect(nfdResponse.contains("CAFE-IDENTITY"))
+        if normalizationInsensitiveFS {
+            #expect(nfdResponse.hasPrefix("HTTP/1.1 200"))  // dev FS resolves NFD→NFC inode
+            #expect(nfdResponse.contains("CAFE-IDENTITY"))
+        } else {
+            #expect(nfdResponse.hasPrefix("HTTP/1.1 404"))  // normalization-sensitive FS: no NFD file
+            #expect(!nfdResponse.contains("CAFE-IDENTITY"))  // still jailed: nothing leaked
+        }
 
         // Request via the exact NFC form it was written with.
         let nfcRoutes = StubRoutes { _ in
@@ -228,12 +239,23 @@ import Testing
         defer { root.cleanup() }
         try Data("UPPERCASE-FILE".utf8).write(to: URL(fileURLWithPath: root.file("APP.CSS")))
 
+        // Whether `app.css` resolves to the on-disk `APP.CSS` is a property of THIS filesystem, not the
+        // OS: the macOS dev FS (APFS) folds case, Linux CI (ext4) does not. Probe it directly so the test
+        // asserts the real behavior on either — a case-insensitive FS serves it (200), a case-sensitive FS
+        // 404s. The jail invariant (the resolved path never leaves root) holds regardless.
+        let caseInsensitiveFS = FileManager.default.fileExists(atPath: root.file("app.css"))
+
         let routes = StubRoutes { _ in
             .file(root: root.path, subpath: "app.css", contentType: "text/css; charset=utf-8")
         }
         let response = try await Loopback.run(path: "/app.css", routes: routes)
-        #expect(response.hasPrefix("HTTP/1.1 200"))  // case-insensitive FS resolves APP.CSS
-        #expect(response.contains("UPPERCASE-FILE"))
+        if caseInsensitiveFS {
+            #expect(response.hasPrefix("HTTP/1.1 200"))  // case-insensitive FS resolves APP.CSS
+            #expect(response.contains("UPPERCASE-FILE"))
+        } else {
+            #expect(response.hasPrefix("HTTP/1.1 404"))  // case-sensitive FS: no `app.css` on disk
+            #expect(!response.contains("UPPERCASE-FILE"))  // still jailed: nothing leaked
+        }
     }
 
     @Test func extensionAllowListIsCaseFoldedSoUppercaseCannotBypass() {
