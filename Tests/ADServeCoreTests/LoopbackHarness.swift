@@ -4,6 +4,23 @@ import Logging
 
 @testable import ADServeCore
 
+// The raw-socket test client calls POSIX `connect`/`send`/`close` directly. Importing the platform
+// module (Darwin on Apple, Glibc on Linux) brings in the C functions; typed file-scope aliases pin
+// the intended overloads and — crucially — sidestep the name clash with `TestSocket`'s own
+// `send`/`connect` members (the reason these were platform-qualified before, which broke on Linux).
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
+
+// `nonisolated(unsafe)`: these are immutable references to reentrant C functions — safe to share, but
+// their bare function types aren't `Sendable`, so the global-state check needs the opt-out.
+private nonisolated(unsafe) let posixClose: (Int32) -> Int32 = close
+private nonisolated(unsafe) let posixConnect: (Int32, UnsafePointer<sockaddr>?, socklen_t) -> Int32 =
+    connect
+private nonisolated(unsafe) let posixSend: (Int32, UnsafeRawPointer?, Int, Int32) -> Int = send
+
 /// A minimal `HTTPHandling` for integration tests: every `GET` (any path) runs `respond`; other
 /// methods 404. Lets a loopback test serve a chosen `ResponseContent` (e.g. a `.stream`/`.sse`)
 /// straight through the engine without pulling in the DSL.
@@ -83,7 +100,7 @@ final class TestSocket: @unchecked Sendable {
         self.descriptor = descriptor
     }
 
-    deinit { _ = Darwin.close(descriptor) }
+    deinit { _ = posixClose(descriptor) }
 
     /// Connects to `host:port` (TCP, loopback tests).
     static func connect(host: String, port: Int) throws -> TestSocket {
@@ -95,11 +112,11 @@ final class TestSocket: @unchecked Sendable {
         address.sin_addr.s_addr = inet_addr(host)
         let connected = withUnsafePointer(to: &address) { pointer in
             pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { rebound in
-                Darwin.connect(descriptor, rebound, socklen_t(MemoryLayout<sockaddr_in>.size))
+                posixConnect(descriptor, rebound, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
         guard connected == 0 else {
-            _ = Darwin.close(descriptor)
+            _ = posixClose(descriptor)
             throw TLSHarnessError(message: "connect(\(host):\(port)) failed: errno \(errno)")
         }
         var flag: Int32 = 1
@@ -123,11 +140,11 @@ final class TestSocket: @unchecked Sendable {
         }
         let connected = withUnsafePointer(to: &address) { pointer in
             pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { rebound in
-                Darwin.connect(descriptor, rebound, socklen_t(MemoryLayout<sockaddr_un>.size))
+                posixConnect(descriptor, rebound, socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
         guard connected == 0 else {
-            _ = Darwin.close(descriptor)
+            _ = posixClose(descriptor)
             throw TLSHarnessError(message: "connect(\(path)) failed: errno \(errno)")
         }
         var noSigpipe: Int32 = 1
@@ -140,7 +157,7 @@ final class TestSocket: @unchecked Sendable {
         var offset = 0
         while offset < bytes.count {
             let written = bytes.withUnsafeBytes { raw in
-                Darwin.send(descriptor, raw.baseAddress.map { $0 + offset }, bytes.count - offset, 0)
+                posixSend(descriptor, raw.baseAddress.map { $0 + offset }, bytes.count - offset, 0)
             }
             guard written > 0 else { throw TLSHarnessError(message: "send failed: errno \(errno)") }
             offset += written
@@ -306,7 +323,7 @@ enum Loopback {
     static func freePort() throws -> Int {
         let probe = socket(AF_INET, SOCK_STREAM, 0)
         guard probe >= 0 else { throw TLSHarnessError(message: "probe socket failed") }
-        defer { _ = Darwin.close(probe) }
+        defer { _ = posixClose(probe) }
         var address = sockaddr_in()
         address.sin_family = sa_family_t(AF_INET)
         address.sin_port = 0
