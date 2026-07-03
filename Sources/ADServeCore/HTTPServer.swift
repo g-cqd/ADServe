@@ -350,8 +350,14 @@ public struct HTTPServer: Sendable {
         // The engine's h1 parser enforces this GLOBAL cap at parse time, BEFORE the per-route
         // resolver can RAISE it (recorded upstream gap) — so it is set to a coarse transport
         // ceiling and `EngineResponder.resolve` supplies the effective cap (the server default, or
-        // a route's raise) for every request head. It also bounds a WebSocket message reassembly.
+        // a route's raise) for every request head.
         limits.maxBodySize = max(maxBodyBytes, 64 << 20)
+        // The WebSocket message (and, via the engine, single-frame) cap mirrors the server's body
+        // policy DIRECTLY — not the floored h1 parse ceiling above, whose 64 MiB coarseness exists
+        // only so per-route raises can beat parse-time enforcement. WS has no per-route raise, so
+        // the configured body cap is the right bound for reassembled or unfragmented messages
+        // (default 1 MB; an oversized frame closes 1009 instead of buffering without bound).
+        limits.maxWebSocketMessageSize = maxBodyBytes
         let idle: Duration = idleTimeout > .zero ? idleTimeout : .seconds(1 << 24)
         limits.idleTimeout = idle
         limits.keepAliveTimeout = idle
