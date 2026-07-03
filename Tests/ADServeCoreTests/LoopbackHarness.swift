@@ -242,7 +242,9 @@ final class TestSocket: @unchecked Sendable {
     }
 
     func close() {
-        _ = shutdown(descriptor, SHUT_RDWR)
+        // `SHUT_RDWR` is a plain `Int32` on Darwin but an `Int` on Glibc — normalize to the `Int32`
+        // `shutdown()`'s `how` argument wants.
+        _ = shutdown(descriptor, Int32(SHUT_RDWR))
     }
 }
 
