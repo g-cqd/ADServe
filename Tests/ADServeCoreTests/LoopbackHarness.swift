@@ -29,6 +29,14 @@ private nonisolated(unsafe) let posixSend: (Int32, UnsafeRawPointer?, Int, Int32
     private let posixSendFlags = Int32(MSG_NOSIGNAL)
 #endif
 
+// `SOCK_STREAM` is a plain `Int32` on Darwin but a `__socket_type` enum on Glibc — normalize to the
+// `Int32` that `socket()`'s type argument wants.
+#if canImport(Darwin)
+    private let cSockStream = SOCK_STREAM
+#else
+    private let cSockStream = Int32(SOCK_STREAM.rawValue)
+#endif
+
 /// A minimal `HTTPHandling` for integration tests: every `GET` (any path) runs `respond`; other
 /// methods 404. Lets a loopback test serve a chosen `ResponseContent` (e.g. a `.stream`/`.sse`)
 /// straight through the engine without pulling in the DSL.
@@ -112,7 +120,7 @@ final class TestSocket: @unchecked Sendable {
 
     /// Connects to `host:port` (TCP, loopback tests).
     static func connect(host: String, port: Int) throws -> TestSocket {
-        let descriptor = socket(AF_INET, SOCK_STREAM, 0)
+        let descriptor = socket(AF_INET, cSockStream, 0)
         guard descriptor >= 0 else { throw TLSHarnessError(message: "socket() failed") }
         var address = sockaddr_in()
         address.sin_family = sa_family_t(AF_INET)
@@ -128,7 +136,7 @@ final class TestSocket: @unchecked Sendable {
             throw TLSHarnessError(message: "connect(\(host):\(port)) failed: errno \(errno)")
         }
         var flag: Int32 = 1
-        _ = setsockopt(descriptor, IPPROTO_TCP, TCP_NODELAY, &flag, socklen_t(MemoryLayout<Int32>.size))
+        _ = setsockopt(descriptor, Int32(IPPROTO_TCP), Int32(TCP_NODELAY), &flag, socklen_t(MemoryLayout<Int32>.size))
         // A send to a peer that already closed must fail with EPIPE, not kill the test process.
         #if canImport(Darwin)
             var noSigpipe: Int32 = 1
@@ -140,7 +148,7 @@ final class TestSocket: @unchecked Sendable {
 
     /// Connects to a UNIX-domain socket at `path`.
     static func connectUnix(path: String) throws -> TestSocket {
-        let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
+        let descriptor = socket(AF_UNIX, cSockStream, 0)
         guard descriptor >= 0 else { throw TLSHarnessError(message: "socket(AF_UNIX) failed") }
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
@@ -180,10 +188,15 @@ final class TestSocket: @unchecked Sendable {
 
     /// One bounded read (≤ `timeout`): the received chunk, `[]` on EOF, or `nil` on timeout.
     func readChunk(timeout: Duration) -> [UInt8]? {
-        var tv = timeval(
-            tv_sec: Int(timeout.components.seconds),
-            tv_usec: Int32(timeout.components.attoseconds / 1_000_000_000_000))
-        _ = setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        let usec = timeout.components.attoseconds / 1_000_000_000_000
+        // `timeval.tv_usec` is `Int32` (`__darwin_suseconds_t`) on Darwin but `Int` (`__suseconds_t`)
+        // on Glibc; `tv_sec` is `Int`-compatible on both.
+        #if canImport(Darwin)
+            var tv = timeval(tv_sec: Int(timeout.components.seconds), tv_usec: Int32(usec))
+        #else
+            var tv = timeval(tv_sec: Int(timeout.components.seconds), tv_usec: Int(usec))
+        #endif
+        _ = setsockopt(descriptor, Int32(SOL_SOCKET), Int32(SO_RCVTIMEO), &tv, socklen_t(MemoryLayout<timeval>.size))
         var buffer = [UInt8](repeating: 0, count: 65_536)
         let count = buffer.withUnsafeMutableBytes { raw in
             recv(descriptor, raw.baseAddress, raw.count, 0)
@@ -333,7 +346,7 @@ enum Loopback {
     /// Discover a free loopback port: bind :0, read the assignment, release it. The same
     /// probe-then-bind pattern the pre-migration harness used; raciness is irrelevant at test scale.
     static func freePort() throws -> Int {
-        let probe = socket(AF_INET, SOCK_STREAM, 0)
+        let probe = socket(AF_INET, cSockStream, 0)
         guard probe >= 0 else { throw TLSHarnessError(message: "probe socket failed") }
         defer { _ = posixClose(probe) }
         var address = sockaddr_in()
