@@ -18,7 +18,14 @@ public struct HMACSigner: Sendable {
     /// The minimum signing-secret length (bytes). Below this a key is brute-forceable; construction throws.
     public static let minimumSecretBytes = 32
 
-    private let key: SymmetricKey
+    /// The HKDF-derived key material, stored as bytes: swift-crypto's Linux `SymmetricKey` predates
+    /// its Sendable annotation (CryptoKit's on Darwin has it), and `@preconcurrency import` is
+    /// rejected under this target's strict memory safety — so the `Sendable` field is the byte
+    /// array and the `SymmetricKey` is rewrapped per operation (a 32-byte copy, negligible next to
+    /// the HMAC itself).
+    private let keyBytes: [UInt8]
+
+    private var key: SymmetricKey { SymmetricKey(data: keyBytes) }
 
     /// `secret` MUST be ≥ ``minimumSecretBytes`` bytes (`HMACSignerError.secretTooShort` otherwise). The
     /// HMAC key is HKDF-SHA256-**derived** from it under the context label `info`, so (a) the key is a
@@ -29,10 +36,11 @@ public struct HMACSigner: Sendable {
         guard secret.count >= Self.minimumSecretBytes else {
             throw HMACSignerError.secretTooShort(provided: secret.count, minimum: Self.minimumSecretBytes)
         }
-        self.key = HKDF<SHA256>
+        let derived = HKDF<SHA256>
             .deriveKey(
                 inputKeyMaterial: SymmetricKey(data: secret),
                 info: Data(info.utf8), outputByteCount: 32)
+        self.keyBytes = unsafe derived.withUnsafeBytes { unsafe Array($0) }
     }
 
     /// `"<payload>.<hmac-hex>"` — the payload followed by its tag, so tampering with the payload is

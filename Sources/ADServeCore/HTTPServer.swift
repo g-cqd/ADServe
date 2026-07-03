@@ -336,7 +336,9 @@ public struct HTTPServer: Sendable {
             configuration.backbone = .networkFramework
             configuration.tls = try TLSMaterial.transportTLS(from: tls, alpn: listener.wire.alpn)
         }
-        return TransportFactory.make(configuration)
+        // `make` is `throws(TransportError)` since the HTTP engine's migration additives — an
+        // unsupported backbone surfaces as a boot error here, not a trap.
+        return try TransportFactory.make(configuration)
     }
 
     /// ADServe's knobs mapped onto the engine's `HTTPLimits`: the server body cap, the single

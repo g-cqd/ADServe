@@ -227,7 +227,13 @@ final class UnixDomainSocketTransport: ServerTransport {
         guard path.utf8.count < MemoryLayout<sockaddr_un>.size - 8 else {
             throw EngineError(message: "UNIX-domain socket path too long: \(path)")
         }
-        let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
+        // Glibc's importer vends SOCK_STREAM as the C enum `__socket_type` while `socket` takes a
+        // plain Int32 (Darwin declares both as Int32) — pass the raw value there.
+        #if canImport(Glibc)
+            let descriptor = socket(AF_UNIX, Int32(SOCK_STREAM.rawValue), 0)
+        #else
+            let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
+        #endif
         guard descriptor >= 0 else {
             throw EngineError(message: "socket(AF_UNIX) failed: errno \(errno)")
         }
@@ -373,7 +379,8 @@ actor UnixDomainSocketConnection: TransportConnection {
     nonisolated func cancel() {
         if closed.exchange(true, ordering: .acquiringAndReleasing) == false {
             // Shut both directions down so the parked reader thread unblocks, then release the fd.
-            _ = shutdown(descriptor, SHUT_RDWR)
+            // (`numericCast`: Glibc imports SHUT_RDWR as Int while `shutdown` takes Int32.)
+            _ = shutdown(descriptor, numericCast(SHUT_RDWR))
             HTTPServer.closeDescriptor(descriptor)
         }
     }
