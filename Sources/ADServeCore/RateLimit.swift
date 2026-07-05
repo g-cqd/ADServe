@@ -22,20 +22,37 @@ private final class RateWindowStore: Sendable {
         var start: Double
         var count: Int
     }
-    private let windows = Mutex<[String: Window]>([:])
+    private struct State {
+        var windows: [String: Window] = [:]
+        /// Earliest time the next full expired-window sweep may run.
+        var nextSweep: Double = 0
+    }
+    private let state = Mutex(State())
     private let sweepThreshold = 10_000
+    /// Absolute ceiling on distinct keys. A spoofed `X-Forwarded-For` space would otherwise inflate the
+    /// map without bound between sweeps; past the cap a NEW key is counted for its own request but not
+    /// stored (so it isn't tracked across requests — graceful degradation under a key-flood attack).
+    private let hardCap = 100_000
 
     func admit(key: String, limit: Int, windowSeconds: Int) -> RateDecision {
         let now = Date().timeIntervalSince1970
         let window = Double(windowSeconds)
-        return windows.withLock { map in
-            if map.count > sweepThreshold {
-                map = map.filter { $0.value.start + window >= now }  // drop expired windows
+        return state.withLock { state in
+            // Amortized sweep: rebuild at most once per window. The previous unconditional rebuild reran on
+            // EVERY request once the map passed the soft cap — a spoofed key space (>10k distinct
+            // `X-Forwarded-For`) pinned it there, serializing all traffic behind an O(n) rebuild under the
+            // lock (DoS amplification). Gating on `nextSweep` makes the amortized sweep cost O(1)/request.
+            if state.windows.count > sweepThreshold, now >= state.nextSweep {
+                state.windows = state.windows.filter { $0.value.start + window >= now }
+                state.nextSweep = now + window
             }
-            var entry = map[key] ?? Window(start: now, count: 0)
+            var entry = state.windows[key] ?? Window(start: now, count: 0)
             if now >= entry.start + window { entry = Window(start: now, count: 0) }  // new window
             entry.count += 1
-            map[key] = entry
+            // Store the updated window, unless a key-flood has hit the hard cap and this is a new key.
+            if state.windows[key] != nil || state.windows.count < hardCap {
+                state.windows[key] = entry
+            }
             let resetSeconds = max(0, Int((entry.start + window - now).rounded(.up)))
             return RateDecision(
                 allowed: entry.count <= limit, remaining: max(0, limit - entry.count),

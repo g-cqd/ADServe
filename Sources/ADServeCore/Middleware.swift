@@ -88,16 +88,16 @@ extension ResponseContent {
                     body: Array("Not Found".utf8), contentType: "text/plain; charset=utf-8",
                     status: .notFound, headers: extra)
             case .full(let body, let contentType, let status, var headers):
-                mergeResponseHeaders(extra, into: &headers)
+                headers.mergeResponse(extra)
                 return .full(body: body, contentType: contentType, status: status, headers: headers)
             case .stream(let contentType, let status, var headers, let body):
-                mergeResponseHeaders(extra, into: &headers)
+                headers.mergeResponse(extra)
                 return .stream(contentType: contentType, status: status, headers: headers, body: body)
             case .sse(var headers, let heartbeat, let body):
-                mergeResponseHeaders(extra, into: &headers)
+                headers.mergeResponse(extra)
                 return .sse(headers: headers, heartbeat: heartbeat, body: body)
             case .file(let root, let subpath, let contentType, var headers):
-                mergeResponseHeaders(extra, into: &headers)
+                headers.mergeResponse(extra)
                 return .file(root: root, subpath: subpath, contentType: contentType, headers: headers)
         }
     }

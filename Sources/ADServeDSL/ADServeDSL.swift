@@ -32,22 +32,53 @@ public protocol HandlerContext: Sendable {
     var storage: RequestStorage { get }
 }
 
+// FIX #10 (warm-up): `ctx.query` / `.cookies` / `.multipart()` re-parsed the query string / `Cookie`
+// header / multipart body on EVERY access. Each value is a pure function of the (immutable) request, so
+// the first access parses once and memoizes the result in the request-scoped `storage` (a reference type
+// shared across the middleware chain + handler — one instance per request); later accesses read it back.
+private enum QueryParametersCacheKey: StorageKey { typealias Value = QueryParameters }
+private enum RequestCookiesCacheKey: StorageKey { typealias Value = RequestCookies }
+private enum MultipartFormCacheKey: StorageKey { typealias Value = MultipartFormCache }
+
+/// Boxes the OPTIONAL multipart result so a `nil` (a non-multipart request) is memoized too — a bare
+/// `MultipartForm?` in storage could not tell "parsed to nil" apart from "not yet parsed".
+private struct MultipartFormCache: Sendable { let form: MultipartForm? }
+
 extension HandlerContext {
     /// Typed access to the percent-decoded query parameters (`?k=v&…`): `ctx.query.page`,
-    /// `ctx.query["page"]`, `ctx.query.int("page")`, `try ctx.query.require("page")`.
-    public var query: QueryParameters { QueryParameters(request.query) }
+    /// `ctx.query["page"]`, `ctx.query.int("page")`, `try ctx.query.require("page")`. Parsed once per
+    /// request, then memoized in `storage` (FIX #10).
+    public var query: QueryParameters {
+        if let cached = storage[QueryParametersCacheKey.self] { return cached }
+        let parsed = QueryParameters(request.query)
+        storage[QueryParametersCacheKey.self] = parsed
+        return parsed
+    }
     /// The cookies parsed from the request's `Cookie:` header: `ctx.cookies["session"]`. Set a response
-    /// cookie with `ResponseContent.settingCookie(_:)`.
-    public var cookies: RequestCookies { RequestCookies(request.headers[.cookie]) }
+    /// cookie with `ResponseContent.settingCookie(_:)`. Parsed once per request, then memoized (FIX #10).
+    public var cookies: RequestCookies {
+        if let cached = storage[RequestCookiesCacheKey.self] { return cached }
+        let parsed = RequestCookies(request.headers[.cookie])
+        storage[RequestCookiesCacheKey.self] = parsed
+        return parsed
+    }
     /// Parse the request body as `application/x-www-form-urlencoded`: `ctx.form()["email"]`.
     public func form() -> URLEncodedForm { URLEncodedForm(request.body) }
     /// Parse the request body as `multipart/form-data` (fields + file uploads); `nil` if the request is
-    /// not multipart or the boundary is absent: `ctx.multipart()?["avatar"]`.
+    /// not multipart or the boundary is absent: `ctx.multipart()?["avatar"]`. Parsed once per request,
+    /// then memoized — including a `nil` result (FIX #10).
     public func multipart() -> MultipartForm? {
-        guard let contentType = request.headers[.contentType],
+        if let cached = storage[MultipartFormCacheKey.self] { return cached.form }
+        let parsed: MultipartForm?
+        if let contentType = request.headers[.contentType],
             let boundary = MultipartParser.boundary(fromContentType: contentType)
-        else { return nil }
-        return MultipartParser.parse(request.body, boundary: boundary)
+        {
+            parsed = MultipartParser.parse(request.body, boundary: boundary)
+        } else {
+            parsed = nil
+        }
+        storage[MultipartFormCacheKey.self] = MultipartFormCache(form: parsed)
+        return parsed
     }
     /// The signed-cookie session — present only when the `Sessions` middleware wraps this route (else
     /// `nil`). Read/mutate it: `ctx.session?["userID"] = id`; rotate/expire via `ctx.session?.rotate()`.
@@ -139,6 +170,14 @@ public struct StorageContext: HandlerContext {
 
 // MARK: - Compiled route (engine-facing)
 
+/// The per-route acceptance oracle. Given the request `path` AND the routing trie's ALREADY-split
+/// path segments, it returns the captures-applied handler when the concrete path is truly accepted,
+/// else `nil`. The trie splits the path once during its descent and hands those exact segments here,
+/// so a template `bind` decodes its captures WITHOUT re-splitting the path (FIX #7); exact/opaque
+/// binds ignore the segments and match on `path` directly.
+typealias RouteBinder = @Sendable (_ path: Substring, _ segments: [Substring]) -> (
+    @Sendable (HandlerInput) throws -> ResponseContent)?
+
 /// A fully-built route. `bind` returns a captures-applied handler when the path
 /// matches, else nil; `exactPath` (when non-nil) lets the table index it O(1).
 public struct CompiledRoute: Sendable {
@@ -162,7 +201,7 @@ public struct CompiledRoute: Sendable {
     let webSocketTopic: String?
     /// An async streaming-body handler for a `Stream` route (the engine feeds the body in), else `nil`.
     let streamingRun: StreamingRequestHandler?
-    let bind: @Sendable (Substring) -> (@Sendable (HandlerInput) throws -> ResponseContent)?
+    let bind: RouteBinder
 
     init(
         method: HTTPMethod, needsStorage: Bool, cache: CachePolicy, exactPath: String?,
@@ -171,7 +210,7 @@ public struct CompiledRoute: Sendable {
         webSocketHandler: (any WebSocketHandler)? = nil,
         webSocketHub: WebSocketHub? = nil, webSocketTopic: String? = nil,
         streamingRun: StreamingRequestHandler? = nil,
-        bind: @escaping @Sendable (Substring) -> (@Sendable (HandlerInput) throws -> ResponseContent)?
+        bind: @escaping RouteBinder
     ) {
         self.method = method
         self.needsStorage = needsStorage
@@ -254,7 +293,7 @@ private struct RoutePayload: Sendable {
     let webSocketHub: WebSocketHub?
     let webSocketTopic: String?
     let streamingRun: StreamingRequestHandler?
-    let bind: @Sendable (Substring) -> (@Sendable (HandlerInput) throws -> ResponseContent)?
+    let bind: RouteBinder
 
     init(_ route: CompiledRoute) {
         needsStorage = route.needsStorage
@@ -350,13 +389,14 @@ public struct RouteTable: HTTPHandling {
         }
 
         // Serve `method` from a terminal's route map via its authoritative `bind`; otherwise record the
-        // terminal's other bind-accepting methods for a possible 405.
+        // terminal's other bind-accepting methods for a possible 405. `parts` (the trie's own split of
+        // the path) is threaded into `bind` so a template decodes its captures without re-splitting (#7).
         func accept(_ map: [HTTPMethod: RoutePayload]) -> MatchedRoute? {
-            if let payload = map[method], let run = payload.bind(path) {
+            if let payload = map[method], let run = payload.bind(path, parts) {
                 return payload.matched(run)
             }
             for (candidate, payload) in map where candidate != method {
-                if payload.bind(path) != nil { remember(candidate) }
+                if payload.bind(path, parts) != nil { remember(candidate) }
             }
             return nil
         }
@@ -399,7 +439,7 @@ public struct RouteTable: HTTPHandling {
 
         // Trie miss: try opaque matchers in declaration order (structured routes always win over these).
         for route in opaque {
-            guard let run = route.bind(path) else { continue }
+            guard let run = route.bind(path, parts) else { continue }
             if route.method == method {
                 return .matched(
                     MatchedRoute(

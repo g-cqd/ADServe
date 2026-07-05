@@ -189,9 +189,9 @@ extension EngineResponder {
         // ETag computed once from the original entity; on a match, blank the body → 304
         // but keep the ETag header (RFC 7232).
         if cache.etag {
-            let etag = "\"\(sha256HexLower(materialized.body).prefix(16))\""
+            let etag = "\"\(ConditionalRequest.sha256HexLower(materialized.body).prefix(16))\""
             headers.setValue(etag, for: .etag)
-            if let inm = environment.ifNoneMatch, matchesIfNoneMatch(inm, etag) {
+            if let inm = environment.ifNoneMatch, ConditionalRequest.matchesIfNoneMatch(inm, etag) {
                 materialized.status = .notModified
                 materialized.body = []
                 emitEntity = false
@@ -201,7 +201,7 @@ extension EngineResponder {
             headers.setValue(materialized.contentType, for: .contentType)
         }
         // Route-supplied headers override the envelope (CORS / the MCP `/mcp` set); `set-cookie` appends.
-        mergeResponseHeaders(materialized.headers, into: &headers)
+        headers.mergeResponse(materialized.headers)
         if emitEntity {
             compressIfEligible(&materialized.body, headers: &headers, environment: environment)
         }
@@ -248,7 +248,7 @@ extension EngineResponder {
     ) -> ServerResponse {
         var headers = commonHeaders(cache: cache, environment: environment)
         headers.setValue(contentType, for: .contentType)
-        mergeResponseHeaders(extra, into: &headers)
+        headers.mergeResponse(extra)
         let head = HTTPResponse(status: status, headerFields: headers)
         return ServerResponse(
             head,
@@ -270,7 +270,7 @@ extension EngineResponder {
         let slot = SSESlot(limiter: configuration.sseLimiter)
         var headers = commonHeaders(cache: .noStore, environment: environment)
         headers.setValue("text/event-stream", for: .contentType)
-        mergeResponseHeaders(extra, into: &headers)
+        headers.mergeResponse(extra)
         let head = HTTPResponse(status: .ok, headerFields: headers)
         if environment.isHead {
             slot.release()
@@ -322,12 +322,14 @@ extension EngineResponder {
     /// set + Link + Vary), the echoed/minted request-id, and — h1 only (h2/h3 forbid it) — the
     /// keep-alive/close connection header.
     func commonHeaders(cache: CachePolicy, environment: ResponseEnvironment) -> HTTPFields {
-        var headers = HTTPFields()
+        // Start from the pre-built constant envelope (a CoW copy, sized exactly once) and set only the
+        // per-request fields, instead of re-appending the whole envelope field-by-field into a store that
+        // grows from empty — several reallocations per response on the hottest response-side path.
+        var headers = configuration.envelope
         if let cacheControl = cache.cacheControl {
             headers.setValue(cacheControl, for: .cacheControl)
         }
-        for field in configuration.envelope { headers.append(field) }
-        headers.setValue(environment.requestID, for: requestIDName)
+        headers.setValue(environment.requestID, for: RequestID.name)
         if !environment.isHTTP2 {
             headers.setValue(environment.keepAlive ? "keep-alive" : "close", for: .connection)
         }

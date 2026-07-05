@@ -11,37 +11,41 @@ public import Logging
 
 // MARK: - JSONValue helpers (minimal, ADJSON-agnostic)
 
-public func jsonObject(_ value: JSONValue?) -> OrderedDictionary<String, JSONValue>? {
-    if case .object(let object)? = value { return object }
-    return nil
+/// Typed accessors over an optional ``JSONValue`` for MCP request parsing — a caseless-enum namespace.
+/// Named `MCPJSON` (not `JSON`) to avoid colliding with ADJSON's `JSON` cursor type this module imports.
+public enum MCPJSON {
+    public static func object(_ value: JSONValue?) -> OrderedDictionary<String, JSONValue>? {
+        if case .object(let object)? = value { return object }
+        return nil
+    }
+    public static func string(_ value: JSONValue?) -> String? {
+        if case .string(let string)? = value { return string }
+        return nil
+    }
+    public static func array(_ value: JSONValue?) -> [JSONValue]? {
+        if case .array(let array)? = value { return array }
+        return nil
+    }
+    public static func number(_ value: JSONValue?) -> Double? {
+        if case .number(let number)? = value { return number }
+        return nil
+    }
+    public static func bool(_ value: JSONValue?) -> Bool? {
+        if case .bool(let bool)? = value { return bool }
+        return nil
+    }
+    /// A JSON number read as an Int (the MCP args send integers as JSON numbers). NaN/infinite → nil;
+    /// out-of-range magnitudes clamp to `Int.min`/`Int.max` instead of trapping on the `Int(Double)`
+    /// conversion.
+    public static func int(_ value: JSONValue?) -> Int? {
+        guard let n = number(value), n.isFinite else { return nil }
+        if n >= Double(Int.max) { return Int.max }
+        if n <= Double(Int.min) { return Int.min }
+        return Int(n)
+    }
+    /// `object[key]` for a `.object` value.
+    public static func member(_ value: JSONValue?, _ key: String) -> JSONValue? { object(value)?[key] }
 }
-public func jsonString(_ value: JSONValue?) -> String? {
-    if case .string(let string)? = value { return string }
-    return nil
-}
-public func jsonArray(_ value: JSONValue?) -> [JSONValue]? {
-    if case .array(let array)? = value { return array }
-    return nil
-}
-public func jsonNumber(_ value: JSONValue?) -> Double? {
-    if case .number(let number)? = value { return number }
-    return nil
-}
-public func jsonBool(_ value: JSONValue?) -> Bool? {
-    if case .bool(let bool)? = value { return bool }
-    return nil
-}
-/// A JSON number read as an Int (the MCP args send integers as JSON numbers).
-/// NaN/infinite → nil; out-of-range magnitudes clamp to `Int.min`/`Int.max`
-/// instead of trapping on the `Int(Double)` conversion.
-public func jsonInt(_ value: JSONValue?) -> Int? {
-    guard let number = jsonNumber(value), number.isFinite else { return nil }
-    if number >= Double(Int.max) { return Int.max }
-    if number <= Double(Int.min) { return Int.min }
-    return Int(number)
-}
-/// `object[key]` for a `.object` value.
-public func jsonMember(_ value: JSONValue?, _ key: String) -> JSONValue? { jsonObject(value)?[key] }
 
 // MARK: - Server identity + tool contract
 
@@ -171,11 +175,11 @@ public struct MCPDispatcher: Sendable {
     public func handle(line: String, context: MCPToolContext) -> [UInt8]? {
         let trimmed = line.hasSuffix("\r") ? String(line.dropLast()) : line
         if trimmed.isEmpty { return nil }
-        guard let request = try? JSONValue(parsing: trimmed), let object = jsonObject(request) else {
+        guard let request = try? JSONValue(parsing: trimmed), let object = MCPJSON.object(request) else {
             return encodeLine(rpcError(.null, code: -32700, message: "Parse error"))
         }
         let id = object["id"]
-        guard let method = jsonString(object["method"]) else { return nil }
+        guard let method = MCPJSON.string(object["method"]) else { return nil }
         let params = object["params"] ?? .object([:])
 
         switch method {
@@ -192,7 +196,7 @@ public struct MCPDispatcher: Sendable {
             case "resources/list":
                 return respond(id, resourcesListResult(context: context))
             case "resources/read":
-                guard let uri = jsonString(jsonMember(params, "uri")) else {
+                guard let uri = MCPJSON.string(MCPJSON.member(params, "uri")) else {
                     guard let id else { return nil }
                     return encodeLine(rpcError(id, code: -32602, message: "Missing resource uri"))
                 }
@@ -212,7 +216,7 @@ public struct MCPDispatcher: Sendable {
     // MARK: result builders
 
     private func initializeResult(_ params: JSONValue) -> JSONValue {
-        let requested = jsonString(jsonMember(params, "protocolVersion"))
+        let requested = MCPJSON.string(MCPJSON.member(params, "protocolVersion"))
         let version: String =
             if let requested, Self.supportedVersions.contains(requested) { requested } else { "2025-11-25" }
         var result: OrderedDictionary<String, JSONValue> = [
@@ -265,10 +269,10 @@ public struct MCPDispatcher: Sendable {
     }
 
     private func toolsCallResult(_ params: JSONValue, context: MCPToolContext) -> JSONValue {
-        guard let name = jsonString(jsonMember(params, "name")) else {
+        guard let name = MCPJSON.string(MCPJSON.member(params, "name")) else {
             return errorContent("Missing tool name")
         }
-        let arguments = jsonMember(params, "arguments") ?? .object([:])
+        let arguments = MCPJSON.member(params, "arguments") ?? .object([:])
         switch tools.invoke(name: name, arguments: arguments, context: context) {
             case .ok(let bytes):
                 let text = String(decoding: bytes, as: UTF8.self)

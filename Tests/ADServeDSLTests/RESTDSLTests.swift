@@ -83,10 +83,10 @@ struct PathTemplateTests {
 
     @Test
     func `pathHasTraversal flags literal dot-segments`() {
-        #expect(pathHasTraversal("/a/../b"[...]))
-        #expect(pathHasTraversal("/a/./b"[...]))
-        #expect(!pathHasTraversal("/a/b/c"[...]))
-        #expect(!pathHasTraversal("/items/42"[...]))
+        #expect(PathSafety.hasTraversal("/a/../b"[...]))
+        #expect(PathSafety.hasTraversal("/a/./b"[...]))
+        #expect(!PathSafety.hasTraversal("/a/b/c"[...]))
+        #expect(!PathSafety.hasTraversal("/items/42"[...]))
     }
 }
 
@@ -252,7 +252,7 @@ struct MiddlewareTests {
             await log.append("handler")
             return .plain(.ok, "ok")
         }
-        let chain = composeMiddleware(
+        let chain = MiddlewarePipeline.compose(
             [Recorder(tag: "A", log: log), Recorder(tag: "B", log: log)], context: mwContext,
             terminal: terminal)
         _ = await chain(request)
@@ -266,7 +266,7 @@ struct MiddlewareTests {
             await log.append("handler")
             return .plain(.ok, "ok")
         }
-        let chain = composeMiddleware([Gate()], context: mwContext, terminal: terminal)
+        let chain = MiddlewarePipeline.compose([Gate()], context: mwContext, terminal: terminal)
         let response = await chain(request)
         #expect(await log.entries.isEmpty)
         if case .plain(let status, _) = response {
@@ -282,12 +282,12 @@ struct ObservabilityTests {
 
     @Test
     func `statusCode(of:) extracts the numeric status of every response shape`() {
-        #expect(statusCode(of: .plain(.ok, "x")) == 200)
-        #expect(statusCode(of: .notFound) == 404)
-        #expect(statusCode(of: .raw(body: [], contentType: "x", status: .created)) == 201)
+        #expect(ResponseContent.plain(.ok, "x").statusCode == 200)
+        #expect(ResponseContent.notFound.statusCode == 404)
+        #expect(ResponseContent.raw(body: [], contentType: "x", status: .created).statusCode == 201)
         #expect(
-            statusCode(of: .full(body: [], contentType: "x", status: .noContent, headers: HTTPFields()))
-                == 204)
+            ResponseContent.full(body: [], contentType: "x", status: .noContent, headers: HTTPFields())
+                .statusCode == 204)
     }
 
     @Test
@@ -296,7 +296,7 @@ struct ObservabilityTests {
         let ctx = MiddlewareContext(requestID: "rid-1", logger: Logger(label: "test"))
         // threshold 0 exercises the slow-request `.warning` branch; threshold high exercises `.info`.
         for middleware in [RequestLogging(slowThresholdMillis: 0), RequestLogging(slowThresholdMillis: 1e9)] {
-            let chain = composeMiddleware([middleware], context: ctx, terminal: terminal)
+            let chain = MiddlewarePipeline.compose([middleware], context: ctx, terminal: terminal)
             guard case .plain(let status, let body) = await chain(request) else {
                 Issue.record("response not passed through")
                 return
@@ -374,7 +374,7 @@ struct MiddlewareBuiltinsTests {
 
     @Test
     func `CORS owns the preflight (204 + Allow set) and never calls the handler`() async {
-        let chain = composeMiddleware(
+        let chain = MiddlewarePipeline.compose(
             [CORS(allowOrigin: "https://x.com", allowMethods: [.get, .post])], context: ctx,
             terminal: { _ in .plain(.ok, "handler ran") })
         var headers = HTTPFields()
@@ -391,7 +391,7 @@ struct MiddlewareBuiltinsTests {
 
     @Test
     func `CORS decorates an actual request's response with Allow-Origin`() async {
-        let chain = composeMiddleware(
+        let chain = MiddlewarePipeline.compose(
             [CORS(allowOrigin: "https://x.com")], context: ctx, terminal: { _ in .plain(.ok, "ok") })
         let response = await chain(ServerRequest(method: .get, target: "/x", headers: HTTPFields()))
         guard case .full(_, _, let status, let h) = response else {
@@ -404,7 +404,7 @@ struct MiddlewareBuiltinsTests {
 
     @Test
     func `SecurityHeaders decorates the response`() async {
-        let chain = composeMiddleware([SecurityHeaders()], context: ctx, terminal: { _ in .plain(.ok, "ok") })
+        let chain = MiddlewarePipeline.compose([SecurityHeaders()], context: ctx, terminal: { _ in .plain(.ok, "ok") })
         let response = await chain(ServerRequest(method: .get, target: "/", headers: HTTPFields()))
         if case .full(_, _, _, let h) = response {
             #expect(h[fieldName("x-content-type-options")] == "nosniff")
@@ -418,7 +418,7 @@ struct MiddlewareBuiltinsTests {
     func `request storage is shared middleware → handler`() async {
         let storage = RequestStorage()
         let context = MiddlewareContext(requestID: "r", logger: Logger(label: "t"), storage: storage)
-        let chain = composeMiddleware([SetUser()], context: context, terminal: { _ in .plain(.ok, "ok") })
+        let chain = MiddlewarePipeline.compose([SetUser()], context: context, terminal: { _ in .plain(.ok, "ok") })
         _ = await chain(ServerRequest(method: .get, target: "/", headers: HTTPFields()))
         #expect(storage[CurrentUser.self] == "alice")
     }

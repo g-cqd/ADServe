@@ -129,13 +129,13 @@ extension EngineResponder {
                 var headers = staticHeaders(cache: cache, environment: environment)
                 headers.setValue(etag, for: .etag)
                 headers.setValue(lastModified, for: .lastModified)
-                mergeResponseHeaders(file.headers, into: &headers)
+                headers.mergeResponse(file.headers)
                 return ServerResponse(HTTPResponse(status: .notModified, headerFields: headers))
 
             case .rangeNotSatisfiable(let totalSize):
                 var headers = staticHeaders(cache: cache, environment: environment)
                 headers.setValue("bytes */\(totalSize)", for: .contentRange)
-                mergeResponseHeaders(file.headers, into: &headers)
+                headers.mergeResponse(file.headers)
                 return ServerResponse(
                     HTTPResponse(status: .rangeNotSatisfiable, headerFields: headers))
 
@@ -176,7 +176,7 @@ extension EngineResponder {
                 "bytes \(range.lowerBound)-\(range.upperBound)/\(serve.totalSize)",
                 for: .contentRange)
         }
-        mergeResponseHeaders(file.headers, into: &headers)
+        headers.mergeResponse(file.headers)
         let status: HTTPStatus = serve.partial ? .partialContent : .ok
         let head = HTTPResponse(status: status, headerFields: headers)
         if environment.isHead || length == 0 {
@@ -298,7 +298,7 @@ extension HTTPServer {
         // Conditional GET: `If-None-Match` (the strong validator) takes precedence; only when it is absent
         // do we consult `If-Modified-Since` (whole-second mtime comparison). Either hit → 304.
         if let ifNoneMatch = headers[.ifNoneMatch] {
-            if matchesIfNoneMatch(ifNoneMatch, etag) {
+            if ConditionalRequest.matchesIfNoneMatch(ifNoneMatch, etag) {
                 return .notModified(etag: etag, lastModified: lastModified)
             }
         } else if let ifModifiedSince = headers[.ifModifiedSince].flatMap(HTTPDate.parse), mtime <= ifModifiedSince {

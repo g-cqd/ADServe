@@ -23,7 +23,7 @@ struct OpenAPITests {
                 GET("health", pool: .none) { _ in .plain(.ok, "ok") }  // undocumented, still in the doc
             }
         }
-        return openAPIDocument(info: OpenAPIInfo(title: "Items API", version: "1.0.0"), from: api)
+        return OpenAPI.document(info: OpenAPIInfo(title: "Items API", version: "1.0.0"), from: api)
     }
 
     @Test

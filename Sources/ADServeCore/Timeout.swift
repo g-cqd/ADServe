@@ -1,13 +1,13 @@
 // Request-timeout middleware: races the handler chain against a wall-clock deadline and answers `504
 // Gateway Timeout` if the deadline wins. Distinct from the engine's idle timeout (which reaps a stalled
-// CONNECTION): this bounds the time spent producing ONE response. The deadline is enforced promptly — the
-// 504 is returned the instant it fires, abandoning the slow handler (it runs to completion unobserved;
-// Swift cancellation is cooperative, so a handler that never suspends can't be force-stopped, but its
-// late result is discarded). The losing task is also `cancel()`ed so a cancellation-aware handler unwinds.
+// CONNECTION): this bounds the time spent producing ONE response. The handler and the deadline run as
+// STRUCTURED child tasks (a task group), so they belong to the request's task tree: a client disconnect
+// cancels this request and thus the handler too (no detached-task leak), and on timeout the loser is
+// `cancelAll()`ed so a cancellation-aware handler unwinds. Swift cancellation is cooperative, so a
+// handler that never suspends can't be force-stopped — its late result is simply discarded.
 
 import Foundation
 import HTTPCore
-import Synchronization
 
 /// Answers `504 Gateway Timeout` when a request takes longer than `seconds` to produce a response.
 /// Place it INSIDE any response-shaping middleware you want to run on the 504 (e.g. logging) and OUTSIDE
@@ -24,28 +24,20 @@ public struct Timeout: HTTPMiddleware {
     ) async -> ResponseContent {
         let deadline = seconds
         let requestID = context.requestID
-        return await withCheckedContinuation { (continuation: CheckedContinuation<ResponseContent, Never>) in
-            // One-shot: whichever of the handler / deadline finishes first resumes the continuation; the
-            // loser's `claim()` is a no-op (so the continuation resumes exactly once).
-            let claimed = Mutex(false)
-            @Sendable func claim() -> Bool {
-                claimed.withLock { taken in
-                    if taken { return false }
-                    taken = true
-                    return true
-                }
-            }
-            let handlerTask = Task {
-                let response = await next(request)
-                if claim() { continuation.resume(returning: response) }
-            }
-            Task {
+        // Structured race: the handler and the deadline are CHILD tasks of this request's task tree (not
+        // detached `Task {}`s). So a client disconnect that cancels this request now propagates into the
+        // handler child, which unwinds — where the old unstructured version LEAKED the handler (it ran to
+        // completion holding a pooled connection / CPU for a gone client). Whichever child finishes first
+        // wins; `cancelAll()` cancels the loser so a cancellation-aware handler unwinds promptly.
+        return await withTaskGroup(of: ResponseContent?.self) { group in
+            group.addTask { await next(request) }
+            group.addTask {
                 try? await Task.sleep(for: .seconds(deadline))
-                if claim() {
-                    handlerTask.cancel()  // cooperative: let a cancellation-aware handler unwind
-                    continuation.resume(returning: Self.timeoutResponse(requestID))
-                }
+                return Task.isCancelled ? nil : Self.timeoutResponse(requestID)
             }
+            let winner = await group.next() ?? nil  // first child to finish (handler response or the 504)
+            group.cancelAll()
+            return winner ?? Self.timeoutResponse(requestID)
         }
     }
 

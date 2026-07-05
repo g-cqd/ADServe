@@ -219,7 +219,7 @@ public struct ServerRequest: Sendable {
 
     /// The percent-decoded query parameters (`?k=v&…`; last value wins; bare `?k` → `""`). Empty if
     /// the target has no `?`. Recomputed per access — bind it once in a handler if used repeatedly.
-    public var query: [String: String] { parseQueryString(target) }
+    public var query: [String: String] { QueryString.parse(target) }
 
     /// A single percent-decoded query parameter by name, or `nil` if absent.
     public func query(_ key: String) -> String? { query[key] }
@@ -503,19 +503,22 @@ public protocol HTTPMiddleware: Sendable {
     ) async -> ResponseContent
 }
 
-/// Compose `middleware` into a single async handler around `terminal` — the onion model, with
-/// `middleware[0]` outermost. The engine uses this for `[server-wide] + [route]` middleware; it is
-/// public so a consumer can build a custom pipeline too.
-public func composeMiddleware(
-    _ middleware: [any HTTPMiddleware], context: MiddlewareContext,
-    terminal: @escaping @Sendable (ServerRequest) async -> ResponseContent
-) -> @Sendable (ServerRequest) async -> ResponseContent {
-    var chain = terminal
-    for layer in middleware.reversed() {
-        let next = chain
-        chain = { request in await layer.intercept(request, context, next: next) }
+/// Middleware composition — a caseless-enum namespace.
+public enum MiddlewarePipeline {
+    /// Compose `middleware` into a single async handler around `terminal` — the onion model, with
+    /// `middleware[0]` outermost. The engine uses this for `[server-wide] + [route]` middleware; it is
+    /// public so a consumer can build a custom pipeline too.
+    public static func compose(
+        _ middleware: [any HTTPMiddleware], context: MiddlewareContext,
+        terminal: @escaping @Sendable (ServerRequest) async -> ResponseContent
+    ) -> @Sendable (ServerRequest) async -> ResponseContent {
+        var chain = terminal
+        for layer in middleware.reversed() {
+            let next = chain
+            chain = { request in await layer.intercept(request, context, next: next) }
+        }
+        return chain
     }
-    return chain
 }
 
 // MARK: - Built-in observability middleware
@@ -547,34 +550,36 @@ public struct RequestLogging: HTTPMiddleware {
             level: isSlow ? .warning : level, "request",
             metadata: [
                 "method": "\(request.method.rawValue)", "path": "\(request.path)",
-                "status": "\(resolvedStatusCode(of: response, storage: context.storage))",
+                "status": "\(response.resolvedStatusCode(storage: context.storage))",
                 "duration_ms": .stringConvertible(elapsedMillis), "request_id": "\(context.requestID)"
             ])
         return response
     }
 }
 
-/// The numeric status of a response (for logging/metrics).
-public func statusCode(of content: ResponseContent) -> Int {
-    switch content {
-        case .raw(_, _, let status), .full(_, _, let status, _): return Int(status.code)
-        case .plain(let status, _): return Int(status.code)
-        case .stream(_, let status, _, _): return Int(status.code)
-        case .sse: return 200  // SSE is always 200 text/event-stream
-        // The nominal status; the engine resolves the real 200/304/404 off-loop in `writeFile`.
-        case .file: return 200
-        case .notFound: return 404
+extension ResponseContent {
+    /// The numeric status of this response (for logging/metrics).
+    public var statusCode: Int {
+        switch self {
+            case .raw(_, _, let status), .full(_, _, let status, _): return Int(status.code)
+            case .plain(let status, _): return Int(status.code)
+            case .stream(_, let status, _, _): return Int(status.code)
+            case .sse: return 200  // SSE is always 200 text/event-stream
+            // The nominal status; the engine resolves the real 200/304/404 off-loop in `writeFile`.
+            case .file: return 200
+            case .notFound: return 404
+        }
     }
-}
 
-/// The status to REPORT for `content`: the engine-recorded real status when present (e.g. a `.file`'s
-/// resolved 200/206/304/404/416, known only after off-loop resolution), else the nominal
-/// `statusCode(of:)`. A response-observing middleware (`RequestLogging`, `MetricsMiddleware`) calls this
-/// with `context.storage` so its access log / metric carries the status actually written, not the
-/// pre-resolution placeholder. The engine seeds the `ResponseStatusBox` and records into it from the
-/// route terminal, before the middleware chain unwinds.
-public func resolvedStatusCode(of content: ResponseContent, storage: RequestStorage) -> Int {
-    storage[ResponseStatusKey.self]?.code ?? statusCode(of: content)
+    /// The status to REPORT for this response: the engine-recorded real status when present (e.g. a
+    /// `.file`'s resolved 200/206/304/404/416, known only after off-loop resolution), else the nominal
+    /// `statusCode`. A response-observing middleware (`RequestLogging`, `MetricsMiddleware`) calls this
+    /// with `context.storage` so its access log / metric carries the status actually written, not the
+    /// pre-resolution placeholder. The engine seeds the `ResponseStatusBox` and records into it from the
+    /// route terminal, before the middleware chain unwinds.
+    public func resolvedStatusCode(storage: RequestStorage) -> Int {
+        storage[ResponseStatusKey.self]?.code ?? statusCode
+    }
 }
 
 // MARK: - Routing contract (the engine ⇄ DSL seam)
@@ -661,6 +666,15 @@ public enum RouteMatch: Sendable {
 /// The route table the engine dispatches against. The DSL's `RouteTable` conforms.
 public protocol HTTPHandling: Sendable {
     func match(method: HTTPMethod, path: Substring) -> RouteMatch
+    /// The ONE combined trie descent (FIX #1): a single match returning the full `RouteMatch` for
+    /// `method`+`path` — the matched route carrying EVERYTHING the engine needs for the request
+    /// (`streamingRun`, `maxBodyBytes`, `run`, cache, middleware, WebSocket handler…), or 405 / 404.
+    /// The engine's `respond` and its head-time `resolve` each call this EXACTLY ONCE, collapsing the
+    /// former per-call-site fan-out — `streamingHandler` + `bodyLimit` + `match`, each of which
+    /// re-descended the trie (re-splitting the path, rebuilding captures, percent-decoding): ~4
+    /// descents/request → 2. Default: forwards to ``match(method:path:)``, so a conformer that already
+    /// implements `match` gets the single descent for free (and a decorator can count it).
+    func matchRoute(method: HTTPMethod, path: Substring) -> RouteMatch
     /// The matched route's per-route body ceiling (`.maxBody`), or `nil` for the server default. The
     /// engine peeks this at the request head — *before* draining the body — so an upload route can
     /// raise its limit ABOVE the server default. Default `nil` (the server-wide cap applies).
@@ -671,127 +685,140 @@ public protocol HTTPHandling: Sendable {
 }
 
 extension HTTPHandling {
+    public func matchRoute(method: HTTPMethod, path: Substring) -> RouteMatch {
+        match(method: method, path: path)
+    }
     public func bodyLimit(method: HTTPMethod, path: Substring) -> Int? { nil }
     public var hasWebSocketRoutes: Bool { false }
 }
 
 // MARK: - Hashing / conditional / request-id (engine-generic HTTP)
 
-/// Lowercase-hex SHA-256 (matches JS `Bun.CryptoHasher('sha256').digest('hex')`).
-/// The `hashable`→ETag path and the app's `/data/search/*.<hash>.json` filenames both
-/// use it, so it lives here once.
-public func sha256HexLower(_ bytes: [UInt8]) -> String {
-    var hasher = SHA256()
-    hasher.update(data: bytes)  // safe DataProtocol overload (no unsafe buffer pointer)
-    let hex: [UInt8] = Array("0123456789abcdef".utf8)
-    var out: [UInt8] = []
-    out.reserveCapacity(64)
-    for b in hasher.finalize() {
-        out.append(hex[Int(b >> 4)])
-        out.append(hex[Int(b & 0xF)])
-    }
-    return String(decoding: out, as: UTF8.self)
-}
-
-/// Loose RFC 7232 `If-None-Match`: `*`, a single tag, or a comma list;
-/// the strong/weak prefix is compared verbatim.
-public func matchesIfNoneMatch(_ headerValue: String, _ etag: String) -> Bool {
-    let value = trimOWS(headerValue[...])
-    if value == "*" { return true }
-    for part in value.split(separator: ",") where trimOWS(part) == etag[...] { return true }
-    return false
-}
-
-private func trimOWS(_ s: Substring) -> Substring {
-    var sub = s
-    while let f = sub.first, f == " " || f == "\t" { sub = sub.dropFirst() }
-    while let l = sub.last, l == " " || l == "\t" { sub = sub.dropLast() }
-    return sub
-}
-
-/// Echo a valid inbound `X-Request-Id` (`/^[A-Za-z0-9._:+/=-]{1,128}$/`), else
-/// mint a lowercase v4 UUID.
-public func resolveRequestID(_ headers: HTTPFields) -> String {
-    if let incoming = headers[requestIDName], isValidRequestID(incoming) { return incoming }
-    return UUID().uuidString.lowercased()
-}
-
-/// `x-request-id` — lowercase token name, defined once (HTTPCore's registered constant).
-public let requestIDName: HTTPFieldName = .xRequestID
-
-private func isValidRequestID(_ s: String) -> Bool {
-    let utf8 = s.utf8
-    guard (1 ... 128).contains(utf8.count) else { return false }
-    for b in utf8 {
-        switch b {
-            case UInt8(ascii: "A") ... UInt8(ascii: "Z"), UInt8(ascii: "a") ... UInt8(ascii: "z"),
-                UInt8(ascii: "0") ... UInt8(ascii: "9"):
-                continue
-            case UInt8(ascii: "."), UInt8(ascii: "_"), UInt8(ascii: ":"), UInt8(ascii: "+"),
-                UInt8(ascii: "/"), UInt8(ascii: "="), UInt8(ascii: "-"):
-                continue
-            default:
-                return false
+/// RFC 7232 conditional-request helpers (`If-None-Match`) plus the ETag hash — a caseless-enum namespace.
+public enum ConditionalRequest {
+    /// Lowercase-hex SHA-256 (matches JS `Bun.CryptoHasher('sha256').digest('hex')`). The `hashable`→ETag
+    /// path and the app's `/data/search/*.<hash>.json` filenames both use it, so it lives here once.
+    public static func sha256HexLower(_ bytes: [UInt8]) -> String {
+        var hasher = SHA256()
+        hasher.update(data: bytes)  // safe DataProtocol overload (no unsafe buffer pointer)
+        let hex: [UInt8] = Array("0123456789abcdef".utf8)
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for b in hasher.finalize() {
+            out.append(hex[Int(b >> 4)])
+            out.append(hex[Int(b & 0xF)])
         }
+        return String(decoding: out, as: UTF8.self)
     }
-    return true
+
+    /// Loose RFC 7232 `If-None-Match`: `*`, a single tag, or a comma list; the strong/weak prefix is
+    /// compared verbatim.
+    public static func matchesIfNoneMatch(_ headerValue: String, _ etag: String) -> Bool {
+        let value = trimOWS(headerValue[...])
+        if value == "*" { return true }
+        for part in value.split(separator: ",") where trimOWS(part) == etag[...] { return true }
+        return false
+    }
+
+    private static func trimOWS(_ s: Substring) -> Substring {
+        var sub = s
+        while let f = sub.first, f == " " || f == "\t" { sub = sub.dropFirst() }
+        while let l = sub.last, l == " " || l == "\t" { sub = sub.dropLast() }
+        return sub
+    }
+}
+
+/// Request-ID echo/mint (`X-Request-Id`) — a caseless-enum namespace.
+public enum RequestID {
+    /// `x-request-id` — lowercase token name, defined once (HTTPCore's registered constant).
+    public static let name: HTTPFieldName = .xRequestID
+
+    /// Echo a valid inbound `X-Request-Id` (`/^[A-Za-z0-9._:+/=-]{1,128}$/`), else mint a lowercase v4 UUID.
+    public static func resolve(_ headers: HTTPFields) -> String {
+        if let incoming = headers[name], isValid(incoming) { return incoming }
+        return UUID().uuidString.lowercased()
+    }
+
+    private static func isValid(_ s: String) -> Bool {
+        let utf8 = s.utf8
+        guard (1 ... 128).contains(utf8.count) else { return false }
+        for b in utf8 {
+            switch b {
+                case UInt8(ascii: "A") ... UInt8(ascii: "Z"), UInt8(ascii: "a") ... UInt8(ascii: "z"),
+                    UInt8(ascii: "0") ... UInt8(ascii: "9"):
+                    continue
+                case UInt8(ascii: "."), UInt8(ascii: "_"), UInt8(ascii: ":"), UInt8(ascii: "+"),
+                    UInt8(ascii: "/"), UInt8(ascii: "="), UInt8(ascii: "-"):
+                    continue
+                default:
+                    return false
+            }
+        }
+        return true
+    }
 }
 
 // MARK: - Query string parsing
 
-/// Parse `target`'s `?k=v&k2=v2` into a percent-decoded map (last value wins; bare `?k` → `""`).
-func parseQueryString(_ target: String) -> [String: String] {
-    guard let mark = target.firstIndex(of: "?") else { return [:] }
-    var out: [String: String] = [:]
-    for pair in target[target.index(after: mark)...].split(separator: "&") {
-        let kv = pair.split(separator: "=", maxSplits: 1)
-        guard let key = kv.first else { continue }
-        out[percentDecodeToken(String(key))] = kv.count > 1 ? percentDecodeToken(String(kv[1])) : ""
+/// Query-string parsing + percent-decoding — a caseless-enum namespace.
+enum QueryString {
+    /// Parse `target`'s `?k=v&k2=v2` into a percent-decoded map (last value wins; bare `?k` → `""`).
+    static func parse(_ target: String) -> [String: String] {
+        guard let mark = target.firstIndex(of: "?") else { return [:] }
+        var out: [String: String] = [:]
+        for pair in target[target.index(after: mark)...].split(separator: "&") {
+            let kv = pair.split(separator: "=", maxSplits: 1)
+            guard let key = kv.first else { continue }
+            out[decodeToken(String(key))] = kv.count > 1 ? decodeToken(String(kv[1])) : ""
+        }
+        return out
     }
-    return out
-}
 
-/// Percent-decode (`%XX`, `+` → space) a query token. Hand-rolled (no Foundation), like the other
-/// engine byte helpers.
-func percentDecodeToken(_ s: String) -> String {
-    let chars = Array(s.utf8)
-    var bytes: [UInt8] = []
-    bytes.reserveCapacity(chars.count)
-    var i = 0
-    while i < chars.count {
-        let c = chars[i]
-        if c == UInt8(ascii: "+") {
-            bytes.append(UInt8(ascii: " "))
-            i += 1
-        } else if c == UInt8(ascii: "%"), i + 2 < chars.count,
-            let hi = hexNibble(chars[i + 1]), let lo = hexNibble(chars[i + 2])
-        {
-            bytes.append(hi << 4 | lo)
-            i += 3
-        } else {
-            bytes.append(c)
-            i += 1
+    /// Percent-decode (`%XX`, `+` → space) a query token. Hand-rolled (no Foundation), like the other
+    /// engine byte helpers.
+    static func decodeToken(_ s: String) -> String {
+        let chars = Array(s.utf8)
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(chars.count)
+        var i = 0
+        while i < chars.count {
+            let c = chars[i]
+            if c == UInt8(ascii: "+") {
+                bytes.append(UInt8(ascii: " "))
+                i += 1
+            } else if c == UInt8(ascii: "%"), i + 2 < chars.count,
+                let hi = hexNibble(chars[i + 1]), let lo = hexNibble(chars[i + 2])
+            {
+                bytes.append(hi << 4 | lo)
+                i += 3
+            } else {
+                bytes.append(c)
+                i += 1
+            }
+        }
+        return String(decoding: bytes, as: UTF8.self)
+    }
+
+    private static func hexNibble(_ b: UInt8) -> UInt8? {
+        switch b {
+            case UInt8(ascii: "0") ... UInt8(ascii: "9"): return b - UInt8(ascii: "0")
+            case UInt8(ascii: "a") ... UInt8(ascii: "f"): return b - UInt8(ascii: "a") + 10
+            case UInt8(ascii: "A") ... UInt8(ascii: "F"): return b - UInt8(ascii: "A") + 10
+            default: return nil
         }
     }
-    return String(decoding: bytes, as: UTF8.self)
 }
 
-private func hexNibble(_ b: UInt8) -> UInt8? {
-    switch b {
-        case UInt8(ascii: "0") ... UInt8(ascii: "9"): return b - UInt8(ascii: "0")
-        case UInt8(ascii: "a") ... UInt8(ascii: "f"): return b - UInt8(ascii: "a") + 10
-        case UInt8(ascii: "A") ... UInt8(ascii: "F"): return b - UInt8(ascii: "A") + 10
-        default: return nil
+/// Path-safety checks — a caseless-enum namespace.
+public enum PathSafety {
+    /// True if `path` contains a `.` or `..` segment (directory traversal) in its literal form. The engine
+    /// rejects such requests with 400 before routing; percent-encoded dot-segments are caught at
+    /// capture-decode time (`PathTemplate.decodeSegment`).
+    public static func hasTraversal(_ path: Substring) -> Bool {
+        for segment in path.split(separator: "/", omittingEmptySubsequences: true)
+        where segment == "." || segment == ".." {
+            return true
+        }
+        return false
     }
-}
-
-/// True if `path` contains a `.` or `..` segment (directory traversal) in its literal form. The
-/// engine rejects such requests with 400 before routing; percent-encoded dot-segments are caught
-/// at capture-decode time (`PathTemplate.decodeSegment`).
-public func pathHasTraversal(_ path: Substring) -> Bool {
-    for segment in path.split(separator: "/", omittingEmptySubsequences: true)
-    where segment == "." || segment == ".." {
-        return true
-    }
-    return false
 }

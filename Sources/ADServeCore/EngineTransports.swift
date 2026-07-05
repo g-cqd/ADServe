@@ -48,6 +48,16 @@ final class ConnectionLimitingTransport: ServerTransport {
     private let inner: any ServerTransport
     private let limiter: ConnectionLimiter
 
+    // FIX #9: the former `else { Task { await Self.reject(connection) } }` spawned ONE unstructured
+    // detached task per refused connection — unbounded under a connection flood, and a task LEAKED on a
+    // stalled peer (its socket buffer full → the 503 write never returned). These bound both hazards: at
+    // most `rejectWorkers` rejections run at once, drawn from a queue of at most `rejectQueueDepth`
+    // refused connections, and each write is bounded by `rejectWriteDeadline` (the fd is force-closed on
+    // expiry). Past the queue bound a refused connection is dropped (synchronously cancelled).
+    private static let rejectQueueDepth = 128
+    private static let rejectWorkers = 8
+    private static let rejectWriteDeadline: Duration = .seconds(2)
+
     init(_ inner: any ServerTransport, limiter: ConnectionLimiter) {
         self.inner = inner
         self.limiter = limiter
@@ -60,18 +70,29 @@ final class ConnectionLimitingTransport: ServerTransport {
         let upstream = try await inner.start()
         let limiter = limiter
         return AsyncStream { continuation in
+            // Refused connections are handed to a BOUNDED reject pool over a BOUNDED queue (FIX #9),
+            // never a fresh detached task each — so a flood spawns no unbounded tasks and a stalled
+            // peer leaks none.
+            let (refused, refuse) = AsyncStream.makeStream(
+                of: (any TransportConnection).self,
+                bufferingPolicy: .bufferingOldest(Self.rejectQueueDepth))
+            let rejectPool = Task { await Self.runRejectPool(refused) }
             let pump = Task {
                 for await connection in upstream {
                     if limiter.tryAcquire() {
                         continuation.yield(LimitedConnection(connection, limiter: limiter))
-                    } else {
-                        // Reject out-of-band so the accept loop never blocks on a refused peer.
-                        Task { await Self.reject(connection) }
+                    } else if case .dropped(let overflow) = refuse.yield(connection) {
+                        overflow.cancel()  // queue saturated → drop now (no task spawned, no leak)
                     }
                 }
+                refuse.finish()
                 continuation.finish()
             }
-            continuation.onTermination = { _ in pump.cancel() }
+            continuation.onTermination = { _ in
+                pump.cancel()
+                rejectPool.cancel()
+                refuse.finish()
+            }
         }
     }
 
@@ -79,7 +100,28 @@ final class ConnectionLimitingTransport: ServerTransport {
 
     func reload(tls: TransportTLS) async throws { try await inner.reload(tls: tls) }
 
-    /// The canned over-capacity response: `503` + `Connection: close` + `Retry-After: 1`.
+    /// A fixed-size pool of reject workers draining the bounded `refused` queue. `AsyncStream` is
+    /// single-consumer, so ONE consumer feeds a task group capped at `rejectWorkers` concurrent
+    /// rejections — awaiting a free slot before admitting the next, so no more than that many reject
+    /// tasks ever run (the flood bound). Ends when the queue finishes (shutdown / accept-loop end).
+    private static func runRejectPool(_ refused: AsyncStream<any TransportConnection>) async {
+        await withTaskGroup(of: Void.self) { group in
+            var active = 0
+            for await connection in refused {
+                if active >= rejectWorkers {
+                    _ = await group.next()
+                    active -= 1
+                }
+                group.addTask { await reject(connection) }
+                active += 1
+            }
+        }
+    }
+
+    /// The canned over-capacity response: `503` + `Connection: close` + `Retry-After: 1`, written under
+    /// a deadline. A stalled peer (receive buffer full) would otherwise park the `send` forever and pin a
+    /// worker; on the deadline the fd is force-closed (`cancel()` is the synchronous close) so the parked
+    /// send unwinds, then the connection is closed.
     private static func reject(_ connection: any TransportConnection) async {
         let body = "server at connection capacity\n"
         let response =
@@ -88,7 +130,15 @@ final class ConnectionLimitingTransport: ServerTransport {
             + "content-length: \(body.utf8.count)\r\n"
             + "connection: close\r\n"
             + "retry-after: 1\r\n\r\n" + body
-        try? await connection.send(Array(response.utf8))
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { try? await connection.send(Array(response.utf8)) }
+            group.addTask {
+                try? await Task.sleep(for: rejectWriteDeadline)
+                if !Task.isCancelled { connection.cancel() }  // deadline hit → unblock the parked send
+            }
+            _ = await group.next()  // first to finish: the write completed, or the deadline fired
+            group.cancelAll()       // cancel the loser (the timer, or the now-unblockable send)
+        }
         await connection.close()
     }
 }
@@ -118,33 +168,12 @@ private final class LimitedConnection: TransportConnection {
     var tlsPeerSubject: String? { inner.tlsPeerSubject }
     var preferredTaskExecutor: (any TaskExecutor)? { inner.preferredTaskExecutor }
 
-    // The reads are wrapped in per-op cancellation handlers: the socket backbones park `receive`
-    // in a continuation that does NOT honor task cancellation (they rely on the serve-task-level
-    // `cancel()` handler — which the idle watchdog's child-task cancellation never reaches), so an
-    // idle deadline would otherwise never actually close the connection. Recorded upstream; the
-    // wrapper restores the documented `TransportConnection` contract at a task-status record per
-    // read.
     func receive(maxLength: Int) async throws -> [UInt8]? {
-        let inner = inner
-        return try await withTaskCancellationHandler {
-            try await inner.receive(maxLength: maxLength)
-        } onCancel: {
-            inner.cancel()
-        }
+        try await inner.receive(maxLength: maxLength)
     }
 
     func receive(into buffer: inout [UInt8], maxLength: Int) async throws -> Int {
-        // `buffer` is `inout` and cannot cross into the cancellation-handler closure pair; read into
-        // a fresh chunk (the wrapper is not on the zero-copy path) and append.
-        let inner = inner
-        let chunk = try await withTaskCancellationHandler {
-            try await inner.receive(maxLength: maxLength)
-        } onCancel: {
-            inner.cancel()
-        }
-        guard let chunk, !chunk.isEmpty else { return 0 }
-        buffer.append(contentsOf: chunk)
-        return chunk.count
+        try await inner.receive(into: &buffer, maxLength: maxLength)
     }
 
     func send(_ bytes: [UInt8]) async throws { try await inner.send(bytes) }

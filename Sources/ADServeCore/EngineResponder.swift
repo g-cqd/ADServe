@@ -49,31 +49,45 @@ struct EngineResponder: HTTPRouter {
 
         // Reject directory traversal (`.`/`..` segments) before routing — a catch-all route would
         // otherwise hand `../../etc/passwd` to a handler.
-        if pathHasTraversal(path) {
+        if PathSafety.hasTraversal(path) {
             return await finalize(
                 .plain(.badRequest, "bad request path\n"), cache: .unset, environment: environment)
         }
 
+        // FIX #1: ONE combined trie descent for the request method. The streaming opt-in, the bound
+        // handler, the per-route body limit, and the 404/405 outcome ALL come from this single
+        // `RouteMatch` — replacing the former `streamingHandler(...)` + `match(...)` (two descents).
+        var matchResult = routes.matchRoute(method: request.method, path: path)
+
         // A streaming-body route consumes the body incrementally (the engine delivers `.stream`
         // because `resolve` reported `streamsBody`); route-level middleware is not applied to it.
-        if let streamingHandler = routes.streamingHandler(method: request.method, path: path) {
+        // Evaluated on the REQUEST-method match, before any HEAD→GET fallback — exactly as before.
+        if case .matched(let route) = matchResult, let streamingHandler = route.streamingRun {
             return await respondStreaming(
                 request, body: body, handler: streamingHandler, environment: environment)
         }
 
-        let bytes = await body.collect()
+        // A HEAD with no explicit HEAD route falls back to the GET route (the engine suppresses the
+        // body at serialization time). This is the only SECOND descent, and only for a HEAD that missed.
+        if environment.isHead, case .matched = matchResult {
+        } else if environment.isHead {
+            matchResult = routes.matchRoute(method: .get, path: path)
+        }
+
+        // FIX #8: match FIRST, THEN decide the body. A matched route gets its buffered body; a
+        // 404 / 405 drains-and-discards instead of accumulating — a POST to an unknown path or a
+        // wrong method no longer buffers its body into the request (the streaming path above already
+        // returned without collecting).
+        let bytes: [UInt8]
+        if case .matched = matchResult {
+            bytes = await body.collect()
+        } else {
+            await Self.drainAndDiscard(body)
+            bytes = []
+        }
         let serverRequest = ServerRequest(
             method: request.method, target: target, headers: request.headerFields, body: bytes)
 
-        // Resolve the route. A HEAD with no explicit HEAD route falls back to the GET route (the
-        // engine suppresses the body at serialization time).
-        var matchResult = routes.match(method: request.method, path: path)
-        if environment.isHead {
-            if case .matched = matchResult {
-            } else {
-                matchResult = routes.match(method: .get, path: path)
-            }
-        }
         let resolved = resolveMatch(
             matchResult, method: request.method, requestID: environment.requestID,
             bodySize: bytes.count, storage: environment.storage)
@@ -82,7 +96,7 @@ struct EngineResponder: HTTPRouter {
         let mwContext = MiddlewareContext(
             requestID: environment.requestID, logger: configuration.logger,
             storage: environment.storage)
-        let chain = composeMiddleware(
+        let chain = MiddlewarePipeline.compose(
             configuration.middleware + resolved.middleware, context: mwContext,
             terminal: resolved.terminal)
         let content = await chain(serverRequest)
@@ -96,13 +110,23 @@ struct EngineResponder: HTTPRouter {
     /// opt-in (whose body the route bounds itself — the server cap does not apply).
     func resolve(method: HTTPMethod, path: String) -> ResolvedRoute? {
         let bare = path.prefix { $0 != "?" }
-        if routes.streamingHandler(method: method, path: bare) != nil {
+        let serverDefault = configuration.maxBodyBytes
+        // FIX #1: ONE combined descent — BOTH the streaming opt-in and the per-route body ceiling are
+        // read from a single match (was `streamingHandler` + `bodyLimit`, two separate descents). No
+        // `RequestContext` exists at head time, so the match result cannot be memoized for `respond`;
+        // this is the second of the request's two total descents.
+        guard case .matched(let route) = routes.matchRoute(method: method, path: bare) else {
+            // No route for this method (404 / 405): the server default bounds any body it still carries.
+            return ResolvedRoute(bodyLimit: serverDefault)
+        }
+        // A streaming route bounds its own body (the server cap does not apply); it raises the head-time
+        // ceiling so the engine hands the body off incrementally rather than rejecting it early.
+        if route.streamingRun != nil {
             return ResolvedRoute(bodyLimit: Int.max / 2, streamsBody: true)
         }
-        let serverDefault = configuration.maxBodyBytes
-        let routeLimit = routes.bodyLimit(method: method, path: bare)
-        return ResolvedRoute(
-            bodyLimit: max(routeLimit ?? serverDefault, serverDefault))
+        // A route may RAISE the server default (an upload); a LOWER per-route bound stays post-match so
+        // it can answer as problem+json.
+        return ResolvedRoute(bodyLimit: max(route.maxBodyBytes ?? serverDefault, serverDefault))
     }
 
     /// The WebSocket endpoint for `path`, wrapped in ADServe's CSWSH origin gate (same-origin or
@@ -133,7 +157,7 @@ struct EngineResponder: HTTPRouter {
         }
         let negotiated = context.connection.negotiatedApplicationProtocol
         return ResponseEnvironment(
-            requestID: resolveRequestID(request.headerFields),
+            requestID: RequestID.resolve(request.headerFields),
             isHead: request.method == .head,
             keepAlive: isKeepAlive(request),
             isHTTP2: negotiated == "h2" || negotiated == "h3",
@@ -148,6 +172,16 @@ struct EngineResponder: HTTPRouter {
         guard configuration.keepAliveEnabled else { return false }
         guard let connection = request.headerFields[.connection]?.lowercased() else { return true }
         return !connection.contains("close")
+    }
+
+    /// FIX #8: consume a NON-matched request's body off the wire without accumulating it. A POST to an
+    /// unknown path (404) or a wrong method (405) must still drain its body so HTTP/1.1 keep-alive
+    /// framing stays exact, but the 404/405 terminal never reads those bytes — so each chunk is
+    /// discarded instead of buffered into the request. A `.collected` body was already fully read by
+    /// the engine during framing (nothing left on the wire), so this is a no-op there.
+    private static func drainAndDiscard(_ body: RequestBody) async {
+        guard body.isStreaming else { return }
+        for await _ in body.asStream {}
     }
 
     /// Drives a streaming-body route: the handler consumes the incremental body (wrapped in the
@@ -177,7 +211,7 @@ struct EngineResponder: HTTPRouter {
             }
         }
         let mwContext = MiddlewareContext(requestID: requestID, logger: logger, storage: storage)
-        let chain = composeMiddleware(
+        let chain = MiddlewarePipeline.compose(
             configuration.middleware, context: mwContext, terminal: terminal)
         let content = await chain(serverRequest)
         return await finalize(content, cache: .unset, environment: environment)

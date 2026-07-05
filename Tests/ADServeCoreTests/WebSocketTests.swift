@@ -306,26 +306,26 @@ private func withWebSocketServer<R: Sendable>(
 
 @Suite struct WebSocketOriginGateTests {
     @Test func originlessHandshakeIsAllowed() {
-        #expect(webSocketOriginAllowed(origin: nil, host: "example.com"))
-        #expect(webSocketOriginAllowed(origin: "", host: "example.com"))
+        #expect(WebSocketOrigin.isAllowed(origin: nil, host: "example.com"))
+        #expect(WebSocketOrigin.isAllowed(origin: "", host: "example.com"))
     }
 
     @Test func sameOriginIsAllowed() {
-        #expect(webSocketOriginAllowed(origin: "https://example.com", host: "example.com"))
-        #expect(webSocketOriginAllowed(origin: "https://EXAMPLE.com", host: "example.com"))
-        #expect(webSocketOriginAllowed(origin: "http://app.local:8080", host: "app.local:8080"))
+        #expect(WebSocketOrigin.isAllowed(origin: "https://example.com", host: "example.com"))
+        #expect(WebSocketOrigin.isAllowed(origin: "https://EXAMPLE.com", host: "example.com"))
+        #expect(WebSocketOrigin.isAllowed(origin: "http://app.local:8080", host: "app.local:8080"))
     }
 
     @Test func crossOriginIsRejected() {
-        #expect(!webSocketOriginAllowed(origin: "https://evil.com", host: "example.com"))
-        #expect(!webSocketOriginAllowed(origin: "https://app.com.evil.com", host: "app.com"))
-        #expect(!webSocketOriginAllowed(origin: "https://app.local:9999", host: "app.local:8080"))
+        #expect(!WebSocketOrigin.isAllowed(origin: "https://evil.com", host: "example.com"))
+        #expect(!WebSocketOrigin.isAllowed(origin: "https://app.com.evil.com", host: "app.com"))
+        #expect(!WebSocketOrigin.isAllowed(origin: "https://app.local:9999", host: "app.local:8080"))
     }
 
     @Test func malformedOrNullOriginIsRejected() {
-        #expect(!webSocketOriginAllowed(origin: "null", host: "example.com"))
-        #expect(!webSocketOriginAllowed(origin: "example.com", host: "example.com"))  // no scheme
-        #expect(!webSocketOriginAllowed(origin: "https://example.com", host: nil))  // no Host
+        #expect(!WebSocketOrigin.isAllowed(origin: "null", host: "example.com"))
+        #expect(!WebSocketOrigin.isAllowed(origin: "example.com", host: "example.com"))  // no scheme
+        #expect(!WebSocketOrigin.isAllowed(origin: "https://example.com", host: nil))  // no Host
     }
 
     @Test func crossOriginUpgradeIsRefusedOnTheWire() async throws {

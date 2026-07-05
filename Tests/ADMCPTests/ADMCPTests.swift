@@ -77,9 +77,9 @@ struct ADMCPTests {
         let listLine = #"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#
         let listBytes = try #require(dispatcher.handle(line: listLine, context: ctx))
         let list = try JSONValue(parsing: String(decoding: listBytes, as: UTF8.self))
-        #expect(jsonObject(list)?["id"] == .int(1))
-        let tools = jsonArray(jsonMember(jsonMember(list, "result"), "tools")) ?? []
-        #expect(Set(tools.compactMap { jsonString(jsonMember($0, "name")) }) == ["ping", "greet"])
+        #expect(MCPJSON.object(list)?["id"] == .int(1))
+        let tools = MCPJSON.array(MCPJSON.member(MCPJSON.member(list, "result"), "tools")) ?? []
+        #expect(Set(tools.compactMap { MCPJSON.string(MCPJSON.member($0, "name")) }) == ["ping", "greet"])
 
         let callLine =
             #"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"greet","arguments":{"name":"Ada"}}}"#

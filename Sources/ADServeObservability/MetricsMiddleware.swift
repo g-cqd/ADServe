@@ -46,7 +46,7 @@ public struct MetricsMiddleware: HTTPMiddleware {
         let response = await next(request)
         let dimensions = [
             ("method", request.method.rawValue),
-            ("status", String(resolvedStatusCode(of: response, storage: context.storage)))
+            ("status", String(response.resolvedStatusCode(storage: context.storage)))
         ]
         // swift-metrics dedups handlers by label+dimensions inside the backend, so creating the
         // metric per request is the documented usage (not a per-request allocation of state).

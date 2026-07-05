@@ -41,11 +41,11 @@ public struct TracingMiddleware: HTTPMiddleware {
             span in
             span.attributes["http.request.method"] = request.method.rawValue
             span.attributes["url.path"] = String(request.path)
-            if let requestID = request.headers[requestIDName] {
+            if let requestID = request.headers[RequestID.name] {
                 span.attributes["http.request.id"] = requestID
             }
             let response = await next(request)
-            let status = statusCode(of: response)
+            let status = response.statusCode
             span.attributes["http.response.status_code"] = status
             // OTel: a server span is errored only for 5xx (a 4xx is the client's fault, not the span's).
             if status >= 500 { span.setStatus(SpanStatus(code: .error)) }

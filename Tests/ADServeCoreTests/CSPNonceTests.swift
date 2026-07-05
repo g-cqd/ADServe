@@ -17,7 +17,7 @@ import Testing
         let ctx = MiddlewareContext(requestID: "r", logger: Logger(label: "t"))
         // The terminal stands in for a handler: it reads the nonce the middleware stored and echoes it,
         // exactly as a real handler would stamp it onto `<script nonce="…">`.
-        let chain = composeMiddleware(
+        let chain = MiddlewarePipeline.compose(
             [CSPNonce()], context: ctx,
             terminal: { _ in .plain(.ok, ctx.storage[CSPNonceKey.self] ?? "MISSING") })
         let response = await chain(ServerRequest(method: .get, target: "/", headers: HTTPFields()))
@@ -35,7 +35,7 @@ import Testing
     @Test func eachRequestGetsADistinctNonce() async {
         func nonce(for storage: RequestStorage) async -> String {
             let ctx = MiddlewareContext(requestID: "r", logger: Logger(label: "t"), storage: storage)
-            let chain = composeMiddleware(
+            let chain = MiddlewarePipeline.compose(
                 [CSPNonce()], context: ctx,
                 terminal: { _ in .plain(.ok, ctx.storage[CSPNonceKey.self] ?? "MISSING") })
             let response = await chain(ServerRequest(method: .get, target: "/", headers: HTTPFields()))
@@ -50,7 +50,7 @@ import Testing
     @Test func customPolicyReplacesTheDefault() async {
         let ctx = MiddlewareContext(requestID: "r", logger: Logger(label: "t"))
         let middleware = CSPNonce { nonce in "default-src 'self'; script-src 'nonce-\(nonce)'" }
-        let chain = composeMiddleware([middleware], context: ctx, terminal: { _ in .plain(.ok, "x") })
+        let chain = MiddlewarePipeline.compose([middleware], context: ctx, terminal: { _ in .plain(.ok, "x") })
         let response = await chain(ServerRequest(method: .get, target: "/", headers: HTTPFields()))
         guard case .full(_, _, _, let headers) = response else {
             Issue.record("expected .full")

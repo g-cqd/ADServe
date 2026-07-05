@@ -10,6 +10,7 @@
 // package, but its `release/6.4.x` pins swift-collections 1.1.6 — conflicting with ADTestKit's ≥1.6.0 — so
 // the package is not resolvable here; the umbrella import below uses the same essentials types ICU-free.)
 
+import ADFCore
 import Foundation
 
 enum HTTPDate {
@@ -37,28 +38,12 @@ enum HTTPDate {
             + "\(pad2(hour)):\(pad2(minute)):\(pad2(second)) GMT"
     }
 
-    /// Parse an HTTP-date to whole epoch seconds, or `nil`. Accepts the preferred IMF-fixdate; the
-    /// obsolete RFC 850 / asctime forms are rare from real clients and intentionally not accepted.
+    /// Parse an HTTP-date to whole epoch seconds, or `nil`. Delegates to the shared, Foundation-free
+    /// ``ADFCore/HTTPDateParser`` (RFC 9110 §5.6.7) — the same parser `HTTPCore` uses, so the AD* family
+    /// has one HTTP-date parser. It also accepts the obsolete rfc850 / asctime forms a recipient is
+    /// required to handle (the prior local parser accepted only IMF-fixdate) and validates the `GMT` zone.
     static func parse(_ string: String) -> Int? {
-        // "Wed, 21 Oct 2015 07:28:00 GMT" → ["Wed,","21","Oct","2015","07:28:00","GMT"]
-        let tokens = string.split(whereSeparator: { $0 == " " || $0 == "\t" })
-        guard tokens.count >= 5,
-            let day = Int(tokens[1]),
-            let monthIndex = monthNames.firstIndex(of: String(tokens[2])),
-            let year = Int(tokens[3])
-        else { return nil }
-        let time = tokens[4].split(separator: ":")
-        guard time.count == 3, let hour = Int(time[0]), let minute = Int(time[1]), let second = Int(time[2])
-        else { return nil }
-        var components = DateComponents()
-        components.year = year
-        components.month = monthIndex + 1
-        components.day = day
-        components.hour = hour
-        components.minute = minute
-        components.second = second
-        guard let date = utc.date(from: components) else { return nil }
-        return Int(date.timeIntervalSince1970.rounded(.down))
+        HTTPDateParser.parse(string)
     }
 
     private static func pad2(_ value: Int) -> String { value < 10 ? "0\(value)" : "\(value)" }

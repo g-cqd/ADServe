@@ -162,7 +162,7 @@ import Testing
             let response = await limiter.intercept(request, context) { _ in
                 .raw(body: Array("ok".utf8), contentType: "text/plain", status: .ok)
             }
-            let code = statusCode(of: response)
+            let code = response.statusCode
             guard code == 200 else {
                 #expect(code == 429)  // the only non-200 the limiter ever returns
                 throw RateLimited()
@@ -188,7 +188,7 @@ import Testing
             let response = await limiter.intercept(request, context) { _ in
                 .raw(body: Array("ok".utf8), contentType: "text/plain", status: .ok)
             }
-            guard statusCode(of: response) == 200 else { throw RateLimited() }
+            guard response.statusCode == 200 else { throw RateLimited() }
         }
         #expect(outcome.complete)
         #expect(outcome.successCount == 2 * limit)  // limit per key, both buckets fully spent, none over

@@ -149,15 +149,17 @@ extension ResponseContent {
 
 // MARK: - Response header merge (append `Set-Cookie`, overwrite the rest)
 
-/// Merge `extra` into `base` with the right repeatability: `set-cookie` is APPENDED (each cookie is its
-/// own header line — collapsing them is wrong), every other name overwrites. The single place the engine
-/// folds route/middleware headers onto the response envelope, so multi-cookie responses survive.
-func mergeResponseHeaders(_ extra: HTTPFields, into base: inout HTTPFields) {
-    for field in extra {
-        if field.name == .setCookie {
-            base.append(field)
-        } else {
-            base.setValue(field.value, for: field.name)
+extension HTTPFields {
+    /// Merge `extra` into `self` with the right repeatability: `set-cookie` is APPENDED (each cookie is
+    /// its own header line — collapsing them is wrong), every other name overwrites. The single place the
+    /// engine folds route/middleware headers onto the response envelope, so multi-cookie responses survive.
+    mutating func mergeResponse(_ extra: HTTPFields) {
+        for field in extra {
+            if field.name == .setCookie {
+                append(field)
+            } else {
+                setValue(field.value, for: field.name)
+            }
         }
     }
 }

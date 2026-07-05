@@ -27,16 +27,26 @@ public final class InMemorySessionStore: SessionStore {
         var values: [String: String]
         var deadline: Double
     }
-    private let entries = Mutex<[String: Entry]>([:])
+    private struct State {
+        var entries: [String: Entry] = [:]
+        /// Earliest time a full expired-entry sweep may next run — amortizes the O(n) rebuild so a map
+        /// held above `sweepThreshold` doesn't rebuild on every write.
+        var nextSweep: Double = 0
+    }
+    private let state = Mutex(State())
     private let ttlSeconds: Double
+    /// Above this many entries, `save` drops expired sessions (at most once per TTL). Without it an
+    /// abandoned one-time-visitor session — never re-fetched, so never lazily expired by `load` — would
+    /// leak forever (monotonic growth per unique visitor).
+    private let sweepThreshold = 10_000
 
     public init(ttlSeconds: Int = 86_400) { self.ttlSeconds = Double(ttlSeconds) }
 
     public func load(_ id: String) async -> [String: String]? {
-        entries.withLock { store in
-            guard let entry = store[id] else { return nil }
+        state.withLock { state in
+            guard let entry = state.entries[id] else { return nil }
             if entry.deadline < Date().timeIntervalSince1970 {
-                store[id] = nil
+                state.entries[id] = nil
                 return nil
             }
             return entry.values
@@ -44,12 +54,19 @@ public final class InMemorySessionStore: SessionStore {
     }
 
     public func save(_ id: String, values: [String: String]) async {
-        let deadline = Date().timeIntervalSince1970 + ttlSeconds
-        entries.withLock { $0[id] = Entry(values: values, deadline: deadline) }
+        let now = Date().timeIntervalSince1970
+        let deadline = now + ttlSeconds
+        state.withLock { state in
+            if state.entries.count > sweepThreshold, now >= state.nextSweep {
+                state.entries = state.entries.filter { $0.value.deadline >= now }
+                state.nextSweep = now + ttlSeconds  // amortize: at most one full sweep per TTL
+            }
+            state.entries[id] = Entry(values: values, deadline: deadline)
+        }
     }
 
     public func delete(_ id: String) async {
-        entries.withLock { $0[id] = nil }
+        state.withLock { $0.entries[id] = nil }
     }
 }
 

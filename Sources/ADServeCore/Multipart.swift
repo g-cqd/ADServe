@@ -94,6 +94,11 @@ public struct MultipartForm: Sendable {
 public enum MultipartParser {
     private static let crlf: [UInt8] = [13, 10]
     private static let dashDash: [UInt8] = [45, 45]
+    /// Upper bound on parts parsed from one body — a defensive backstop so a body of many tiny parts cannot
+    /// force unbounded `MultipartPart` allocations (each copies its part bytes). The body is already
+    /// `maxBody`-capped upstream, so this only bites truly pathological input; set far above any real form
+    /// (and above the deep-body stress tests) so legitimate multi-part fidelity is untouched.
+    private static let maxParts = 100_000
 
     /// The `boundary` token from a `Content-Type: multipart/form-data; boundary=…` value, or `nil` if the
     /// type is not multipart / the boundary is missing. A quoted boundary is unquoted.
@@ -107,12 +112,21 @@ public enum MultipartParser {
         if boundary.count >= 2, boundary.hasPrefix("\""), boundary.hasSuffix("\"") {
             boundary = String(boundary.dropFirst().dropLast())
         }
-        return boundary.isEmpty ? nil : boundary
+        // RFC 2046 caps a boundary at 70 characters. Enforcing it bounds the needle length in
+        // `ByteSearch.split` (the parser's hot loop) to O(1), so an attacker-chosen giant boundary can no
+        // longer force the O(body × boundary) ≈ O(n²) scan — a request-body-sized CPU-DoS. An over-long
+        // (or empty) boundary is not valid multipart, so it reads as "no multipart form" (nil).
+        guard (1 ... 70).contains(boundary.utf8.count) else { return nil }
+        return boundary
     }
 
     /// Parse `body` against `boundary` into parts. Returns an empty form when there are no parts; never
     /// traps on malformed input (a bad part is skipped).
     public static func parse(_ body: [UInt8], boundary: String) -> MultipartForm {
+        // Bound the delimiter length (RFC 2046 caps a boundary at 70) so the split scan stays O(body).
+        // `parse` is public, so guard here too (not only in `boundary(fromContentType:)`) — a giant
+        // boundary would otherwise force the O(body × boundary) ≈ O(n²) needle scan.
+        guard (1 ... 70).contains(boundary.utf8.count) else { return MultipartForm(parts: []) }
         let delimiter = Array("--\(boundary)".utf8)
         let segments = ByteSearch.split(body, on: delimiter)
         var parts: [MultipartPart] = []
@@ -120,6 +134,7 @@ public enum MultipartParser {
         // with "--" is the closing delimiter (`--boundary--`) — stop.
         for segment in segments.dropFirst() {
             if segment.starts(with: dashDash) { break }
+            if parts.count >= Self.maxParts { break }  // defensive part-count cap
             var content = segment
             if content.starts(with: crlf) { content.removeFirst(2) }  // CRLF after the delimiter
             if content.count >= 2, content.suffix(2).elementsEqual(crlf) { content.removeLast(2) }  // before next

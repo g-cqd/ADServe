@@ -55,7 +55,14 @@ public struct PathTemplate: Sendable {
     /// family's `ADFCore.PercentCoding`, and a capture that decodes to `.`/`..` or contains a `/`
     /// (an encoded path separator) is REJECTED — closing the encoded-traversal hole.
     public func match(_ path: Substring) -> PathParameters? {
-        let parts = path.split(separator: "/", omittingEmptySubsequences: true)
+        match(segments: path.split(separator: "/", omittingEmptySubsequences: true))
+    }
+
+    /// The split-free core of ``match(_:)``: bind against the request path's ALREADY-split segments.
+    /// The routing trie splits the request path once during its descent (`omittingEmptySubsequences:
+    /// true`), so it hands those exact segments straight here — the per-route `bind` no longer re-splits
+    /// the path (FIX #7). Behavior is byte-identical to `match(_:)` (which just splits then calls this).
+    func match(segments parts: [Substring]) -> PathParameters? {
         var captures: [String: String] = [:]
         var index = 0
         for segment in segments {

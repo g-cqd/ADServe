@@ -6,6 +6,7 @@
 import ADTestKit
 import Foundation
 import HTTPCore
+import Synchronization
 import Testing
 
 @testable import ADServeCore
@@ -116,7 +117,7 @@ private struct StatusCaptureMiddleware: HTTPMiddleware {
         next: @Sendable (ServerRequest) async -> ResponseContent
     ) async -> ResponseContent {
         let response = await next(request)
-        probe.record(resolvedStatusCode(of: response, storage: context.storage))
+        probe.record(response.resolvedStatusCode(storage: context.storage))
         return response
     }
 }
@@ -130,4 +131,47 @@ private func headerValue(_ response: String, _ name: String) -> String? {
         }
     }
     return nil
+}
+
+// MARK: - Unified router descent (FIX #1)
+
+/// An `HTTPHandling` decorator that counts every call to the unified combined descent (`matchRoute`) —
+/// the ONE trie walk each request site makes — while forwarding routing verbatim to `inner`. The counter
+/// is a shared `Atomic<Int>` (boxed in this reference type, mirroring `ConnectionLimiter`), so the test
+/// reads the total after driving a request through the real engine.
+private final class DescentCountingRoutes: HTTPHandling {
+    private let inner: any HTTPHandling
+    private let counter = Atomic<Int>(0)
+
+    init(_ inner: any HTTPHandling) { self.inner = inner }
+
+    /// The number of unified descents performed since construction.
+    var descents: Int { counter.load(ordering: .relaxed) }
+
+    func matchRoute(method: HTTPMethod, path: Substring) -> RouteMatch {
+        counter.wrappingAdd(1, ordering: .relaxed)
+        return inner.matchRoute(method: method, path: path)
+    }
+    func match(method: HTTPMethod, path: Substring) -> RouteMatch {
+        inner.match(method: method, path: path)
+    }
+    func bodyLimit(method: HTTPMethod, path: Substring) -> Int? {
+        inner.bodyLimit(method: method, path: path)
+    }
+    var hasWebSocketRoutes: Bool { inner.hasWebSocketRoutes }
+}
+
+@Suite struct RouterDescentTests {
+    /// FIX #1: the engine now descends the router through exactly ONE unified `matchRoute` at the request
+    /// head (`resolve`, which reads BOTH the streaming opt-in and the per-route body limit from a single
+    /// match) and ONE at `respond` — 2 descents/request. Before unifying, `respond` fanned out to
+    /// `streamingHandler` + `match` and the head-time `resolve` to `streamingHandler` + `bodyLimit`, so
+    /// the SAME request walked the trie ~4 times. One loopback GET proves the drop to 2.
+    @Test func oneRequestDescendsTheRouterExactlyTwice() async throws {
+        let counting = DescentCountingRoutes(
+            StubRoutes { _ in .raw(body: Array("ok".utf8), contentType: "text/plain", status: .ok) })
+        let response = try await Loopback.run(path: "/thing", routes: counting)
+        #expect(response.hasPrefix("HTTP/1.1 200"))
+        #expect(counting.descents == 2)  // was ~4 (streamingHandler + bodyLimit + streamingHandler + match)
+    }
 }

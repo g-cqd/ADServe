@@ -60,8 +60,8 @@ final class CollectingBodyWriter: ResponseBodyWriter {
     }
 
     @Test func statusCodeReadsStreamStatus() {
-        #expect(statusCode(of: .stream(contentType: "text/html", status: .accepted) { _ in }) == 202)
-        #expect(statusCode(of: .stream(contentType: "text/html") { _ in }) == 200)
+        #expect((ResponseContent.stream(contentType: "text/html", status: .accepted) { _ in }).statusCode == 202)
+        #expect((ResponseContent.stream(contentType: "text/html") { _ in }).statusCode == 200)
     }
 
     @Test func withHeadersMergesIntoStreamWithoutLosingTheBody() async throws {

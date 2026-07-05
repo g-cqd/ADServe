@@ -165,133 +165,139 @@ indirect enum DocJSON {
 /// published contract stay in lockstep. Routes with no documentable path (opaque `GET(match:)`
 /// matchers) are skipped; every other route contributes its path + verb, enriched by any `.summary`/
 /// `.body`/`.responds`/… metadata.
-public func openAPIDocument(info: OpenAPIInfo, from apps: [Application]) -> String {
-    let routes = apps.flatMap(\.routes).filter { $0.pathTemplate != nil }
+/// OpenAPI 3.1 document generation — a caseless-enum namespace (was free functions). `document(info:from:)`
+/// is the entry; the object-builder helpers are private statics.
+public enum OpenAPI {
+    public static func document(info: OpenAPIInfo, from apps: [Application]) -> String {
+        let routes = apps.flatMap(\.routes).filter { $0.pathTemplate != nil }
 
-    // Group by path, preserving first-seen path order; within a path, keep first-seen verb.
-    var pathOrder: [String] = []
-    var byPath: [String: [(method: HTTPMethod, doc: RouteDoc?)]] = [:]
-    for route in routes {
-        guard let path = route.pathTemplate else { continue }
-        if byPath[path] == nil { pathOrder.append(path) }
-        if byPath[path]?.contains(where: { $0.method == route.method }) == true { continue }
-        byPath[path, default: []].append((route.method, route.doc))
+        // Group by path, preserving first-seen path order; within a path, keep first-seen verb.
+        var pathOrder: [String] = []
+        var byPath: [String: [(method: HTTPMethod, doc: RouteDoc?)]] = [:]
+        for route in routes {
+            guard let path = route.pathTemplate else { continue }
+            if byPath[path] == nil { pathOrder.append(path) }
+            if byPath[path]?.contains(where: { $0.method == route.method }) == true { continue }
+            byPath[path, default: []].append((route.method, route.doc))
+        }
+
+        // Collect every referenced schema, de-duplicated by component name (first wins).
+        var schemaOrder: [String] = []
+        var schemas: [String: String] = [:]
+        func register(_ ref: SchemaRef?) {
+            guard let ref, schemas[ref.name] == nil else { return }
+            schemaOrder.append(ref.name)
+            schemas[ref.name] = ref.schemaText
+        }
+        for route in routes {
+            register(route.doc?.requestBody)
+            for (_, ref) in (route.doc?.responses ?? [:]) { register(ref) }
+        }
+
+        var root: [(String, DocJSON)] = [
+            ("openapi", .string("3.1.0")),
+            ("info", infoObject(info)),
+            ("paths", .object(pathOrder.map { path in (path, pathItemObject(byPath[path] ?? [], path: path)) }))
+        ]
+        if !schemaOrder.isEmpty {
+            let entries = schemaOrder.map { name in (name, DocJSON.raw(schemas[name] ?? "{}")) }
+            root.append(("components", .object([("schemas", .object(entries))])))
+        }
+        return DocJSON.object(root).serialized
     }
 
-    // Collect every referenced schema, de-duplicated by component name (first wins).
-    var schemaOrder: [String] = []
-    var schemas: [String: String] = [:]
-    func register(_ ref: SchemaRef?) {
-        guard let ref, schemas[ref.name] == nil else { return }
-        schemaOrder.append(ref.name)
-        schemas[ref.name] = ref.schemaText
-    }
-    for route in routes {
-        register(route.doc?.requestBody)
-        for (_, ref) in (route.doc?.responses ?? [:]) { register(ref) }
+    private static func infoObject(_ info: OpenAPIInfo) -> DocJSON {
+        var fields: [(String, DocJSON)] = [("title", .string(info.title)), ("version", .string(info.version))]
+        if let description = info.description { fields.append(("description", .string(description))) }
+        return .object(fields)
     }
 
-    var root: [(String, DocJSON)] = [
-        ("openapi", .string("3.1.0")),
-        ("info", openAPIInfoObject(info)),
-        ("paths", .object(pathOrder.map { path in (path, pathItemObject(byPath[path] ?? [], path: path)) }))
+    /// Fixed verb order so a path's operations serialize deterministically.
+    private static let methodOrder = [
+        "GET", "PUT", "POST", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE", "CONNECT"
     ]
-    if !schemaOrder.isEmpty {
-        let entries = schemaOrder.map { name in (name, DocJSON.raw(schemas[name] ?? "{}")) }
-        root.append(("components", .object([("schemas", .object(entries))])))
-    }
-    return DocJSON.object(root).serialized
-}
 
-private func openAPIInfoObject(_ info: OpenAPIInfo) -> DocJSON {
-    var fields: [(String, DocJSON)] = [("title", .string(info.title)), ("version", .string(info.version))]
-    if let description = info.description { fields.append(("description", .string(description))) }
-    return .object(fields)
-}
-
-/// Fixed verb order so a path's operations serialize deterministically.
-private let methodOrder = ["GET", "PUT", "POST", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE", "CONNECT"]
-
-private func pathItemObject(
-    _ operations: [(method: HTTPMethod, doc: RouteDoc?)], path: String
-) -> DocJSON {
-    let parameters = pathParameterObjects(of: path)
-    let sorted = operations.sorted {
-        (methodOrder.firstIndex(of: $0.method.rawValue) ?? methodOrder.count)
-            < (methodOrder.firstIndex(of: $1.method.rawValue) ?? methodOrder.count)
-    }
-    return .object(
-        sorted.map { ($0.method.rawValue.lowercased(), operationObject($0.doc, parameters: parameters)) })
-}
-
-private func operationObject(_ doc: RouteDoc?, parameters: [DocJSON]) -> DocJSON {
-    var fields: [(String, DocJSON)] = []
-    if let summary = doc?.summary { fields.append(("summary", .string(summary))) }
-    if let description = doc?.description { fields.append(("description", .string(description))) }
-    if let operationId = doc?.operationId { fields.append(("operationId", .string(operationId))) }
-    if let tags = doc?.tags, !tags.isEmpty { fields.append(("tags", .array(tags.map(DocJSON.string)))) }
-    if doc?.deprecated == true { fields.append(("deprecated", .bool(true))) }
-    if !parameters.isEmpty { fields.append(("parameters", .array(parameters))) }
-    if let body = doc?.requestBody { fields.append(("requestBody", requestBodyObject(body))) }
-    fields.append(("responses", responsesObject(doc?.responses ?? [:])))
-    return .object(fields)
-}
-
-private func pathParameterObjects(of path: String) -> [DocJSON] {
-    path.split(separator: "/")
-        .compactMap { segment -> DocJSON? in
-            guard segment.first == "{", segment.last == "}" else { return nil }
-            var name = segment.dropFirst().dropLast()
-            if name.last == "*" { name = name.dropLast() }  // catch-all `{rest*}` → `rest`
-            return .object([
-                ("name", .string(String(name))),
-                ("in", .string("path")),
-                ("required", .bool(true)),
-                ("schema", .object([("type", .string("string"))]))
-            ])
+    private static func pathItemObject(
+        _ operations: [(method: HTTPMethod, doc: RouteDoc?)], path: String
+    ) -> DocJSON {
+        let parameters = pathParameterObjects(of: path)
+        let sorted = operations.sorted {
+            (methodOrder.firstIndex(of: $0.method.rawValue) ?? methodOrder.count)
+                < (methodOrder.firstIndex(of: $1.method.rawValue) ?? methodOrder.count)
         }
-}
-
-private func mediaObject(_ ref: SchemaRef) -> DocJSON {
-    .object([
-        (
-            "content",
-            .object([
-                (
-                    "application/json",
-                    .object([
-                        ("schema", .object([("$ref", .string("#/components/schemas/\(ref.name)"))]))
-                    ])
-                )
-            ])
-        )
-    ])
-}
-
-private func requestBodyObject(_ ref: SchemaRef) -> DocJSON {
-    var fields = objectFields(mediaObject(ref))
-    fields.insert(("required", .bool(true)), at: 0)
-    return .object(fields)
-}
-
-private func responsesObject(_ responses: [Int: SchemaRef]) -> DocJSON {
-    guard !responses.isEmpty else {
-        return .object([("200", .object([("description", .string("OK"))]))])
+        return .object(
+            sorted.map { ($0.method.rawValue.lowercased(), operationObject($0.doc, parameters: parameters)) })
     }
-    let entries = responses.keys.sorted()
-        .map { status -> (String, DocJSON) in
-            let ref = responses[status]
-            var fields: [(String, DocJSON)] = [
-                ("description", .string(HTTPStatus(code: status)?.reasonPhrase ?? "Status \(status)"))
-            ]
-            if let ref { fields.append(contentsOf: objectFields(mediaObject(ref))) }
-            return (String(status), .object(fields))
-        }
-    return .object(entries)
-}
 
-/// Unwrap a `.object`'s pairs (the small helpers above build `.object`s, then compose them).
-private func objectFields(_ json: DocJSON) -> [(String, DocJSON)] {
-    if case .object(let pairs) = json { return pairs }
-    return []
+    private static func operationObject(_ doc: RouteDoc?, parameters: [DocJSON]) -> DocJSON {
+        var fields: [(String, DocJSON)] = []
+        if let summary = doc?.summary { fields.append(("summary", .string(summary))) }
+        if let description = doc?.description { fields.append(("description", .string(description))) }
+        if let operationId = doc?.operationId { fields.append(("operationId", .string(operationId))) }
+        if let tags = doc?.tags, !tags.isEmpty { fields.append(("tags", .array(tags.map(DocJSON.string)))) }
+        if doc?.deprecated == true { fields.append(("deprecated", .bool(true))) }
+        if !parameters.isEmpty { fields.append(("parameters", .array(parameters))) }
+        if let body = doc?.requestBody { fields.append(("requestBody", requestBodyObject(body))) }
+        fields.append(("responses", responsesObject(doc?.responses ?? [:])))
+        return .object(fields)
+    }
+
+    private static func pathParameterObjects(of path: String) -> [DocJSON] {
+        path.split(separator: "/")
+            .compactMap { segment -> DocJSON? in
+                guard segment.first == "{", segment.last == "}" else { return nil }
+                var name = segment.dropFirst().dropLast()
+                if name.last == "*" { name = name.dropLast() }  // catch-all `{rest*}` → `rest`
+                return .object([
+                    ("name", .string(String(name))),
+                    ("in", .string("path")),
+                    ("required", .bool(true)),
+                    ("schema", .object([("type", .string("string"))]))
+                ])
+            }
+    }
+
+    private static func mediaObject(_ ref: SchemaRef) -> DocJSON {
+        .object([
+            (
+                "content",
+                .object([
+                    (
+                        "application/json",
+                        .object([
+                            ("schema", .object([("$ref", .string("#/components/schemas/\(ref.name)"))]))
+                        ])
+                    )
+                ])
+            )
+        ])
+    }
+
+    private static func requestBodyObject(_ ref: SchemaRef) -> DocJSON {
+        var fields = objectFields(mediaObject(ref))
+        fields.insert(("required", .bool(true)), at: 0)
+        return .object(fields)
+    }
+
+    private static func responsesObject(_ responses: [Int: SchemaRef]) -> DocJSON {
+        guard !responses.isEmpty else {
+            return .object([("200", .object([("description", .string("OK"))]))])
+        }
+        let entries = responses.keys.sorted()
+            .map { status -> (String, DocJSON) in
+                let ref = responses[status]
+                var fields: [(String, DocJSON)] = [
+                    ("description", .string(HTTPStatus(code: status)?.reasonPhrase ?? "Status \(status)"))
+                ]
+                if let ref { fields.append(contentsOf: objectFields(mediaObject(ref))) }
+                return (String(status), .object(fields))
+            }
+        return .object(entries)
+    }
+
+    /// Unwrap a `.object`'s pairs (the small helpers above build `.object`s, then compose them).
+    private static func objectFields(_ json: DocJSON) -> [(String, DocJSON)] {
+        if case .object(let pairs) = json { return pairs }
+        return []
+    }
 }

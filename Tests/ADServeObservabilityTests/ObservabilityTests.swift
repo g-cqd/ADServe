@@ -34,7 +34,7 @@ struct ObservabilityTests {
             .intercept(
                 ServerRequest(method: .get, target: "/x", headers: HTTPFields()), makeContext()
             ) { _ in .plain(.ok, "ok") }
-        #expect(statusCode(of: response) == 200)
+        #expect(response.statusCode == 200)
 
         let counter = try testMetrics.expectCounter(
             "http_requests_total", [("method", "GET"), ("status", "200")])
@@ -51,7 +51,7 @@ struct ObservabilityTests {
             .intercept(
                 ServerRequest(method: .post, target: "/y", headers: HTTPFields()), makeContext()
             ) { _ in .plain(.created, "made") }
-        #expect(statusCode(of: response) == 201)
+        #expect(response.statusCode == 201)
     }
 
     @Test

@@ -363,7 +363,7 @@ private func webSocketRoute(
         !subpath.contains("{"), "ADServe: a WS route path '\(subpath)' cannot contain a path parameter")
     return RouteNode(cache: .unset) { prefix, cache, middleware in
         let full = joinPath(prefix, subpath)
-        let bind: @Sendable (Substring) -> (@Sendable (HandlerInput) throws -> ResponseContent)? = { path in
+        let bind: RouteBinder = { path, _ in
             pathMatchesExact(path, full) ? { @Sendable _ in webSocketUpgradeRequired() } : nil
         }
         return [
@@ -392,7 +392,7 @@ public func Stream(_ subpath: String, _ handler: @escaping StreamingRequestHandl
         "ADServe: a streaming route path '\(subpath)' cannot contain a path parameter")
     return RouteNode(cache: .unset) { prefix, cache, middleware in
         let full = joinPath(prefix, subpath)
-        let bind: @Sendable (Substring) -> (@Sendable (HandlerInput) throws -> ResponseContent)? = { path in
+        let bind: RouteBinder = { path, _ in
             // Placeholder: the engine takes the streaming path when `streamingRun` is set, so `run` is
             // never invoked for a matched streaming request.
             pathMatchesExact(path, full) ? { @Sendable _ in .plain(.internalServerError, "streaming route\n") } : nil
@@ -439,8 +439,8 @@ private func exactRoute<P: PoolScope>(
     let run: @Sendable (HandlerInput) throws -> ResponseContent = { input in try handler(P.Context(input)) }
     return RouteNode(cache: .unset) { prefix, cache, middleware in
         let full = joinPath(prefix, subpath)
-        let bind: @Sendable (Substring) -> (@Sendable (HandlerInput) throws -> ResponseContent)? = {
-            pathMatchesExact($0, full) ? run : nil
+        let bind: RouteBinder = { path, _ in
+            pathMatchesExact(path, full) ? run : nil
         }
         return [
             CompiledRoute(
@@ -458,8 +458,9 @@ private func templateRoute<P: PoolScope>(
     return RouteNode(cache: .unset) { prefix, cache, middleware in
         let fullTemplate = joinPath(prefix, template)
         let pathTemplate = PathTemplate(fullTemplate)
-        let bind: @Sendable (Substring) -> (@Sendable (HandlerInput) throws -> ResponseContent)? = { path in
-            guard let params = pathTemplate.match(path) else { return nil }
+        let bind: RouteBinder = { _, segments in
+            // FIX #7: bind against the trie's already-split segments — no second `path.split`.
+            guard let params = pathTemplate.match(segments: segments) else { return nil }
             return { input in try handler(P.Context(input), params) }
         }
         return [
@@ -475,7 +476,7 @@ private func matchRoute<P: PoolScope, Captures: Sendable>(
     _ handler: @escaping @Sendable (P.Context, Captures) throws -> ResponseContent
 ) -> RouteNode {
     let needsStorage = pool.needsStorage
-    let bind: @Sendable (Substring) -> (@Sendable (HandlerInput) throws -> ResponseContent)? = { path in
+    let bind: RouteBinder = { path, _ in
         guard let captures = match(path) else { return nil }
         return { input in try handler(P.Context(input), captures) }
     }
