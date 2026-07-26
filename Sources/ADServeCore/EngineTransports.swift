@@ -137,7 +137,7 @@ final class ConnectionLimitingTransport: ServerTransport {
                 if !Task.isCancelled { connection.cancel() }  // deadline hit → unblock the parked send
             }
             _ = await group.next()  // first to finish: the write completed, or the deadline fired
-            group.cancelAll()       // cancel the loser (the timer, or the now-unblockable send)
+            group.cancelAll()  // cancel the loser (the timer, or the now-unblockable send)
         }
         await connection.close()
     }

@@ -175,8 +175,10 @@ public struct StorageContext: HandlerContext {
 /// else `nil`. The trie splits the path once during its descent and hands those exact segments here,
 /// so a template `bind` decodes its captures WITHOUT re-splitting the path (FIX #7); exact/opaque
 /// binds ignore the segments and match on `path` directly.
-typealias RouteBinder = @Sendable (_ path: Substring, _ segments: [Substring]) -> (
-    @Sendable (HandlerInput) throws -> ResponseContent)?
+typealias RouteBinder =
+    @Sendable (_ path: Substring, _ segments: [Substring]) -> (
+        @Sendable (HandlerInput) throws -> ResponseContent
+    )?
 
 /// A fully-built route. `bind` returns a captures-applied handler when the path
 /// matches, else nil; `exactPath` (when non-nil) lets the table index it O(1).

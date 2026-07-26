@@ -17,7 +17,6 @@ import Testing
 // socket — neither exists on Linux, where the engine-level coverage lives in the HTTP
 // package (UnixSocketTransportTests + the portable-TLS trust-roots suite).
 #if canImport(Security)
-
     import Security
 
     @Suite struct UnixDomainSocketTests {
