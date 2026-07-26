@@ -372,6 +372,50 @@ enum Loopback {
         return Int(UInt16(bigEndian: assigned.sin_port))
     }
 
+    /// Start a server on a fresh loopback port, retrying if the port was lost to a concurrent test.
+    ///
+    /// `freePort()` probe-binds `:0`, reads the assignment, then RELEASES it — so between that
+    /// release and the server's own bind, another concurrently-running test can be handed the same
+    /// port. Under swift-testing's parallelism that window is real: CI observed port 41177 issued
+    /// twice, the loser failing `bind()` with EADDRINUSE, and the resulting "server never became
+    /// ready" reported against whichever innocent test lost the race.
+    ///
+    /// Retrying with a fresh port makes the collision self-correcting. It does not close the window
+    /// — the airtight fix is to stop pre-picking and let the listener bind `:0` and report its
+    /// assignment back, which needs `boundPort` surfaced through `HTTPServer` (a change in the HTTP
+    /// package). Until then three attempts turn a routine flake into a negligible one.
+    ///
+    /// Returns the bound port and the serve task; the caller owns cancelling it.
+    static func startServer(
+        _ make: (_ port: Int, _ readiness: ServerReadiness) -> HTTPServer
+    ) async throws -> (port: Int, task: Task<Void, any Error>) {
+        var lastFailure: (any Error)?
+        for _ in 1 ... 3 {
+            let port = try freePort()
+            let readiness = ServerReadiness()
+            let server = make(port, readiness)
+            // NOT `try?`: a listener that fails to start must stay reportable, otherwise the only
+            // symptom is a readiness timeout with no stated cause.
+            let task = Task { try await server.run() }
+            do {
+                try await awaitReadiness(readiness)
+                return (port, task)
+            } catch let readinessFailure {
+                task.cancel()
+                // Prefer the listener's own error (e.g. bind EADDRINUSE) over the generic timeout.
+                lastFailure = readinessFailure
+                do {
+                    try await task.value
+                } catch is CancellationError {
+                } catch {
+                    lastFailure = error
+                }
+            }
+        }
+        throw lastFailure
+            ?? TLSHarnessError(message: "server never became ready after 3 port attempts")
+    }
+
     /// Await `readiness` (≤2s, 10ms spins) so a bind failure surfaces as a thrown error, never a hang.
     static func awaitReadiness(_ readiness: ServerReadiness) async throws {
         var spins = 0
@@ -392,18 +436,17 @@ enum Loopback {
         requestDecompression: RequestDecompressionPolicy = .disabled,
         _ body: @escaping @Sendable (Int) throws -> R
     ) async throws -> R {
-        let port = try freePort()
-        let readiness = ServerReadiness()
-        let server = HTTPServer(
-            listeners: [ListenerConfig(host: "127.0.0.1", port: port, routes: routes)], pool: nil,
-            envelope: HTTPFields(), logger: Logger(label: "loopback-test"), threadCount: 2,
-            loopCount: 1, readiness: readiness, middleware: middleware,
-            maxBodyBytes: maxBodyBytes, maxConnections: maxConnections,
-            responseCompression: compression, keepAlive: policyOrDefault(keepAlive),
-            requestDecompression: requestDecompression)
-        let serverTask = Task { try? await server.run() }
+        let (port, serverTask) = try await startServer { port, readiness in
+            HTTPServer(
+                listeners: [ListenerConfig(host: "127.0.0.1", port: port, routes: routes)],
+                pool: nil,
+                envelope: HTTPFields(), logger: Logger(label: "loopback-test"), threadCount: 2,
+                loopCount: 1, readiness: readiness, middleware: middleware,
+                maxBodyBytes: maxBodyBytes, maxConnections: maxConnections,
+                responseCompression: compression, keepAlive: policyOrDefault(keepAlive),
+                requestDecompression: requestDecompression)
+        }
         defer { serverTask.cancel() }
-        try await awaitReadiness(readiness)
         // The client speaks blocking POSIX I/O — run it on a dedicated thread, never the pool.
         return try await runOnThread { try body(port) }
     }

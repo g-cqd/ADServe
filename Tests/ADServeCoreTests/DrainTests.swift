@@ -17,14 +17,13 @@ import Testing
         let routes = StubRoutes { _ in
             .raw(body: Array("ok".utf8), contentType: "text/plain", status: .ok)
         }
-        let port = try Loopback.freePort()
-        let readiness = ServerReadiness()
-        let server = HTTPServer(
-            listeners: [ListenerConfig(host: "127.0.0.1", port: port, routes: routes)], pool: nil,
-            envelope: HTTPFields(), logger: Logger(label: "drain-cancel"), threadCount: 1,
-            loopCount: 1, readiness: readiness)
-        let serverTask = Task { _ = try? await server.run() }
-        try await Loopback.awaitReadiness(readiness)
+        let (port, serverTask) = try await Loopback.startServer { port, readiness in
+            HTTPServer(
+                listeners: [ListenerConfig(host: "127.0.0.1", port: port, routes: routes)],
+                pool: nil,
+                envelope: HTTPFields(), logger: Logger(label: "drain-cancel"), threadCount: 1,
+                loopCount: 1, readiness: readiness)
+        }
 
         // Hold an idle keep-alive connection open (served once), then cancel the server task: the
         // teardown force-closes the connection (the client sees EOF) within the bound.
@@ -52,14 +51,14 @@ import Testing
             let routes = StubRoutes { _ in
                 .raw(body: Array("ok".utf8), contentType: "text/plain", status: .ok)
             }
-            let port = try Loopback.freePort()
-            let readiness = ServerReadiness()
-            let server = HTTPServer(
-                listeners: [ListenerConfig(host: "127.0.0.1", port: port, routes: routes)], pool: nil,
-                envelope: HTTPFields(), logger: Logger(label: "drain-cancel-stress"), threadCount: 1,
-                loopCount: 1, readiness: readiness)
-            let serverTask = Task { _ = try? await server.run() }
-            try await Loopback.awaitReadiness(readiness)
+            let (port, serverTask) = try await Loopback.startServer { port, readiness in
+                HTTPServer(
+                    listeners: [ListenerConfig(host: "127.0.0.1", port: port, routes: routes)],
+                    pool: nil,
+                    envelope: HTTPFields(),
+                    logger: Logger(label: "drain-cancel-stress"), threadCount: 1,
+                    loopCount: 1, readiness: readiness)
+            }
 
             let client = try await runOnThread { () -> TestSocket in
                 let socket = try TestSocket.connect(host: "127.0.0.1", port: port)

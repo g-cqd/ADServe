@@ -25,7 +25,22 @@ struct ServingService: Service {
             taskGroup.addTask {
                 await withDiscardingTaskGroup { serving in
                     for engine in engines {
-                        serving.addTask { try? await engine.server.run() }
+                        serving.addTask {
+                            do {
+                                try await engine.server.run()
+                            } catch {
+                                // Do NOT swallow this. A listener that fails to START — most often
+                                // `bind() errno 48/98` when the port is already taken — otherwise
+                                // vanishes here, the group completes "normally", and the only trace
+                                // is ServiceLifecycle's opaque "A service has finished unexpectedly".
+                                // Callers then see a server that never becomes ready, with no cause.
+                                logger.error(
+                                    "ad-server listener failed",
+                                    metadata: [
+                                        "address": "\(engine.address)", "error": "\(error)"
+                                    ])
+                            }
+                        }
                     }
                 }
                 return .served
