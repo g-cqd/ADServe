@@ -25,6 +25,10 @@ jobs:
     # workflow used. The Linux container moves from the stale swift:6.3 to the canonical 6.4 nightly.
     uses: g-cqd/ADBuildTools/.github/workflows/swift-quality.yml@v1
     with:
+      # arcleak and dolly GATE (arcleak measured 0 findings family-wide; dolly runs the token
+      # pass against .dolly-baseline.json, so only NEW clones fail). deadwood is report-only —
+      # its syntax-mode dataflow cannot see writes through closures or mutating methods.
+      enable-static-analysis: true
       dev-env-var: ADSERVE_DEV
       requires-published-siblings: true
       # Memory/data-race safety: ADServeCore does manual buffer parsing (MIME sniffing, header
