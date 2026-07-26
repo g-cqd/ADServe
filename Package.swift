@@ -36,36 +36,19 @@ let kernelSettings: [SwiftSetting] =
 // AD-family `*_DEV` convention). Provides the shared ADBuildTools lint/format plugins + DocC.
 let isDev = Context.environment["ADSERVE_DEV"] != nil
 
-// First-party dependencies resolve from a local checkout when the matching PATH env var is set,
-// otherwise from the published `main` branch.
-//   ADJSON_PATH        -> ADJSON (the MCP/response JSON codec). Pulls ADFoundation + ADConcurrency.
-//   ADCONCURRENCY_PATH -> ADConcurrency (the `PooledResource`/`ResourcePool` pool primitive).
-let adjsonDependency: Package.Dependency = {
-    if let path = Context.environment["ADJSON_PATH"], !path.isEmpty {
-        return .package(path: path)
-    }
-    return .package(url: "https://github.com/g-cqd/ADJSON.git", branch: "main")
-}()
+// First-party dependencies always resolve from the published `main` branch.
+//   ADJSON — the MCP/response JSON codec. Pulls ADFoundation transitively.
+let adjsonDependency: Package.Dependency = .package(url: "https://github.com/g-cqd/ADJSON.git", branch: "main")
 // (ADConcurrency is folded into the ADFoundation umbrella package — resolved via adfoundationDependency.)
-// ADFOUNDATION_PATH -> ADFCore, the canonical RFC 3986 `PercentCoding` byte kernel used to decode
+// ADFoundation — `ADFCore`, the canonical RFC 3986 `PercentCoding` byte kernel used to decode
 // path captures + query values (and reject traversal smuggling). Already transitive via ADJSON;
 // declared directly so ADServe reuses the family primitive instead of re-rolling percent-coding.
-let adfoundationDependency: Package.Dependency = {
-    if let path = Context.environment["ADFOUNDATION_PATH"], !path.isEmpty {
-        return .package(path: path)
-    }
-    return .package(url: "https://github.com/g-cqd/ADFoundation.git", branch: "main")
-}()
+let adfoundationDependency: Package.Dependency = .package(
+    url: "https://github.com/g-cqd/ADFoundation.git", branch: "main")
 // HTTP — the from-scratch, SwiftNIO-free HTTP/1.1·2·3 stack ADServe runs on (the engine,
-// transport backbones, sans-I/O protocol engines, and the commodity middleware). Same env→URL shape
-// as the other first-party deps: override with HTTP_PATH for a local checkout, else resolve the
-// published repo. The strangler migration is complete: ADServe resolves NO SwiftNIO package.
-let httpDependency: Package.Dependency = {
-    if let path = Context.environment["HTTP_PATH"], !path.isEmpty {
-        return .package(path: path)
-    }
-    return .package(url: "https://github.com/g-cqd/HTTP.git", branch: "main")
-}()
+// transport backbones, sans-I/O protocol engines, and the commodity middleware).
+// The strangler migration is complete: ADServe resolves NO SwiftNIO package.
+let httpDependency: Package.Dependency = .package(url: "https://github.com/g-cqd/HTTP.git", branch: "main")
 // ADMCP (the transport-agnostic MCP JSON-RPC core + `Tool` DSL) was a standalone package; it is now a
 // target in THIS package (folded in), so there is no longer an ADMCP package dependency to resolve.
 // ADTestKit (the deterministic-testing toolkit, TEST-ONLY) is also folded into the ADFoundation umbrella
@@ -85,12 +68,8 @@ var packageDependencies: [Package.Dependency] = [
     httpDependency
 ]
 if isDev {
-    if let path = Context.environment["ADBUILDTOOLS_PATH"], !path.isEmpty {
-        packageDependencies.append(.package(path: path))
-    } else {
-        packageDependencies.append(
-            .package(url: "https://github.com/g-cqd/ADBuildTools.git", branch: "main"))
-    }
+    packageDependencies.append(
+        .package(url: "https://github.com/g-cqd/ADBuildTools.git", branch: "main"))
     packageDependencies.append(
         .package(url: "https://github.com/swiftlang/swift-docc-plugin", from: "1.0.0"))
     // ordo-one's statistically-rigorous benchmark framework (p-percentile latencies + throughput +

@@ -90,9 +90,8 @@ The first-party deps (`HTTP`, `ADJSON`, `ADFoundation`) follow the g-cqd `AD*` f
 - **Planned:** cut semver tags (0.x stabilizing toward 1.0) for the siblings and pin the resolved
   graph via the **committed `Package.resolved`** (already in this repo — it pins the exact
   revisions resolution uses), so a clean checkout builds what CI validated.
-- **Local development:** override a first-party dependency to a sibling checkout with its `*_PATH`
-  env var — `HTTP_PATH`, `ADJSON_PATH`, `ADFOUNDATION_PATH`. Never set a `*_PATH` in CI or a
-  release build; those resolve the published package.
+- **Local development:** first-party dependencies always resolve from the published package. To
+  test a sibling change, push it and re-resolve.
 
 ## Build
 
